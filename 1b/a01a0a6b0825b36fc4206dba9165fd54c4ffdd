@@ -1,0 +1,461 @@
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingCommand.java
+  s_dfd3390801b580::t_a84d8818cedd59 1-51
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingFolderAccess.java
+  s_dfd3390801b580::t_33a3ecd2a2144e 1-68
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SyncthingSuperuserStateTransferTest.java
+  s_143aa52c59d6cc::t_0a6f2315e63327 162-186,205-229
+  s_143aa52c59d6cc::t_4f842afb4a5f33 7-9,12,30,79-136,365-379,382-457
+  s_143aa52c59d6cc::t_165bfc928121b9 256-279,330,354-357
+  s_143aa52c59d6cc::t_5f35423676436b 243
+  s_143aa52c59d6cc::t_f06646d362b231 473-476
+  s_143aa52c59d6cc::t_5e972c2a83c5f8 280-312,316-324,331,336-339
+  s_143aa52c59d6cc::t_c9a5e92c0fe0b7 67,157,251
+  s_143aa52c59d6cc::t_a59f8fde48351c 1-6,10-11,13-29,31-66,68-78,137-156,158-161,187-204,230-242,244-250,252-255,313-315,325-329,332-335,340-353,358-364,380-381,458-472,477-493
+app/src/test/java/com/nutomic/syncthingandroid/util/ConfigXmlStateAccessTest.java
+  s_dfd3390801b580::t_d7fc656b9fa816 1-7,9-49,55-121
+  s_dfd3390801b580::t_4532be5da12186 8,50-54
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingExecutionBackend.java
+  s_dfd3390801b580::t_6daa708c72f159 1-25
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserRuntimeStatus.java
+  s_dfd3390801b580::t_a84d8818cedd59 1-75
+app/src/main/java/com/nutomic/syncthingandroid/SyncthingModule.java
+  s_dfd3390801b580::t_6daa708c72f159 7-10,57-60,165-172,175
+  s_dfd3390801b580::t_1b664443084d17 18,20,22-23,64-76,145-154
+  s_dfd3390801b580::t_249537e3a37752 16,137-144
+  s_dfd3390801b580::t_9ba2515a57c0ba 14,52-56
+  s_dfd3390801b580::t_43ef38119b8535 17,61-63,155-158,173-174,176-178
+  s_dfd3390801b580::t_2296bd7ff299bc 19,21,24-25,77-105,136
+  s_dfd3390801b580::t_5e56695b8e9e18 159-164
+  s_dfd3390801b580::t_9e3a258fa15317 11-13,15,106-135
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateAccess.java
+  s_dfd3390801b580::t_5d75c13794fbf5 1-15
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserModeController.java
+  s_dfd3390801b580::t_6c340e611347db 227-231,246-249,254-257,261-265,272-275,280
+  s_dfd3390801b580::t_d591d88a61242d 172-207
+  s_dfd3390801b580::t_dc91484749e58e 281-292
+  s_dfd3390801b580::t_275536a55850e6 1-53,55-64,66-113,115-118,121-125,130-135,141-171,208-212,214-226,232-236,243-245,250-253,258-260,266-271,276-279,293-294,296-341
+  s_dfd3390801b580::t_2d49d9aaf6aeda 119-120
+  s_dfd3390801b580::t_9d09602a56886d 54,65,114,213,295
+  s_dfd3390801b580::t_591de9e201ffd9 126-129,136-140
+  s_dfd3390801b580::t_249537e3a37752 237-242
+app/src/main/res/values/strings.xml
+  s_dfd3390801b580::t_734c217fbda3df 535-541,952
+app/src/main/java/com/nutomic/syncthingandroid/service/state/NormalSyncthingStateAccess.java
+  s_dfd3390801b580::t_5d75c13794fbf5 1-3,7-82,107-111,180-182
+  s_dfd3390801b580::t_ea35046a06c041 114-115,117,119-121,127-129,136-138
+  s_dfd3390801b580::t_884120af1aa4b3 4-6,83-106,112-113,116,118,122-126,130-135,139-179
+app/src/main/java/com/nutomic/syncthingandroid/settings/SuperuserPreferenceUiState.kt
+  s_dfd3390801b580::t_734c217fbda3df 1-58,61-91
+  s_dfd3390801b580::t_e9238fcb744d40 59-60
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingStateTransfer.java
+  s_dfd3390801b580::t_fd32f9416b65c1 1-3,5-17,19-20,25-36,38,40-43,45,48,50-51,55-56,60-93,96-98,100,103-105
+  s_143aa52c59d6cc::t_0a8bbac3900a08 101
+  s_143aa52c59d6cc::t_5d55f64f225ed4 18,21-24,37,39,46-47,52-54,57-59,94-95,99,102
+  s_143aa52c59d6cc::t_b06d420749fede 49
+  s_dfd3390801b580::t_2c7622aa807e65 4,44
+app/src/main/java/com/nutomic/syncthingandroid/DaggerComponent.java
+  s_dfd3390801b580::t_1b664443084d17 20,30
+app/src/test/java/com/nutomic/syncthingandroid/service/execution/SyncthingCommandTest.java
+  s_dfd3390801b580::t_7aa19e3f22ed3c 1-46
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserContractTest.java
+  s_dfd3390801b580::t_a2518b6b2714bd 1-4,7-50
+  s_dfd3390801b580::t_a47bd5cafba48c 5-6
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserBooleanResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-38
+app/src/main/java/com/nutomic/syncthingandroid/service/RestApi.java
+  s_dfd3390801b580::t_d01f08931c2109 189,191-194,201,1275,1293-1300
+  s_dfd3390801b580::t_f609e1bfe7eb1e 54-55,185-186,1272-1274,1276-1280
+app/src/main/java/com/nutomic/syncthingandroid/onboarding/OnboardingActivity.kt
+  s_909f94353bc49f::t_3cbc3e739d25f2 28,42-53,471-476,479,485,490
+app/src/main/AndroidManifest.xml
+  s_dfd3390801b580::t_9ba2515a57c0ba 197
+  s_dfd3390801b580::t_fef3dbd5d41255 198-199
+app/src/test/java/com/nutomic/syncthingandroid/superuser/ProcessIdentityTest.java
+  s_dfd3390801b580::t_c3a871bf7a6328 1-55
+app/src/main/java/com/nutomic/syncthingandroid/fragments/FolderListFragment.java
+  s_9f2e6a6a9de5c5::t_bc9793cdb09fc7 161,164-168
+  s_9f2e6a6a9de5c5::t_2071fe499fd11d 64,152-154,172,241
+  s_407d6abdd05eeb::t_ef0350983460f3 115,130-138,140-142,148,150-151,155-157
+  s_9f2e6a6a9de5c5::t_e4fc16db18d2bd 26,62-63,139,143-147,149,158-160,162-163,169-171,173-178,209-213
+  s_9f2e6a6a9de5c5::t_b422dd1495e685 116-120
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserCoreExitResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-53
+app/src/main/java/com/nutomic/syncthingandroid/superuser/OrphanRecoveryPolicy.java
+  s_dfd3390801b580::t_a997d4f1fd86e0 1-119
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingExecutionBackend.java
+  s_dfd3390801b580::t_0eff2564fbd31e 1-58,61-72
+  s_dfd3390801b580::t_8dc72b35d32299 59-60
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingExecutionException.java
+  s_dfd3390801b580::t_6daa708c72f159 1-13
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingRunnable.java
+  s_dfd3390801b580::t_43ef38119b8535 245,248-254
+  s_dfd3390801b580::t_6daa708c72f159 19-22,53,62-63,73-76,85-89,94-95,97,136-139
+  s_dfd3390801b580::t_e7928a8446931d 65-66,98-102,110,181,207-210
+  s_dfd3390801b580::t_e63368030a4ed3 179
+  s_dfd3390801b580::t_a4e62f6ba1a04f 72
+app/src/main/java/com/nutomic/syncthingandroid/service/folder/SyncthingFolderAccess.java
+  s_dfd3390801b580::t_ffc339eedeff24 1-10
+app/src/test/java/com/nutomic/syncthingandroid/service/state/SyncthingStateAccessRouterTest.java
+  s_dfd3390801b580::t_d7fc656b9fa816 1-110
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserClientTest.java
+  s_34f203b4cdb2f4::t_d75edf0fcb1f80 263-267
+  s_7bc59de5467065::t_0cd094619d584c 41,50,52-53,58,60,80,82,86-87,237-250,252,280-282,288-289,315,322,338,349,372,376-385,393-398,402,414-419,423,425-426,431,433-435,437-438
+  s_9f2e6a6a9de5c5::t_bc9793cdb09fc7 285
+  s_34f203b4cdb2f4::t_3618ae7c514740 26,114-147
+  s_143aa52c59d6cc::t_63c2eaf6d12eec 354-361
+  s_dfd3390801b580::t_46e055ab58fc58 1-15,17-19,27-28,31,33,36-40,42-49,293-301,303-314,316-321,323-337,339-343,369-371,386-392,399-401,403-413,461-557
+  s_9f2e6a6a9de5c5::t_ca544b8b1be7f6 51,83-85,253-255
+  s_143aa52c59d6cc::t_902b8faeb191ef 16,20,344-348,350-353,362-368
+  s_34f203b4cdb2f4::t_dcb4ace7085801 59,251
+  s_dfd3390801b580::t_bd7271c0b17181 29-30,32,34-35
+  s_34f203b4cdb2f4::t_f16b709ca5801b 21-25,64,66-79,81,88-113,148-236,420-422,424,427-430,432,439-460
+  s_7bc59de5467065::t_31cad2f451110d 256-262,268-277,436
+  s_7bc59de5467065::t_3e63d0c8b07b06 302
+  s_9f2e6a6a9de5c5::t_cd174fbd1e0c0d 54-57,61-63,65,278-279,283-284,286-287,290-292,373-375
+app/src/main/java/com/nutomic/syncthingandroid/activities/FolderActivity.java
+  s_dfd3390801b580::t_b973c997000a40 158-161,524-525,762,771-793
+  s_dfd3390801b580::t_20e916ed6a6561 52-53,149-151
+app/src/main/java/com/nutomic/syncthingandroid/service/folder/ConfiguredFolderPathMatcher.java
+  s_dfd3390801b580::t_ffc339eedeff24 1-56
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingServiceSuperuserPolicyTest.java
+  s_dfd3390801b580::t_3cba481739df3d 1-40,42-48,60-61
+  s_dfd3390801b580::t_de90b4866ec1bc 41,49-59
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingImportPreferenceTest.java
+  s_dfd3390801b580::t_4184b79d2a76cb 30,44,48
+  s_dfd3390801b580::t_3685e191e8baf7 1-27,31,34-43,45-47,49-50
+  s_dfd3390801b580::t_02c5583cac549b 28-29,32-33
+app/src/main/java/com/nutomic/syncthingandroid/superuser/ProcessIdentity.java
+  s_dfd3390801b580::t_a997d4f1fd86e0 1-17
+app/build.gradle.kts
+  s_dfd3390801b580::t_7aa19e3f22ed3c 32-33,44-49,65,75
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserModeControllerTest.java
+  s_dfd3390801b580::t_32444c82b8d48b 17-18,125-174
+  s_dfd3390801b580::t_ff4dd41d451d6c 41-42,71-72,91-92,278-279,284
+  s_dfd3390801b580::t_7e27938ae19b86 80,100,232
+  s_dfd3390801b580::t_dc91484749e58e 89-90
+  s_dfd3390801b580::t_a7754ddc5dfe68 1-16,19-40,43-70,73-79,81-88,93-99,101-124,175-231,233-277,280-283,285-286
+app/src/test/java/com/nutomic/syncthingandroid/fragments/ListFragmentSuperuserUnavailableTest.java
+  s_407d6abdd05eeb::t_8c4b3860c92b59 616-618
+  s_7bc59de5467065::t_9e78ddf92dbb68 642-643
+  s_407d6abdd05eeb::t_00c15aa7e250e7 511-514,520-522,537-540,546-548
+  s_407d6abdd05eeb::t_2356dfb65a5adf 77,79,81,85
+  s_9f2e6a6a9de5c5::t_87d221cee10d6d 27-28,114-159,241-285,434-436,440-447,453-458,462-469,621-622,624-628,678,680-681,696-699,705,707-710,731,738-749
+  s_7bc59de5467065::t_8a670ecbdb2af9 300,320,347,375,644-650,657-662
+  s_407d6abdd05eeb::t_4339973827fad0 560-565,567-569,571-573
+  s_407d6abdd05eeb::t_4a3b6218398e4b 1-8,12-25,29-34,38-39,41-44,46-47,49-50,53,88-113,182-240,475-477,508-510,515-519,523-529,531-536,541-545,549-555,557-559,603-604,608-613,615,619-620,629-641,651-656,663-677,682-688,691-693,695,701-704,706,761-769,771-786
+  s_7bc59de5467065::t_bd6639533c7f1a 26,286-299,301-319,321-346,348-374,376-433,576-583,586-602,605,711-730,732-737,750-760
+  s_7bc59de5467065::t_600bcb3e435620 9,614,623,770
+  s_407d6abdd05eeb::t_cfde5809b6bf8a 10-11,689-690,694
+  s_407d6abdd05eeb::t_14e6a76c4de7a1 35-37,40,48,51,54-76,78,80,82-84,86-87
+  s_407d6abdd05eeb::t_ef2d55c751298b 45,52,574-575,584
+  s_9f2e6a6a9de5c5::t_16f93978d73abf 160-181,679,700
+  s_9f2e6a6a9de5c5::t_b5c4286f4cbee3 437-439,448-451,459-461,470-473
+  s_9f2e6a6a9de5c5::t_a8f041986aa522 530,556
+  s_407d6abdd05eeb::t_2dc1a2ef8ff000 566,570
+  s_407d6abdd05eeb::t_f180498e8a18ca 585
+  s_9f2e6a6a9de5c5::t_762edf4714d006 452,474
+  s_407d6abdd05eeb::t_d7968e1888982b 606-607
+  s_9f2e6a6a9de5c5::t_a029450536bde8 478-507
+app/src/test/java/com/nutomic/syncthingandroid/superuser/OrphanRecoveryPolicyTest.java
+  s_dfd3390801b580::t_8c88f5bb924890 51
+  s_dfd3390801b580::t_c3a871bf7a6328 1-50,52-177
+app/src/main/java/com/nutomic/syncthingandroid/settings/SettingsBehaviorScreen.kt
+  s_dfd3390801b580::t_734c217fbda3df 3,6-11,15,17-20,35-56,64-89
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserCoreStatus.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/test/java/com/nutomic/syncthingandroid/service/folder/SyncthingFolderAccessTest.java
+  s_dfd3390801b580::t_bc35bd0895e010 1-50,54-60,63-181
+  s_dfd3390801b580::t_271f24a4f804bd 51-53,61-62
+app/src/main/java/com/nutomic/syncthingandroid/fragments/DeviceListFragment.java
+  s_9f2e6a6a9de5c5::t_e4fc16db18d2bd 27,73-74,150,154-158,160,169-171,173-174,180-182,184-189,218-222
+  s_9f2e6a6a9de5c5::t_2071fe499fd11d 75,163-165,183,261
+  s_9f2e6a6a9de5c5::t_b422dd1495e685 127-131
+  s_9f2e6a6a9de5c5::t_bc9793cdb09fc7 172,175-179
+  s_407d6abdd05eeb::t_ef0350983460f3 126,141-149,151-153,159,161-162,166-168
+app/src/androidTest/java/com/nutomic/syncthingandroid/superuser/SuperuserManifestTest.java
+  s_dfd3390801b580::t_9ba2515a57c0ba 1-29
+app/src/test/java/com/nutomic/syncthingandroid/service/RestApiFolderAccessTest.java
+  s_dfd3390801b580::t_7c1e8437f5c5a1 14-15,17,19-20
+  s_dfd3390801b580::t_029feea46e0833 1-13,16,18,21-50
+app/src/main/java/com/nutomic/syncthingandroid/superuser/ProcessIdentityStore.java
+  s_dfd3390801b580::t_8c88f5bb924890 92-96,98
+  s_dfd3390801b580::t_a997d4f1fd86e0 1-91,97,99-249
+app/src/main/java/com/nutomic/syncthingandroid/superuser/ProcessIdentityRecordState.java
+  s_dfd3390801b580::t_a997d4f1fd86e0 1-9
+app/src/main/java/com/nutomic/syncthingandroid/service/AppPrefs.java
+  s_dfd3390801b580::t_a84d8818cedd59 37-54
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserClient.java
+  s_dfd3390801b580::t_13da95148e1bc9 330
+  s_9f2e6a6a9de5c5::t_63ab4d55b00bb0 17,41,53,57-61,67-69,74,112-113,115,117,124-125,180,810-812,814-815,846-847,849
+  s_143aa52c59d6cc::t_1628237804a190 33-34,880-890
+  s_dfd3390801b580::t_ccec02ef91b392 501-548
+  s_34f203b4cdb2f4::t_31d6519d9d4f65 23,47,107,111,118,123,126-179,211-220,282-287,813,818-836,851-859
+  s_dfd3390801b580::t_143e8c8f2d2556 600-622
+  s_dfd3390801b580::t_e58d5a48788b2c 11,448-497
+  s_dfd3390801b580::t_9cfa7e8667c88a 549-599
+  s_dfd3390801b580::t_c635feeecd48a9 1-6,9,12-13,19,21-22,24-32,35-40,42-46,48-52,54-55,62-66,70,73,75-77,80,87-97,102-106,108-110,121,181-210,221-281,288-329,331-335,623-626,633,647-660,662-707,709-716,718-722,724-725,736-791,794-795,797-800,837-845,891
+  s_7bc59de5467065::t_f5f0689013f9da 14-15,114,116,119-120,122,816-817,848,850
+  s_9f2e6a6a9de5c5::t_16f93978d73abf 18
+  s_34f203b4cdb2f4::t_3d25931f6dc31c 78-79,81-86
+  s_dfd3390801b580::t_8614d0c732c2b3 878-879
+  s_dfd3390801b580::t_1bbff601e5fa10 8,10,792-793,796,801-809
+  s_dfd3390801b580::t_dd6175fdef7521 7,16,20,71-72,336-447,498-500,627-632,634-646,860-877
+  s_dfd3390801b580::t_9fe787d285f367 56,661,708,717,723,726,732,735
+  s_dfd3390801b580::t_8dc72b35d32299 98-101
+  s_dfd3390801b580::t_77f2108c749901 727-731,733-734
+app/src/main/java/com/nutomic/syncthingandroid/util/ConfigXml.java
+  s_dfd3390801b580::t_d0a94fce6f3cc1 249
+  s_dfd3390801b580::t_fcdc5105d598d0 10,23-25,28,66-67,107-108,113-118,120,242-244,252-254,1277-1278,1294-1295,1297-1299
+  s_dfd3390801b580::t_1e02ceef5210c3 12,136,221
+app/src/test/java/com/nutomic/syncthingandroid/service/NotificationHandlerSuperuserTest.java
+  s_dfd3390801b580::t_75ab5e5be2b0f8 15,33,48
+  s_dfd3390801b580::t_bea688821cb172 1-13,18-19,22-32,34-47,49-51
+  s_dfd3390801b580::t_80018583dc2a9d 14,16-17,20-21
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingExecutionResult.java
+  s_dfd3390801b580::t_6daa708c72f159 1-5
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserStateFileResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-46
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserCoreExitResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateAccessException.java
+  s_dfd3390801b580::t_5d75c13794fbf5 1-13
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateAccessRouter.java
+  s_dfd3390801b580::t_5d75c13794fbf5 1-61
+app/src/test/java/com/nutomic/syncthingandroid/service/execution/SyncthingExecutionControllerTest.java
+  s_dfd3390801b580::t_ab91248f4f33c8 1-3,5-10,12-31,72-74,77-80,82,86-89,91,95-121
+  s_dfd3390801b580::t_c06f6a4e6110d7 4,32-71,75-76,81,83-85,90,92-94
+  s_dfd3390801b580::t_6f86bced7f7643 11
+app/src/main/java/com/nutomic/syncthingandroid/service/folder/SyncthingFolderAccessException.java
+  s_dfd3390801b580::t_ffc339eedeff24 1-13
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SyncthingSuperuserService.java
+  s_143aa52c59d6cc::t_4640ab84b00f05 36-39
+  s_dfd3390801b580::t_48304512832866 8-9,23,26-28,43-45,47,75-76,92,216,220-223,233,237,240-259,261,264-272,274-275,277-280,287-298,321-326,404-409,413-553
+  s_dfd3390801b580::t_a6aaecdf8010d6 24,136,143,149,586-621,623-667,948
+  s_dfd3390801b580::t_1d1b7655758b34 11-14,22,25,32,42,73,77-78,99,105,111,117,180-182,190-207,217-219,224-229,231-232,234-236,238-239,281,286,299-301,303-315,317-320,327-336,338-345,347-354,386,394-400,402-403,410-412,554-560,562-566,580,582-585
+  s_dfd3390801b580::t_2398c40fe04e1c 74,86,302,346,401,561
+  s_dfd3390801b580::t_9f7817d293d165 29-31,168,871-874,878-888,890-935
+  s_143aa52c59d6cc::t_7c0680077b9391 48-58,60-72,691-711,713,715-720,722-727,729-731,733-736,741-744,746-753,758-762,766-797,936,940-946,949-951,958-968
+  s_dfd3390801b580::t_01b62eace048cf 17,156,162,668-672,674-675,677-690,712,714,721,728,732,737-740,745,754-755,763-765,798-845,847-848,937-939,947
+  s_dfd3390801b580::t_d591d88a61242d 84,91,98,104,110,116,122,129,135,142,148,155,161,167,183-189,673,676,875-877,889
+  s_dfd3390801b580::t_69d5b34b692042 260,262-263,364,366,369,374-385,387-390
+  s_143aa52c59d6cc::t_2e40630a48c1dc 59
+  s_dfd3390801b580::t_2acd68e81574e4 15-16,123,130,849-870
+  s_dfd3390801b580::t_c62daaf9079519 622
+  s_143aa52c59d6cc::t_7ae945bdd6e42f 756-757
+  s_dfd3390801b580::t_cadc51d9cba3cc 208-215,230
+  s_dfd3390801b580::t_9ba2515a57c0ba 1-7,10,20-21,33-35,40-41,79-83,85,87-90,93-97,100-103,106-109,112-115,118-121,124-128,131-134,137-141,144-147,150-154,157-160,163-166,169-179,316,952-957,969
+  s_dfd3390801b580::t_93b5c17605e646 337
+  s_dfd3390801b580::t_c14e8a88714c4e 18,846
+  s_dfd3390801b580::t_ca7d846286bd15 19
+  s_dfd3390801b580::t_fef3dbd5d41255 46,273,276,282-285,355-363,365,367-368,370-373,391-393,567-579,581
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateTransferRouter.java
+  s_dfd3390801b580::t_270ea9d4f13796 1-47
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserOperationResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-64
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserBooleanResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+gradle/libs.versions.toml
+  s_dfd3390801b580::t_db56a3e6ffbae0 94-95
+  s_dfd3390801b580::t_7aa19e3f22ed3c 16-21,88-93
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserCoreStatus.java
+  s_dfd3390801b580::t_ff49fabc057181 1-41
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateTransfer.java
+  s_dfd3390801b580::t_270ea9d4f13796 1-11
+app/src/test/java/com/nutomic/syncthingandroid/service/execution/NormalSyncthingExecutionBackendTest.java
+  s_dfd3390801b580::t_ab91248f4f33c8 1-103,105-126,128-161
+  s_dfd3390801b580::t_351cd1c4f37772 104,127
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/NormalSyncthingExecutionBackend.java
+  s_dfd3390801b580::t_6daa708c72f159 1-80
+app/src/main/java/com/nutomic/syncthingandroid/service/folder/SyncthingFolderAccessRouter.java
+  s_dfd3390801b580::t_33a3ecd2a2144e 1-46
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingProcessOutput.java
+  s_dfd3390801b580::t_6daa708c72f159 1-96
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_dfd3390801b580::t_ece1bd0aa0455b 364,420,504,623,1282,1529,1596,1676,1724,1805
+  s_dfd3390801b580::t_8da6bb2bbf0f99 782,809,811-812,817-820,822-829,831-833,836-838,843-853
+  s_dfd3390801b580::t_23c0c5aca56ba2 532-537
+  s_dfd3390801b580::t_1f1881b774255a 400-404,1087-1100
+  s_dfd3390801b580::t_e98c5abf22fb4d 22,269-271
+  s_143aa52c59d6cc::t_b06d420749fede 1259,1261-1263,1329-1336,1339
+  s_dfd3390801b580::t_d591d88a61242d 1442,1445-1459
+  s_dfd3390801b580::t_bb84b26a1fd426 1615-1630,1632-1634,1636,1639-1640,1643
+  s_dfd3390801b580::t_fdaf9be780b6b4 1631
+  s_dfd3390801b580::t_7041d00f17bd66 1759-1761,1763,1768
+  s_143aa52c59d6cc::t_6f6af9b63668db 1764-1766
+  s_143aa52c59d6cc::t_fddc97be5064de 1936-1942
+  s_dfd3390801b580::t_95fdc05cbcb6fb 18,24-30,48-51,53,172-176,219-220,252-260,272-280
+  s_dfd3390801b580::t_437e413c1bb119 943-1086,1101-1102
+  s_dfd3390801b580::t_5a8b9d26423622 1727-1730,1733-1745,1749-1755
+  s_dfd3390801b580::t_e2ef13e37d31bc 777-781,898
+  s_dfd3390801b580::t_da0a27f2d5ae0d 503,518-519
+  s_dfd3390801b580::t_de61b2edc60f3c 861-897,899-942
+  s_143aa52c59d6cc::t_8ded31c2291c6e 1194,1204-1208,1251-1255,1257-1258,1260,1268-1271,1290-1324,1328,1337-1338,1340-1378
+  s_143aa52c59d6cc::t_93ee927b53c741 1767
+  s_dfd3390801b580::t_bc0a292f95ccd3 1811
+  s_dfd3390801b580::t_04365aef418588 52
+  s_dfd3390801b580::t_4dd957cbd67880 625-626,632-636,642-649,678
+  s_dfd3390801b580::t_3a3e64c0bc48dc 307-315,763-767
+  s_dfd3390801b580::t_4853b83b6ec1c9 373,376-381
+  s_143aa52c59d6cc::t_4640ab84b00f05 1325
+  s_143aa52c59d6cc::t_a2d4c6f383d397 1237
+  s_dfd3390801b580::t_4184b79d2a76cb 1831-1837
+  s_dfd3390801b580::t_87925335530531 19
+  s_dfd3390801b580::t_bb8d9303149ddf 20-21,23,267-268,281,1241-1243,1245-1249,1267,1272,1463-1466,1468-1475,1479-1481,1484-1485,1487-1490,1500,1507-1515
+  s_dfd3390801b580::t_23c03311728af1 374-375
+  s_dfd3390801b580::t_6756b70e019b92 462-470
+  s_dfd3390801b580::t_89d3be55d5c56b 1146,1151
+  s_dfd3390801b580::t_4dd4237564f9a7 1655-1656,1667-1671
+  s_dfd3390801b580::t_3b367f67fba599 1578-1579,1582-1592,1594,1602
+  s_143aa52c59d6cc::t_7942bc774ea01b 1326-1327
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserUidResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/main/java/com/nutomic/syncthingandroid/service/state/SyncthingStateFile.java
+  s_dfd3390801b580::t_ff49fabc057181 1-48
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserStringListResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/androidTest/java/com/nutomic/syncthingandroid/settings/SettingsBehaviorSuperuserTest.kt
+  s_dfd3390801b580::t_2ddb790e8d1974 1-7,9-13,15-35,37-52,54-69,71,73-74
+  s_dfd3390801b580::t_0a491b003426b2 14,72
+  s_dfd3390801b580::t_cf2d43ade56d48 8,36,53,70
+app/src/test/java/com/nutomic/syncthingandroid/superuser/RootRestartRecoveryRegressionTest.java
+  s_909f94353bc49f::t_1ae73a98b553be 1-291
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserErrorCode.java
+  s_dfd3390801b580::t_a84d8818cedd59 1-47
+app/src/main/java/com/nutomic/syncthingandroid/service/Constants.java
+  s_dfd3390801b580::t_a84d8818cedd59 54-55
+app/src/main/java/com/nutomic/syncthingandroid/service/execution/SyncthingExecutionController.java
+  s_dfd3390801b580::t_6daa708c72f159 1-52
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserRuntimeStatusTest.java
+  s_dfd3390801b580::t_7aa19e3f22ed3c 1-34
+app/src/main/java/com/nutomic/syncthingandroid/service/folder/NormalSyncthingFolderAccess.java
+  s_dfd3390801b580::t_ffc339eedeff24 1-23,25-46,48-137
+  s_dfd3390801b580::t_fffa4306a1e295 24
+  s_dfd3390801b580::t_85eccf8c477592 47
+app/src/test/java/com/nutomic/syncthingandroid/onboarding/OnboardingSuperuserRoutingTest.java
+  s_909f94353bc49f::t_1cc13b3e187108 1-89
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingExecutionBackendTest.java
+  s_dfd3390801b580::t_c06f6a4e6110d7 1-132,138-139
+  s_dfd3390801b580::t_3cb5690ed0289d 133-137
+app/src/test/java/com/nutomic/syncthingandroid/settings/SuperuserPreferenceUiStateTest.kt
+  s_dfd3390801b580::t_2ddb790e8d1974 1-126
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserUidResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-39
+app/src/main/java/com/nutomic/syncthingandroid/service/NotificationHandler.java
+  s_dfd3390801b580::t_2b9bf2c62796ca 22,127,159
+  s_dfd3390801b580::t_77f3dda21e43b7 117,128,157,160,193,204,245-271
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/ISyncthingSuperuserService.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-31
+app/src/test/java/com/nutomic/syncthingandroid/service/state/SyncthingStateTransferTest.java
+  s_143aa52c59d6cc::t_4640ab84b00f05 187-190
+  s_dfd3390801b580::t_3685e191e8baf7 1-15,17,19-20,22,25-34,47-94,105-113,161-186,191-207
+  s_143aa52c59d6cc::t_83bcb63d650982 16,114-160
+  s_143aa52c59d6cc::t_71137ac714bd97 18,95-104
+  s_143aa52c59d6cc::t_b0a8977b8660ca 21,23-24,35-46
+app/src/main/java/com/nutomic/syncthingandroid/service/state/NormalSyncthingStateTransfer.java
+  s_143aa52c59d6cc::t_28d5f03d2ccfde 82
+  s_dfd3390801b580::t_01b62eace048cf 176-178,195-196
+  s_dfd3390801b580::t_02c5583cac549b 4-6,254,280,350-352,374-377,381
+  s_143aa52c59d6cc::t_060cb047e849fa 364-367
+  s_dfd3390801b580::t_42410a53fe3ae1 19-20,42,113-122,152-155,166-167,205-213,216-218,229,239-240,244-247,266,271-272,302-303,328-329
+  s_143aa52c59d6cc::t_16470cd883c6fe 369-370
+  s_dfd3390801b580::t_f2d96f56cf9cd5 257-259,378-380
+  s_143aa52c59d6cc::t_431247c43995ed 360
+  s_143aa52c59d6cc::t_42823175f18dec 65,135-138
+  s_143aa52c59d6cc::t_6403ac292e5f38 47-48,51,55,68-70,72-77,79-81,83-84,331-334
+  s_143aa52c59d6cc::t_b06d420749fede 160,179-194
+  s_dfd3390801b580::t_a98757279cbb90 197-198,204,215
+  s_dfd3390801b580::t_ea35046a06c041 330,335
+  s_143aa52c59d6cc::t_dacb14869eceee 362-363,368
+  s_143aa52c59d6cc::t_ee8b52220a0fe6 358-359,361
+  s_143aa52c59d6cc::t_4ce27be04659bb 371-373
+  s_143aa52c59d6cc::t_50184eb01d0476 50,52,58-60,123-134,139-151,199,220-227,241-243,248-251,273-277,284-286,313-315,353-357
+  s_dfd3390801b580::t_270ea9d4f13796 1-3,7-18,21-41,43-46,49,53-54,56-57,61-64,66-67,71,78,85-112,156-159,161-165,168-175,200-203,214,219,228,230-238,252-253,255-256,260-265,267-270,278-279,281-283,287-301,304-312,316-327,336-349,382-384
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserOperationResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserSecurityRegressionTest.java
+  s_dfd3390801b580::t_2c739be3756a5f 1-62,133-161
+  s_143aa52c59d6cc::t_a59f8fde48351c 104-106
+  s_dfd3390801b580::t_32444c82b8d48b 63-89,91-95,110-132
+  s_dfd3390801b580::t_c812e487d7f8b6 90
+  s_143aa52c59d6cc::t_83bcb63d650982 96-103,107-109
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingStateAccess.java
+  s_dfd3390801b580::t_e58d5a48788b2c 1-137
+app/src/main/aidl/com/nutomic/syncthingandroid/superuser/SuperuserStateFileResult.aidl
+  s_dfd3390801b580::t_ff49fabc057181 1-3
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserStringListResult.java
+  s_dfd3390801b580::t_ff49fabc057181 1-38
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingServiceExportTest.java
+  s_143aa52c59d6cc::t_b763d434838abf 8-9,12-13,28,30,32,188-222
+  s_143aa52c59d6cc::t_83bcb63d650982 1-3,6-7,19-21,26,40,44-45,55-62,428-440
+  s_143aa52c59d6cc::t_f87a780611564d 4-5,11,14-16,22-25,27,29,31,33-36,38,42,46-54,63-117,119-120,123-126,134-139,141-146,223-225,358-372,399-427
+  s_143aa52c59d6cc::t_6264e028d6a932 41
+  s_143aa52c59d6cc::t_165bfc928121b9 226,310-345,349-357
+  s_143aa52c59d6cc::t_d591fbf2d2170d 227-309
+  s_143aa52c59d6cc::t_5a8bafb95faf9a 18,121,147-150,389-397
+  s_143aa52c59d6cc::t_52c82c39ac3093 17,37,39,118,122,127-133,140,151-187,373-388,398
+  s_143aa52c59d6cc::t_e90649ef215c92 10,43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1ba01a0a6b0825b36fc4206dba9165fd54c4ffdd",
+  "prompts": {},
+  "sessions": {
+    "s_143aa52c59d6cc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a047f6-27dd-7112-8cdc-373e54b70782",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_34f203b4cdb2f4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0510c-4f84-79d2-8717-e745cd392b16",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_407d6abdd05eeb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04af3-f3e4-7cf2-af75-af1c34ba4063",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_7bc59de5467065": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a050bc-19d8-7193-b543-bda5d49767f9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_909f94353bc49f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04529-9c8e-7ff0-8cb1-666865960777",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_9f2e6a6a9de5c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04b8e-23b1-77e1-a8b3-0d6286d0c893",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    },
+    "s_dfd3390801b580": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a042dc-5904-7280-bfc0-3e359d699ef2",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <daniel@danielbyon.com>"
+    }
+  }
+}
