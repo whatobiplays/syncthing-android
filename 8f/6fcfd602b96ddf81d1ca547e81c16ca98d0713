@@ -1,0 +1,60 @@
+app/src/test/java/com/nutomic/syncthingandroid/superuser/OrphanRecoveryPolicyTest.java
+  s_33d7dae6b4d078::t_7b0ef99af9c4e4 50
+  s_33d7dae6b4d078::t_1b7d83302c8f3a 51,114
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserModeControllerTest.java
+  s_33d7dae6b4d078::t_21f2233307293d 92
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserClientTest.java
+  s_33d7dae6b4d078::t_2e7beb207eafdf 53,67,82,97,122,165,187,200,228,245,377-380
+  s_33d7dae6b4d078::t_5075e9ca1d418c 269
+app/src/test/java/com/nutomic/syncthingandroid/superuser/ProcessIdentityTest.java
+  s_33d7dae6b4d078::t_7b0ef99af9c4e4 34,53,66
+  s_33d7dae6b4d078::t_1b7d83302c8f3a 35,54,67
+  s_33d7dae6b4d078::t_21f2233307293d 5,58-65,68-71
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserSyncthingFolderAccess.java
+  s_33d7dae6b4d078::t_316f2b180999ba 35-38
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SyncthingSuperuserService.java
+  s_33d7dae6b4d078::t_1509339fd46eaa 61,621-625,655,657,670
+  s_33d7dae6b4d078::t_316f2b180999ba 20,31,33-34,51-60,223,226,229-238,254-255,626-631,652,656,680,899,907-964
+app/src/test/java/com/nutomic/syncthingandroid/activities/FolderActivityWriteabilityTest.java
+  s_33d7dae6b4d078::t_21f2233307293d 1-19
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserModeController.java
+  s_33d7dae6b4d078::t_316f2b180999ba 133-140
+app/src/main/java/com/nutomic/syncthingandroid/superuser/ProcessIdentityStore.java
+  s_33d7dae6b4d078::t_409a43bc432b0c 8,30,33-34,38-41,45-47,49,54-58,103,112,195-200,203
+  s_33d7dae6b4d078::t_316f2b180999ba 4,10,59,88-90,104-111,113-116,202,210-212,224-225
+app/src/test/java/com/nutomic/syncthingandroid/superuser/SuperuserBoundaryReviewTest.java
+  s_33d7dae6b4d078::t_21f2233307293d 1-5,7-67,85-95,98-115,118-124,126-127
+  s_33d7dae6b4d078::t_0fe4b8c344ffb2 125
+  s_33d7dae6b4d078::t_1b7d83302c8f3a 96,116
+  s_33d7dae6b4d078::t_7b0ef99af9c4e4 97,117
+  s_33d7dae6b4d078::t_754e0a6fe91bbe 6,68-84
+app/src/test/java/com/nutomic/syncthingandroid/superuser/JavaSecureFileAccess.java
+  s_33d7dae6b4d078::t_8b6d39229bd10c 1-93
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SecureFileAccess.java
+  s_33d7dae6b4d078::t_8b6d39229bd10c 1-162
+app/src/main/java/com/nutomic/syncthingandroid/activities/FolderActivity.java
+  s_33d7dae6b4d078::t_316f2b180999ba 773,787,792-796,818-819,824-827
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserClient.java
+  s_33d7dae6b4d078::t_2e7beb207eafdf 42,54,58,63-68,82,106
+app/src/test/java/com/nutomic/syncthingandroid/superuser/RootRestartRecoveryRegressionTest.java
+  s_33d7dae6b4d078::t_1b7d83302c8f3a 111
+  s_33d7dae6b4d078::t_7b0ef99af9c4e4 110
+app/src/main/java/com/nutomic/syncthingandroid/superuser/SuperuserStringListResult.java
+  s_33d7dae6b4d078::t_316f2b180999ba 23,26-30,33,37-38,45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8f6fcfd602b96ddf81d1ca547e81c16ca98d0713",
+  "prompts": {},
+  "sessions": {
+    "s_33d7dae6b4d078": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07a86-b3ee-76c2-ac09-6dc20dd15003",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
