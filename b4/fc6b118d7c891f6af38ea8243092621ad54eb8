@@ -1,0 +1,110 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/SyncthingEnvironment.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-116
+gradle/libs.versions.toml
+  s_6283fad199b0b6::t_b214a408817baa 48,83
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutableNotFoundException.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-3,5-8
+  s_6283fad199b0b6::t_d3b25500039149 4
+app/src/main/java/com/nutomic/syncthingandroid/runtime/AppUidConfigStorage.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-55
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_6283fad199b0b6::t_d3a889f88d9a9d 18-19,236-238,593,598-602,655-661,663,667,748
+  s_6283fad199b0b6::t_555d7bbe33ec59 20,313,342,344,361,435,544,977,1107,1171,1240,1288,1376
+  s_6283fad199b0b6::t_525261f9dd4b2d 669-673
+  s_6283fad199b0b6::t_f3df01d85ba3d2 662,664-666,674
+  s_6283fad199b0b6::t_6180eaad9d6abb 668
+  s_6283fad199b0b6::t_277cf3af9b34ca 675-676
+app/src/main/java/com/nutomic/syncthingandroid/activities/FolderActivity.java
+  s_6283fad199b0b6::t_8e58cd848d7048 48-49,149-151,764-765
+app/src/main/java/com/nutomic/syncthingandroid/service/RestApi.java
+  s_6283fad199b0b6::t_8e58cd848d7048 53-55,186-187,1270-1272,1297-1299
+app/src/main/java/com/nutomic/syncthingandroid/runtime/FolderIgnoreResult.java
+  s_6283fad199b0b6::t_e72461890ce02b 1-18
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-29,31-35,43-54,64-66,68-69
+  s_6283fad199b0b6::t_d3b25500039149 30
+  s_6283fad199b0b6::t_e72461890ce02b 55-62
+  s_6283fad199b0b6::t_c01e43aaf661ab 36-42
+  s_6283fad199b0b6::t_9db0aecbc4372b 63,67
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionAdmissionException.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-8
+app/src/main/java/com/nutomic/syncthingandroid/runtime/SyncthingCommand.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-30
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingLaunchFailurePolicy.java
+  s_6283fad199b0b6::t_f3df01d85ba3d2 1-19
+app/src/main/java/com/nutomic/syncthingandroid/runtime/FolderEvent.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-16
+app/src/main/java/com/nutomic/syncthingandroid/runtime/SyncthingExecution.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-8,11-30,34-36,38-45
+  s_6283fad199b0b6::t_c01e43aaf661ab 9-10,37
+  s_6283fad199b0b6::t_572f69874f307a 31-33
+app/src/main/java/com/nutomic/syncthingandroid/runtime/PrivilegeBackend.java
+  s_6283fad199b0b6::t_9db0aecbc4372b 34
+  s_6283fad199b0b6::t_e72461890ce02b 30-33
+  s_6283fad199b0b6::t_d6d9adee16117d 1-15,24-29,35-45
+  s_6283fad199b0b6::t_c01e43aaf661ab 16-23
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ConfigStorage.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-19
+app/src/main/java/com/nutomic/syncthingandroid/runtime/AppUidBackend.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-3,6-9,13-14,16,19-26,29,33-35,42-43,60-62,65-66,72,76-96,149-152,154-181,191,204
+  s_6283fad199b0b6::t_8186949a401033 4-5,10-12,15,27-28
+  s_6283fad199b0b6::t_2e8963ff3b7a05 63-64
+  s_6283fad199b0b6::t_56b3a7a7b3d140 97-147
+  s_6283fad199b0b6::t_c01e43aaf661ab 17-18,30-32,36-41,44-59,67-71,73-75,182-190,192-203
+  s_6283fad199b0b6::t_9db0aecbc4372b 148,153
+app/src/main/java/com/nutomic/syncthingandroid/util/ConfigXml.java
+  s_6283fad199b0b6::t_b8a4803580c6c5 765-768,776-779
+  s_6283fad199b0b6::t_d363a42864a036 20-21,23,108,119-121,124-125
+  s_6283fad199b0b6::t_555d7bbe33ec59 27,140,225
+  s_6283fad199b0b6::t_807f95412a09e3 18-19,34,106,113-118,245-246,250,260,1233,1241-1242,1258-1259
+  s_6283fad199b0b6::t_2cf410f642c203 67-69
+  s_6283fad199b0b6::t_2b24fe969ea290 22,137,214,224
+  s_6283fad199b0b6::t_b8ac9011586df7 107
+app/src/main/java/com/nutomic/syncthingandroid/DaggerComponent.java
+  s_6283fad199b0b6::t_ce70092bcc3d9b 14,29-30
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_6283fad199b0b6::t_377c126bb61924 208
+  s_6283fad199b0b6::t_e72461890ce02b 322-329,331-333
+  s_6283fad199b0b6::t_30713aec4886d7 7,10-11,14-15,134,136-137,152,154-162,164,168,170-171,193-202,204,215-216,225-230,235-282,292-293,330,340-344,362-371,373-388,394-397,399,403-409,422-494,499
+  s_6283fad199b0b6::t_b214a408817baa 1-6,8-9,12-13,16-84,105-130,165-167,209-214,217-224,232-234,283-286,288-291,294-299,301-321,335-339,345-361,495-498,500-526
+  s_6283fad199b0b6::t_1356bcf243a441 85-104,131-133,135,138-151,153,163
+  s_6283fad199b0b6::t_9ea4709b8ddab6 334
+  s_6283fad199b0b6::t_9db0aecbc4372b 231
+  s_6283fad199b0b6::t_824ad0d25b5f95 372,389,398
+  s_6283fad199b0b6::t_5203179154c80f 169,172-192,203,205-207,287,300,390-393,400-402,410-421
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingLaunchFailurePolicyTest.java
+  s_6283fad199b0b6::t_7efb79a4306efc 1-23
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingRunnable.java
+  s_6283fad199b0b6::t_75ce6e91c236c2 95-99,111,148,206-213
+  s_6283fad199b0b6::t_0d6b48800d7838 20-25,61,70-71,78,82,110,122-123,130,143-144,147,204-205,235-236,238-240,247,371-383,386,389,391-392,401-404
+  s_6283fad199b0b6::t_2e8963ff3b7a05 194-196
+app/src/main/java/com/nutomic/syncthingandroid/runtime/FolderWriteability.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-7
+app/src/main/java/com/nutomic/syncthingandroid/onboarding/OnboardingActivity.kt
+  s_6283fad199b0b6::t_2b24fe969ea290 29
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ConflictDiscoveryResult.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-22
+app/build.gradle.kts
+  s_6283fad199b0b6::t_b214a408817baa 12
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ConfiguredFolderReference.java
+  s_6283fad199b0b6::t_d6d9adee16117d 1-31
+app/src/main/java/com/nutomic/syncthingandroid/SyncthingModule.java
+  s_6283fad199b0b6::t_ce70092bcc3d9b 6-7,35-39
+  s_6283fad199b0b6::t_4adf888c593dff 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b4fc6b118d7c891f6af38ea8243092621ad54eb8",
+  "prompts": {},
+  "sessions": {
+    "s_6283fad199b0b6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ec09-28f6-72a0-b683-57ed21890348",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
