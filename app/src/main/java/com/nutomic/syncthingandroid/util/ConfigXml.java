@@ -19,6 +19,7 @@ import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.runtime.ConfigStorage;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
+import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 import com.nutomic.syncthingandroid.runtime.FolderIgnoreResult;
 import com.nutomic.syncthingandroid.service.AppPrefs;
@@ -74,7 +75,30 @@ public class ConfigXml {
 
     private Boolean ENABLE_VERBOSE_LOG = false;
 
-    public class OpenConfigException extends RuntimeException {
+    public static class OpenConfigException extends RuntimeException {
+        public OpenConfigException() {
+        }
+
+        public OpenConfigException(Throwable cause) {
+            super(cause);
+        }
+    }
+
+    @FunctionalInterface
+    interface OneShotCommand {
+        String run() throws ExecutableNotFoundException;
+    }
+
+    /**
+     * Runs a one-shot bundled Syncthing command and maps admission rejection to the configuration
+     * operation's existing failure type.
+     */
+    static String runOneShot(OneShotCommand command) throws ExecutableNotFoundException {
+        try {
+            return command.run();
+        } catch (ExecutionAdmissionException e) {
+            throw new OpenConfigException(e);
+        }
     }
 
     /**
@@ -137,7 +161,7 @@ public class ConfigXml {
     public void generateConfig() throws OpenConfigException, ExecutableNotFoundException {
         // Create new secret keys and config.
         Log.i(TAG, "(Re)Generating keys and config.");
-        new SyncthingRunnable(mContext, SyncthingCommand.GENERATE).run(true);
+        runOneShot(() -> new SyncthingRunnable(mContext, SyncthingCommand.GENERATE).run(true));
         parseConfig();
         Boolean changed = false;
 
@@ -211,7 +235,7 @@ public class ConfigXml {
             Log.d(TAG, "getLocalDeviceIDfromPref: Local device ID unavailable, trying to retrieve it from syncthing ...");
             try {
                 localDeviceID = getLocalDeviceIDandStoreToPref();
-            } catch (ExecutableNotFoundException e) {
+            } catch (ExecutableNotFoundException | OpenConfigException e) {
                 Log.e(TAG, "getLocalDeviceIDfromPref: Failed to execute syncthing core");
             }
             if (TextUtils.isEmpty(localDeviceID)) {
@@ -222,7 +246,9 @@ public class ConfigXml {
     }
 
     private String getLocalDeviceIDandStoreToPref() throws ExecutableNotFoundException {
-        String logOutput = new SyncthingRunnable(mContext, SyncthingCommand.DEVICE_ID).run(true);
+        String logOutput = runOneShot(
+                () -> new SyncthingRunnable(mContext, SyncthingCommand.DEVICE_ID).run(true)
+        );
         String localDeviceID = logOutput.replace("\n", "");
 
         // Verify that local device ID is correctly formatted.

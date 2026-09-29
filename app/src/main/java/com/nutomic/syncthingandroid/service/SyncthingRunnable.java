@@ -57,6 +57,33 @@ public class SyncthingRunnable implements Runnable {
     private static final int LOG_FILE_MAX_LINES = 200000;
     private static final int LOG_FILE_BUFFER_SIZE = 1024 * 1024;
 
+    @FunctionalInterface
+    interface ExecutionExitWaiter {
+        void await() throws InterruptedException;
+    }
+
+    /**
+     * Waits for an execution to exit even when the waiting thread is interrupted.
+     *
+     * <p>Interruption is remembered and restored only after the exit has been observed. This keeps
+     * runtime admission occupied until the execution has actually terminated.</p>
+     */
+    static void awaitUntilExit(ExecutionExitWaiter waiter, Runnable onInterrupted) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                waiter.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+                onInterrupted.run();
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private final Context mContext;
     private final SyncthingCommand mCommand;
     private final File mSyncthingLogFile;
@@ -204,12 +231,11 @@ public class SyncthingRunnable implements Runnable {
             if (execution != null) {
                 execution.destroy();
                 if (!executionExitObserved) {
-                    try {
-                        execution.await();
-                    } catch (InterruptedException e) {
-                        Log.w(TAG, "Interrupted while waiting for Syncthing termination", e);
-                        Thread.currentThread().interrupt();
-                    }
+                    SyncthingExecution activeExecution = execution;
+                    awaitUntilExit(
+                            () -> activeExecution.await(),
+                            () -> Log.w(TAG, "Interrupted while waiting for Syncthing termination")
+                    );
                 }
             }
         }

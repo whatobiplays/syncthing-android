@@ -165,6 +165,39 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void resetDatabaseCannotOverlapServeUntilServeActuallyExits() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        DelayedTerminationExecution execution = new DelayedTerminationExecution();
+        backend.execution = execution;
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingEnvironment environment = SyncthingEnvironment.builder()
+                .home("/home")
+                .syncthingHome("/state")
+                .trace("")
+                .monitored()
+                .noUpgrade()
+                .versionExtra("app")
+                .sqliteTemporaryDirectory("/tmp")
+                .gogc(100)
+                .build();
+
+        SyncthingExecution serve = runtime.start(SyncthingCommand.SERVE, environment);
+        serve.destroy();
+
+        assertThrows(
+                ExecutionAdmissionException.class,
+                () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
+        );
+
+        execution.exit(0);
+        assertEquals(0, serve.await());
+
+        backend.execution = new ImmediateExecution();
+        SyncthingExecution reset = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
+        assertEquals(0, reset.await());
+    }
+
+    @Test
     public void interruptedAwaitKeepsAdmissionUntilExecutionExit() throws Exception {
         RecordingBackend backend = new RecordingBackend();
         InterruptedThenDelayedExitExecution execution = new InterruptedThenDelayedExitExecution();

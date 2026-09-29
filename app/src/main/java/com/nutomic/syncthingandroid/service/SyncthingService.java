@@ -335,14 +335,10 @@ public class SyncthingService extends Service {
              * 3. Relaunch syncthing native if it was previously running.
              */
             Log.i(TAG, "Invoking reset of database");
-            if (mCurrentState != State.DISABLED) {
-                // Shutdown synchronously.
-                shutdown(State.DISABLED);
-            }
-            new SyncthingRunnable(this, SyncthingCommand.RESET_DATABASE).run();
-            if (mLastDeterminedShouldRun) {
-                launchStartupTask(SyncthingCommand.SERVE);
-            }
+            requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
+                    () -> mLastDeterminedShouldRun,
+                    () -> launchStartupTask(SyncthingCommand.SERVE)
+            ));
         } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
             /**
              * 1. Stop syncthing native if it's running.
@@ -674,6 +670,34 @@ public class SyncthingService extends Service {
         shutdown(terminalState);
     }
 
+    /**
+     * Requests the existing database reset operation after any service-owned Syncthing execution
+     * has been shut down. Admission rejection is handled here so one-shot failures cannot detach
+     * or terminate the invocation that currently owns runtime admission.
+     */
+    private void requestResetDatabase(@Nullable Runnable afterReset) {
+        Runnable reset = () -> {
+            try {
+                new SyncthingRunnable(this, SyncthingCommand.RESET_DATABASE).run();
+            } catch (ExecutionAdmissionException e) {
+                Log.e(TAG, "Database reset rejected because another Syncthing invocation is active", e);
+                return;
+            }
+            if (afterReset != null) {
+                afterReset.run();
+            }
+        };
+
+        if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
+                mCurrentState,
+                mSyncthingRunnable != null
+        )) {
+            shutdown(State.DISABLED, reset);
+        } else {
+            reset.run();
+        }
+    }
+
     @Override
     public SyncthingServiceBinder onBind(Intent intent) {
         return mBinder;
@@ -711,10 +735,18 @@ public class SyncthingService extends Service {
      * Performs a synchronous shutdown of the native binary.
      */
     private void shutdown(State newState) {
+        shutdown(newState, null);
+    }
+
+    /**
+     * Shuts down the service-owned Syncthing invocation and runs a completion action only after
+     * the runnable has joined and runtime admission has been released.
+     */
+    private void shutdown(State newState, @Nullable Runnable afterShutdown) {
         if (mCurrentState == State.STARTING) {
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
-                shutdown(newState);
+                shutdown(newState, afterShutdown);
             }, 1000);
             return;
         }
@@ -746,17 +778,64 @@ public class SyncthingService extends Service {
 
         if (mSyncthingRunnable != null) {
             mRuntime.terminateBundledSyncthing();
-            if (mSyncthingRunnableThread != null) {
-                LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
-                try {
-                    mSyncthingRunnableThread.join();
-                } catch (InterruptedException e) {
-                    Log.w(TAG, "mSyncthingRunnableThread InterruptedException");
-                }
+            Runnable afterExecutionExit = () -> {
                 Log.d(TAG, "Finished mSyncthingRunnableThread.");
                 mSyncthingRunnableThread = null;
+                mSyncthingRunnable = null;
+                if (afterShutdown != null) {
+                    afterShutdown.run();
+                }
+            };
+            if (mSyncthingRunnableThread != null) {
+                LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
+                Thread syncthingRunnableThread = mSyncthingRunnableThread;
+                joinUntilTerminated(
+                        syncthingRunnableThread::join,
+                        afterExecutionExit,
+                        () -> Log.w(TAG, "mSyncthingRunnableThread InterruptedException")
+                );
+            } else {
+                afterExecutionExit.run();
             }
-            mSyncthingRunnable = null;
+        } else if (afterShutdown != null) {
+            afterShutdown.run();
+        }
+    }
+
+    @FunctionalInterface
+    interface ShutdownJoiner {
+        void join() throws InterruptedException;
+    }
+
+    /**
+     * Waits for a service-owned runnable to terminate before running shutdown completion work.
+     *
+     * <p>An interruption only cancels the current join attempt. The method keeps joining until
+     * termination is observed, then runs completion work and restores the interrupt flag. This
+     * ordering keeps lifecycle handles and runtime admission valid while the runnable is alive.</p>
+     */
+    static void joinUntilTerminated(
+            ShutdownJoiner joiner,
+            Runnable afterTermination,
+            Runnable onInterrupted
+    ) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                joiner.join();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+                onInterrupted.run();
+            }
+        }
+
+        try {
+            afterTermination.run();
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -1092,22 +1171,22 @@ public class SyncthingService extends Service {
             sharedPreferencesFile.delete();
         }
 
+        Runnable startAfterImport = SyncthingResetPolicy.relaunchAfterReset(
+                () -> mLastDeterminedShouldRun,
+                () -> postServeStartupIfNeeded(true)
+        );
+        boolean resetRequested = false;
         try {
-            cleanupImportedFolderDatabases();
+            resetRequested = cleanupImportedFolderDatabases(
+                    startAfterImport
+            );
         } catch (Exception e) {
             Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e);
         }
 
         // Start syncthing after import if run conditions apply.
-        if (mLastDeterminedShouldRun) {
-            Handler mainLooper = new Handler(Looper.getMainLooper());
-            Runnable launchStartupTaskRunnable = new Runnable() {
-                @Override
-                public void run() {
-                    launchStartupTask(SyncthingCommand.SERVE);
-                }
-            };
-            mainLooper.post(launchStartupTaskRunnable);
+        if (!resetRequested) {
+            startAfterImport.run();
         }
         return failSuccess;
     }
@@ -1340,18 +1419,24 @@ public class SyncthingService extends Service {
         file.setExecutable(false, false);
     }
 
-    private void cleanupImportedFolderDatabases() {
+    private void postServeStartupIfNeeded(boolean shouldRun) {
+        if (shouldRun) {
+            new Handler(Looper.getMainLooper()).post(() -> launchStartupTask(SyncthingCommand.SERVE));
+        }
+    }
+
+    private boolean cleanupImportedFolderDatabases(Runnable afterReset) {
         ConfigXml configXml = new ConfigXml(this);
         try {
             configXml.loadConfig();
         } catch (ConfigXml.OpenConfigException e) {
             Log.w(TAG, "importConfig: Unable to parse imported config for DB cleanup");
-            return;
+            return false;
         }
 
         final List<Folder> folders = configXml.getFolders();
         if (folders == null || folders.isEmpty()) {
-            return;
+            return false;
         }
 
         for (Folder folder : folders) {
@@ -1373,10 +1458,11 @@ public class SyncthingService extends Service {
 
             if (folderPathMissing || markerMissing) {
                 Log.i(TAG, "importConfig: Folder path or marker missing for folder id \"" + folder.id + "\". Resetting Syncthing database.");
-                new SyncthingRunnable(this, SyncthingCommand.RESET_DATABASE).run();
-                break;
+                requestResetDatabase(afterReset);
+                return true;
             }
         }
+        return false;
     }
 
     private boolean importConfigSharedPrefs(final File file) {
