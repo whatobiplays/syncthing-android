@@ -32,8 +32,9 @@ public class SyncthingRunnableCleanupTest {
         Thread.interrupted();
 
         try {
-            SyncthingRunnable.awaitUntilExit(
+            TerminationWait.awaitTermination(
                     waiter::await,
+                    () -> { },
                     () -> interruptionCount[0]++
             );
 
@@ -71,8 +72,9 @@ public class SyncthingRunnableCleanupTest {
             SyncthingExecution first = runtime.start(SyncthingCommand.SERVE, environment);
             first.destroy();
 
-            SyncthingRunnable.awaitUntilExit(
+            TerminationWait.awaitTermination(
                     () -> first.await(),
+                    () -> { },
                     () -> {
                         if (execution.interruptionsObserved == 1) {
                             assertThrows(

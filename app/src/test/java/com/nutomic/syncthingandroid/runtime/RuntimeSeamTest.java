@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -13,10 +14,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
@@ -235,6 +246,132 @@ public class RuntimeSeamTest {
         backend.execution = new ImmediateExecution();
         SyncthingExecution second = runtime.start(SyncthingCommand.DEVICE_ID, environment);
         second.await();
+    }
+
+    @Test
+    public void waitingServiceLifecycleStartKeepsAdmissionPriorityOverOneShotStarts()
+            throws Exception {
+        QueuedExecutionBackend backend = new QueuedExecutionBackend();
+        GatedExecution firstExecution = new GatedExecution();
+        GatedExecution serveExecution = new GatedExecution();
+        backend.queueExecution(firstExecution);
+        backend.queueExecution(serveExecution);
+        backend.queueExecution(new ImmediateExecution());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingEnvironment environment = normalModeEnvironment();
+
+        SyncthingExecution first = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
+
+        ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor();
+        try {
+            Future<SyncthingExecution> serveStart = lifecycleExecutor.submit(
+                    () -> runtime.startServiceLifecycle(SyncthingCommand.SERVE, environment)
+            );
+
+            // The registered lifecycle start keeps the next admission: one-shot attempts are
+            // rejected while it waits, while the active invocation is only destroyed, and in the
+            // handoff window after that invocation's exit has been observed.
+            runtime.whileServiceLifecycleStartWaits(() -> {
+                assertThrows(
+                        ExecutionAdmissionException.class,
+                        () -> runtime.start(SyncthingCommand.DEVICE_ID, environment)
+                );
+
+                first.destroy();
+                assertTrue(firstExecution.destroyRequested);
+                assertThrows(
+                        ExecutionAdmissionException.class,
+                        () -> runtime.start(SyncthingCommand.DEVICE_ID, environment)
+                );
+                assertFalse(serveStart.isDone());
+                assertEquals(1, backend.startCount());
+
+                firstExecution.exit(0);
+                assertEquals(0, first.await());
+                assertThrows(
+                        ExecutionAdmissionException.class,
+                        () -> runtime.start(SyncthingCommand.DEVICE_ID, environment)
+                );
+            });
+
+            // The waiting lifecycle start receives the next admission, not a one-shot.
+            SyncthingExecution serve = serveStart.get(5, TimeUnit.SECONDS);
+            assertEquals(2, backend.startCount());
+            assertSame(SyncthingCommand.SERVE, backend.startedCommand(1));
+
+            // One-shots stay rejected while the lifecycle invocation owns admission.
+            assertThrows(
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.DEVICE_ID, environment)
+            );
+
+            // After the lifecycle invocation exits, one-shots are admitted again.
+            serveExecution.exit(137);
+            assertEquals(137, serve.await());
+            SyncthingExecution deviceId = runtime.start(SyncthingCommand.DEVICE_ID, environment);
+            assertEquals(0, deviceId.await());
+            assertEquals(3, backend.startCount());
+            assertSame(SyncthingCommand.DEVICE_ID, backend.startedCommand(2));
+        } finally {
+            lifecycleExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    public void serviceLifecycleStartsAcquireAdmissionOnlyAfterThePreviousExecutionExits()
+            throws Exception {
+        QueuedExecutionBackend backend = new QueuedExecutionBackend();
+        GatedExecution firstExecution = new GatedExecution();
+        GatedExecution serveExecution = new GatedExecution();
+        backend.queueExecution(firstExecution);
+        backend.queueExecution(serveExecution);
+        backend.queueExecution(new ImmediateExecution());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingEnvironment environment = normalModeEnvironment();
+
+        SyncthingExecution first = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
+        ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch serveRequested = new CountDownLatch(1);
+            Future<SyncthingExecution> serveStart = lifecycleExecutor.submit(() -> {
+                serveRequested.countDown();
+                return runtime.startServiceLifecycle(SyncthingCommand.SERVE, environment);
+            });
+            assertTrue(serveRequested.await(5, TimeUnit.SECONDS));
+            assertFalse(serveStart.isDone());
+
+            firstExecution.exit(0);
+            assertEquals(0, first.await());
+
+            SyncthingExecution serve = serveStart.get(5, TimeUnit.SECONDS);
+            assertThrows(
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.DEVICE_ID, environment)
+            );
+
+            CountDownLatch deltasRequested = new CountDownLatch(1);
+            Future<SyncthingExecution> deltasStart = lifecycleExecutor.submit(() -> {
+                deltasRequested.countDown();
+                return runtime.startServiceLifecycle(
+                        SyncthingCommand.RESET_DELTAS,
+                        environment
+                );
+            });
+            assertTrue(deltasRequested.await(5, TimeUnit.SECONDS));
+            assertFalse(deltasStart.isDone());
+
+            serveExecution.exit(137);
+            assertEquals(137, serve.await());
+
+            SyncthingExecution deltas = deltasStart.get(5, TimeUnit.SECONDS);
+            assertEquals(0, deltas.await());
+            assertEquals(3, backend.startCount());
+            assertSame(SyncthingCommand.RESET_DATABASE, backend.startedCommand(0));
+            assertSame(SyncthingCommand.SERVE, backend.startedCommand(1));
+            assertSame(SyncthingCommand.RESET_DELTAS, backend.startedCommand(2));
+        } finally {
+            lifecycleExecutor.shutdownNow();
+        }
     }
 
     @Test
@@ -470,6 +607,165 @@ public class RuntimeSeamTest {
         private void exit(int exitCode) {
             this.exitCode = exitCode;
             exited = true;
+        }
+    }
+
+    /**
+     * Builds the Normal Mode environment contract shared by the admission tests.
+     */
+    private static SyncthingEnvironment normalModeEnvironment() {
+        return SyncthingEnvironment.builder()
+                .home("/home")
+                .syncthingHome("/state")
+                .trace("")
+                .monitored()
+                .noUpgrade()
+                .versionExtra("app")
+                .sqliteTemporaryDirectory("/tmp")
+                .gogc(100)
+                .build();
+    }
+
+    /**
+     * Backend that hands out queued executions and fails the test when two bundled invocations
+     * were active at the same time.
+     */
+    private static final class QueuedExecutionBackend implements PrivilegeBackend {
+        private final AtomicInteger activeInvocations = new AtomicInteger();
+        private final List<SyncthingCommand> startedCommands =
+                Collections.synchronizedList(new ArrayList<>());
+        private final Deque<PrivilegeBackend.Execution> queuedExecutions =
+                new ConcurrentLinkedDeque<>();
+
+        void queueExecution(PrivilegeBackend.Execution execution) {
+            queuedExecutions.addLast(execution);
+        }
+
+        int startCount() {
+            return startedCommands.size();
+        }
+
+        SyncthingCommand startedCommand(int index) {
+            return startedCommands.get(index);
+        }
+
+        @Override
+        public Execution start(SyncthingCommand command, SyncthingEnvironment environment) {
+            if (activeInvocations.incrementAndGet() > 1) {
+                throw new AssertionError("Two bundled Syncthing invocations were active at once");
+            }
+            startedCommands.add(command);
+            PrivilegeBackend.Execution delegate = queuedExecutions.removeFirst();
+            return new CountedExecution(delegate, activeInvocations);
+        }
+
+        @Override
+        public void terminateBundledSyncthing() {
+        }
+
+        @Override
+        public ConfigStorage configStorage() {
+            return new InMemoryConfigStorage();
+        }
+
+        @Override
+        public FolderWriteability validateCandidateFolder(String path) {
+            return FolderWriteability.WRITABLE;
+        }
+
+        @Override
+        public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    /**
+     * Execution that releases the backend's active-invocation counter once its exit is observed.
+     */
+    private static final class CountedExecution implements PrivilegeBackend.Execution {
+        private final PrivilegeBackend.Execution delegate;
+        private final AtomicInteger activeInvocations;
+
+        private CountedExecution(
+                PrivilegeBackend.Execution delegate,
+                AtomicInteger activeInvocations
+        ) {
+            this.delegate = delegate;
+            this.activeInvocations = activeInvocations;
+        }
+
+        @Override
+        public InputStream stdout() {
+            return delegate.stdout();
+        }
+
+        @Override
+        public InputStream stderr() {
+            return delegate.stderr();
+        }
+
+        @Override
+        public int await() throws InterruptedException {
+            try {
+                return delegate.await();
+            } finally {
+                activeInvocations.decrementAndGet();
+            }
+        }
+
+        @Override
+        public void destroy() {
+            delegate.destroy();
+        }
+    }
+
+    /**
+     * Execution that stays alive until the test releases its exit gate.
+     */
+    private static final class GatedExecution implements PrivilegeBackend.Execution {
+        private final CountDownLatch exitGate = new CountDownLatch(1);
+        private volatile boolean destroyRequested;
+        private volatile int exitCode;
+
+        @Override
+        public InputStream stdout() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public InputStream stderr() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public int await() throws InterruptedException {
+            exitGate.await();
+            return exitCode;
+        }
+
+        @Override
+        public void destroy() {
+            destroyRequested = true;
+        }
+
+        void exit(int exitCode) {
+            this.exitCode = exitCode;
+            exitGate.countDown();
         }
     }
 

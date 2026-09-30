@@ -580,7 +580,7 @@ public class SyncthingService extends Service {
             Log.e(TAG, "onStartupTaskCompleteListener: Syncthing binary lifecycle violated");
             return;
         }
-        mSyncthingRunnable = new SyncthingRunnable(this, srCommand);
+        mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(this, srCommand);
 
         /**
          * Check if an old syncthing instance is still running.
@@ -789,7 +789,9 @@ public class SyncthingService extends Service {
             if (mSyncthingRunnableThread != null) {
                 LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
                 Thread syncthingRunnableThread = mSyncthingRunnableThread;
-                joinUntilTerminated(
+                // Lifecycle handles and runtime admission stay owned until the runnable thread
+                // has really terminated, so an interruption only cancels the current join attempt.
+                TerminationWait.awaitTermination(
                         syncthingRunnableThread::join,
                         afterExecutionExit,
                         () -> Log.w(TAG, "mSyncthingRunnableThread InterruptedException")
@@ -799,43 +801,6 @@ public class SyncthingService extends Service {
             }
         } else if (afterShutdown != null) {
             afterShutdown.run();
-        }
-    }
-
-    @FunctionalInterface
-    interface ShutdownJoiner {
-        void join() throws InterruptedException;
-    }
-
-    /**
-     * Waits for a service-owned runnable to terminate before running shutdown completion work.
-     *
-     * <p>An interruption only cancels the current join attempt. The method keeps joining until
-     * termination is observed, then runs completion work and restores the interrupt flag. This
-     * ordering keeps lifecycle handles and runtime admission valid while the runnable is alive.</p>
-     */
-    static void joinUntilTerminated(
-            ShutdownJoiner joiner,
-            Runnable afterTermination,
-            Runnable onInterrupted
-    ) {
-        boolean interrupted = false;
-        while (true) {
-            try {
-                joiner.join();
-                break;
-            } catch (InterruptedException e) {
-                interrupted = true;
-                onInterrupted.run();
-            }
-        }
-
-        try {
-            afterTermination.run();
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
     }
 

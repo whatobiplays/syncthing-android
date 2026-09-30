@@ -49,7 +49,7 @@ public class SyncthingResetPolicyTest {
         Thread.interrupted();
 
         try {
-            SyncthingService.joinUntilTerminated(
+            TerminationWait.awaitTermination(
                     join::join,
                     () -> {
                         callbackSawInterrupted[0] = Thread.currentThread().isInterrupted();

@@ -57,35 +57,9 @@ public class SyncthingRunnable implements Runnable {
     private static final int LOG_FILE_MAX_LINES = 200000;
     private static final int LOG_FILE_BUFFER_SIZE = 1024 * 1024;
 
-    @FunctionalInterface
-    interface ExecutionExitWaiter {
-        void await() throws InterruptedException;
-    }
-
-    /**
-     * Waits for an execution to exit even when the waiting thread is interrupted.
-     *
-     * <p>Interruption is remembered and restored only after the exit has been observed. This keeps
-     * runtime admission occupied until the execution has actually terminated.</p>
-     */
-    static void awaitUntilExit(ExecutionExitWaiter waiter, Runnable onInterrupted) {
-        boolean interrupted = false;
-        while (true) {
-            try {
-                waiter.await();
-                break;
-            } catch (InterruptedException e) {
-                interrupted = true;
-                onInterrupted.run();
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
     private final Context mContext;
     private final SyncthingCommand mCommand;
+    private final boolean mWaitForAdmission;
     private final File mSyncthingLogFile;
 
     @Inject
@@ -98,15 +72,39 @@ public class SyncthingRunnable implements Runnable {
     DefaultSyncthingRuntime mRuntime;
 
     /**
-     * Constructs instance.
+     * Constructs instance for a one-shot bundled Syncthing command.
+     *
+     * <p>A one-shot command rejects immediately when another bundled invocation owns runtime
+     * admission.</p>
      *
      * @param command Which type of Syncthing command to execute.
      */
     public SyncthingRunnable(Context context, SyncthingCommand command) {
+        this(context, command, false);
+    }
+
+    /**
+     * Creates the service-owned lifecycle runnable.
+     *
+     * <p>Unlike a one-shot runnable, the service lifecycle runnable waits for a still-active
+     * bundled invocation to exit and release runtime admission before it launches Syncthing.</p>
+     *
+     * @param command Which service lifecycle command to execute.
+     */
+    static SyncthingRunnable forServiceLifecycle(Context context, SyncthingCommand command) {
+        return new SyncthingRunnable(context, command, true);
+    }
+
+    private SyncthingRunnable(
+            Context context,
+            SyncthingCommand command,
+            boolean waitForAdmission
+    ) {
         ((SyncthingApp) context.getApplicationContext()).component().inject(this);
         ENABLE_VERBOSE_LOG = AppPrefs.getPrefVerboseLog(mPreferences);
         mContext = context;
         mCommand = command;
+        mWaitForAdmission = waitForAdmission;
         mSyncthingLogFile = Constants.getSyncthingLogFile(mContext);
     }
 
@@ -122,7 +120,8 @@ public class SyncthingRunnable implements Runnable {
     /**
      * Runs the configured bundled Syncthing command.
      *
-     * @throws ExecutionAdmissionException when another bundled invocation is still active
+     * @throws ExecutionAdmissionException when this one-shot command runs while another bundled
+     *                                     invocation is still active
      */
     public String run(boolean returnStdOut) throws ExecutableNotFoundException {
         Boolean sendStopToService = false;
@@ -147,7 +146,7 @@ public class SyncthingRunnable implements Runnable {
              * Setup and run a new syncthing instance
              */
             SyncthingEnvironment targetEnv = buildEnvironment();
-            execution = mRuntime.start(mCommand, targetEnv);
+            execution = startExecution(targetEnv);
 
             Thread lInfo = null;
             Thread lWarn = null;
@@ -232,8 +231,9 @@ public class SyncthingRunnable implements Runnable {
                 execution.destroy();
                 if (!executionExitObserved) {
                     SyncthingExecution activeExecution = execution;
-                    awaitUntilExit(
-                            () -> activeExecution.await(),
+                    TerminationWait.awaitTermination(
+                            activeExecution::await,
+                            () -> { },
                             () -> Log.w(TAG, "Interrupted while waiting for Syncthing termination")
                     );
                 }
@@ -256,6 +256,21 @@ public class SyncthingRunnable implements Runnable {
 
         // Return captured command line output.
         return capturedStdOut;
+    }
+
+    /**
+     * Opens this runnable's bundled Syncthing invocation through the runtime seam.
+     *
+     * <p>One-shot runnables keep the immediate admission rejection contract. The service lifecycle
+     * runnable waits for the active invocation to release admission, which must not happen on the
+     * main thread.</p>
+     */
+    private SyncthingExecution startExecution(SyncthingEnvironment targetEnv)
+            throws IOException, ExecutableNotFoundException, InterruptedException {
+        if (mWaitForAdmission) {
+            return mRuntime.startServiceLifecycle(mCommand, targetEnv);
+        }
+        return mRuntime.start(mCommand, targetEnv);
     }
 
     private Map<String, String> customEnvironmentVariables(SharedPreferences sp) {
