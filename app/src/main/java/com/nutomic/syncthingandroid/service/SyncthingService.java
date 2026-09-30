@@ -15,6 +15,9 @@ import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.http.PollWebGuiAvailableTask;
 import com.nutomic.syncthingandroid.model.Device;
 import com.nutomic.syncthingandroid.model.Folder;
+import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
+import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
 import com.nutomic.syncthingandroid.util.ConfigXml;
 import com.nutomic.syncthingandroid.util.FileUtils;
@@ -230,6 +233,9 @@ public class SyncthingService extends Service {
     @Inject
     SharedPreferences mPreferences;
 
+    @Inject
+    DefaultSyncthingRuntime mRuntime;
+
     /**
      * Object that must be locked upon accessing mCurrentState
      */
@@ -304,7 +310,7 @@ public class SyncthingService extends Service {
 
         if (ACTION_RESTART.equals(intent.getAction()) && mCurrentState == State.ACTIVE) {
             shutdown(State.INIT);
-            launchStartupTask(SyncthingRunnable.Command.main);
+            launchStartupTask(SyncthingCommand.SERVE);
         } else if (ACTION_STOP.equals(intent.getAction())) {
             if (intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false)) {
                 /**
@@ -329,14 +335,10 @@ public class SyncthingService extends Service {
              * 3. Relaunch syncthing native if it was previously running.
              */
             Log.i(TAG, "Invoking reset of database");
-            if (mCurrentState != State.DISABLED) {
-                // Shutdown synchronously.
-                shutdown(State.DISABLED);
-            }
-            new SyncthingRunnable(this, SyncthingRunnable.Command.resetdatabase).run();
-            if (mLastDeterminedShouldRun) {
-                launchStartupTask(SyncthingRunnable.Command.main);
-            }
+            requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
+                    () -> mLastDeterminedShouldRun,
+                    () -> launchStartupTask(SyncthingCommand.SERVE)
+            ));
         } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
             /**
              * 1. Stop syncthing native if it's running.
@@ -352,7 +354,7 @@ public class SyncthingService extends Service {
                 // Shutdown synchronously.
                 shutdown(State.DISABLED);
             }
-            launchStartupTask(SyncthingRunnable.Command.resetdeltas);
+            launchStartupTask(SyncthingCommand.RESET_DELTAS);
             if (!mLastDeterminedShouldRun) {
                 // Shutdown if syncthing was not running before the UI action was raised.
                 shutdown(State.DISABLED);
@@ -426,7 +428,7 @@ public class SyncthingService extends Service {
                 switch (mCurrentState) {
                     case DISABLED:
                     case INIT:
-                        launchStartupTask(SyncthingRunnable.Command.main);
+                        launchStartupTask(SyncthingCommand.SERVE);
                         break;
                     case STARTING:
                     case ACTIVE:
@@ -535,7 +537,7 @@ public class SyncthingService extends Service {
     /**
      * Prepares to launch the syncthing binary.
      */
-    private void launchStartupTask(SyncthingRunnable.Command srCommand) {
+    private void launchStartupTask(SyncthingCommand srCommand) {
         synchronized (mStateLock) {
             if (mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
                 Log.e(TAG, "launchStartupTask: Wrong state " + mCurrentState + " detected. Cancelling.");
@@ -578,17 +580,22 @@ public class SyncthingService extends Service {
             Log.e(TAG, "onStartupTaskCompleteListener: Syncthing binary lifecycle violated");
             return;
         }
-        mSyncthingRunnable = new SyncthingRunnable(this, srCommand);
+        mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(this, srCommand);
 
         /**
          * Check if an old syncthing instance is still running.
          * This happens after an in-place app upgrade. If so, end it.
          */
-        Util.killProcess(Constants.FILENAME_SYNCTHING_BINARY);
+        mRuntime.terminateBundledSyncthing();
 
         // Start the syncthing binary in a separate thread.
         Thread.UncaughtExceptionHandler syncthingRunnableThreadExceptionHandler = new Thread.UncaughtExceptionHandler() {
                 public void uncaughtException(Thread syncthingRunnableThread, Throwable ex) {
+                    if (ex instanceof ExecutionAdmissionException) {
+                        Log.e(TAG, "mSyncthingRunnableThread: Syncthing execution admission rejected", ex);
+                        mHandler.post(() -> handleSyncthingLaunchFailure());
+                        return;
+                    }
                     Log.e(TAG, "mSyncthingRunnableThread: Uncaught exception [ExecutableNotFoundException]");
                     mNotificationHandler.showCrashedNotification(R.string.executable_not_found, Constants.FILENAME_SYNCTHING_BINARY);
                 }
@@ -641,6 +648,56 @@ public class SyncthingService extends Service {
         }
     }
 
+    /**
+     * Leaves STARTING when the runnable could not create an admitted execution.
+     *
+     * <p>The service owns the lifecycle transition. The runnable reports the failure through its
+     * uncaught-exception path and does not mutate service state itself.</p>
+     */
+    private void handleSyncthingLaunchFailure() {
+        State terminalState;
+        synchronized (mStateLock) {
+            terminalState = SyncthingLaunchFailurePolicy.terminalState(mCurrentState);
+            if (terminalState != mCurrentState) {
+                onServiceStateChange(terminalState);
+            }
+        }
+        // Admission failed before this runnable created an execution. Clear only the failed
+        // lifecycle handles so shutdown does not terminate the already-active invocation that
+        // caused admission to be rejected.
+        mSyncthingRunnable = null;
+        mSyncthingRunnableThread = null;
+        shutdown(terminalState);
+    }
+
+    /**
+     * Requests the existing database reset operation after any service-owned Syncthing execution
+     * has been shut down. Admission rejection is handled here so one-shot failures cannot detach
+     * or terminate the invocation that currently owns runtime admission.
+     */
+    private void requestResetDatabase(@Nullable Runnable afterReset) {
+        Runnable reset = () -> {
+            try {
+                new SyncthingRunnable(this, SyncthingCommand.RESET_DATABASE).run();
+            } catch (ExecutionAdmissionException e) {
+                Log.e(TAG, "Database reset rejected because another Syncthing invocation is active", e);
+                return;
+            }
+            if (afterReset != null) {
+                afterReset.run();
+            }
+        };
+
+        if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
+                mCurrentState,
+                mSyncthingRunnable != null
+        )) {
+            shutdown(State.DISABLED, reset);
+        } else {
+            reset.run();
+        }
+    }
+
     @Override
     public SyncthingServiceBinder onBind(Intent intent) {
         return mBinder;
@@ -678,10 +735,18 @@ public class SyncthingService extends Service {
      * Performs a synchronous shutdown of the native binary.
      */
     private void shutdown(State newState) {
+        shutdown(newState, null);
+    }
+
+    /**
+     * Shuts down the service-owned Syncthing invocation and runs a completion action only after
+     * the runnable has joined and runtime admission has been released.
+     */
+    private void shutdown(State newState, @Nullable Runnable afterShutdown) {
         if (mCurrentState == State.STARTING) {
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
-                shutdown(newState);
+                shutdown(newState, afterShutdown);
             }, 1000);
             return;
         }
@@ -712,18 +777,30 @@ public class SyncthingService extends Service {
         }
 
         if (mSyncthingRunnable != null) {
-            Util.killProcess(Constants.FILENAME_SYNCTHING_BINARY);
-            if (mSyncthingRunnableThread != null) {
-                LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
-                try {
-                    mSyncthingRunnableThread.join();
-                } catch (InterruptedException e) {
-                    Log.w(TAG, "mSyncthingRunnableThread InterruptedException");
-                }
+            mRuntime.terminateBundledSyncthing();
+            Runnable afterExecutionExit = () -> {
                 Log.d(TAG, "Finished mSyncthingRunnableThread.");
                 mSyncthingRunnableThread = null;
+                mSyncthingRunnable = null;
+                if (afterShutdown != null) {
+                    afterShutdown.run();
+                }
+            };
+            if (mSyncthingRunnableThread != null) {
+                LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
+                Thread syncthingRunnableThread = mSyncthingRunnableThread;
+                // Lifecycle handles and runtime admission stay owned until the runnable thread
+                // has really terminated, so an interruption only cancels the current join attempt.
+                TerminationWait.awaitTermination(
+                        syncthingRunnableThread::join,
+                        afterExecutionExit,
+                        () -> Log.w(TAG, "mSyncthingRunnableThread InterruptedException")
+                );
+            } else {
+                afterExecutionExit.run();
             }
-            mSyncthingRunnable = null;
+        } else if (afterShutdown != null) {
+            afterShutdown.run();
         }
     }
 
@@ -941,7 +1018,7 @@ public class SyncthingService extends Service {
             Runnable launchStartupTaskRunnable = new Runnable() {
                 @Override
                 public void run() {
-                    launchStartupTask(SyncthingRunnable.Command.main);
+                    launchStartupTask(SyncthingCommand.SERVE);
                 }
             };
             mainLooper.post(launchStartupTaskRunnable);
@@ -1059,22 +1136,22 @@ public class SyncthingService extends Service {
             sharedPreferencesFile.delete();
         }
 
+        Runnable startAfterImport = SyncthingResetPolicy.relaunchAfterReset(
+                () -> mLastDeterminedShouldRun,
+                () -> postServeStartupIfNeeded(true)
+        );
+        boolean resetRequested = false;
         try {
-            cleanupImportedFolderDatabases();
+            resetRequested = cleanupImportedFolderDatabases(
+                    startAfterImport
+            );
         } catch (Exception e) {
             Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e);
         }
 
         // Start syncthing after import if run conditions apply.
-        if (mLastDeterminedShouldRun) {
-            Handler mainLooper = new Handler(Looper.getMainLooper());
-            Runnable launchStartupTaskRunnable = new Runnable() {
-                @Override
-                public void run() {
-                    launchStartupTask(SyncthingRunnable.Command.main);
-                }
-            };
-            mainLooper.post(launchStartupTaskRunnable);
+        if (!resetRequested) {
+            startAfterImport.run();
         }
         return failSuccess;
     }
@@ -1135,7 +1212,7 @@ public class SyncthingService extends Service {
             restoreFile(certBak, certFile);
             restoreFile(keyBak, keyFile);
             if (mLastDeterminedShouldRun) {
-                launchStartupTask(SyncthingRunnable.Command.main);
+                launchStartupTask(SyncthingCommand.SERVE);
             }
             listener.onResult(HttpsCertReplaceResult.FAILED, e.getMessage());
             return;
@@ -1204,7 +1281,7 @@ public class SyncthingService extends Service {
             if (mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
                 shutdown(State.INIT);
             }
-            launchStartupTask(SyncthingRunnable.Command.main);
+            launchStartupTask(SyncthingCommand.SERVE);
             listener.onResult(HttpsCertReplaceResult.FAILED,
                     "Syncthing did not come online with the new certificate.");
         };
@@ -1252,7 +1329,7 @@ public class SyncthingService extends Service {
         // that is ignored because sawStarting is still false.
         registerOnServiceStateChangeListener(verifyListener[0]);
         mHandler.postDelayed(watchdog[0], HTTPS_CERT_VERIFY_TIMEOUT_MS);
-        launchStartupTask(SyncthingRunnable.Command.main);
+        launchStartupTask(SyncthingCommand.SERVE);
     }
 
     @Nullable
@@ -1307,18 +1384,24 @@ public class SyncthingService extends Service {
         file.setExecutable(false, false);
     }
 
-    private void cleanupImportedFolderDatabases() {
+    private void postServeStartupIfNeeded(boolean shouldRun) {
+        if (shouldRun) {
+            new Handler(Looper.getMainLooper()).post(() -> launchStartupTask(SyncthingCommand.SERVE));
+        }
+    }
+
+    private boolean cleanupImportedFolderDatabases(Runnable afterReset) {
         ConfigXml configXml = new ConfigXml(this);
         try {
             configXml.loadConfig();
         } catch (ConfigXml.OpenConfigException e) {
             Log.w(TAG, "importConfig: Unable to parse imported config for DB cleanup");
-            return;
+            return false;
         }
 
         final List<Folder> folders = configXml.getFolders();
         if (folders == null || folders.isEmpty()) {
-            return;
+            return false;
         }
 
         for (Folder folder : folders) {
@@ -1340,10 +1423,11 @@ public class SyncthingService extends Service {
 
             if (folderPathMissing || markerMissing) {
                 Log.i(TAG, "importConfig: Folder path or marker missing for folder id \"" + folder.id + "\". Resetting Syncthing database.");
-                new SyncthingRunnable(this, SyncthingRunnable.Command.resetdatabase).run();
-                break;
+                requestResetDatabase(afterReset);
+                return true;
             }
         }
+        return false;
     }
 
     private boolean importConfigSharedPrefs(final File file) {
