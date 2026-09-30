@@ -1,0 +1,47 @@
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingRunnable.java
+  s_6283fad199b0b6::t_8b26e2d3127f2c 62,75-78,83-102,107,123-124,149,234-236,261-268,270-274
+  s_6283fad199b0b6::t_fed751dca1e269 269
+  s_6e45b70b7be182::t_60fc4c71856293 275
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingRunnableCleanupTest.java
+  s_6283fad199b0b6::t_dc8984ecbcd09a 35,37,75,77
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_6283fad199b0b6::t_bbd295b57bfd33 14,24-25,27-28,32,40-43,51,53-69
+  s_6283fad199b0b6::t_f4d195996c1cff 117-140,142-181
+  s_6283fad199b0b6::t_720d8927f56242 141
+  s_6283fad199b0b6::t_6dc095f060bc59 20-23,26,29,33-39,44-50,52,71,73-74,77,79
+app/src/main/java/com/nutomic/syncthingandroid/service/TerminationWait.java
+  s_6283fad199b0b6::t_c19a305515db4f 1-54
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_6283fad199b0b6::t_fa87a593eafab7 583,792-794
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_6283fad199b0b6::t_18919deccfc5d8 251,253-255,257,259-262,264-266,269,288,296,299-300,315-376
+  s_6283fad199b0b6::t_5132161a3144b2 613-771
+  s_6283fad199b0b6::t_a7c9b10e60f74f 5,17,20,22,24-30
+  s_6283fad199b0b6::t_13859ab50bac29 252,256,258,263,267-268,270-287,289-295,297-298,301-314
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicyTest.java
+  s_6283fad199b0b6::t_593bc5a40c7f24 52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "23f6a47f51b970c27e50861675dfc03321c8ddf0",
+  "prompts": {},
+  "sessions": {
+    "s_6283fad199b0b6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ec09-28f6-72a0-b683-57ed21890348",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_6e45b70b7be182": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e67d-0812-78b0-a9f2-1a3c3d5e671b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
