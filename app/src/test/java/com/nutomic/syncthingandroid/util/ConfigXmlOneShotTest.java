@@ -1,9 +1,11 @@
 package com.nutomic.syncthingandroid.util;
 
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.fail;
 
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 
 import org.junit.Test;
 
@@ -21,5 +23,20 @@ public class ConfigXmlOneShotTest {
         } catch (ConfigXml.OpenConfigException e) {
             assertSame(admissionFailure, e.getCause());
         }
+    }
+
+    @Test
+    public void executableNotFoundPassesThroughUnchanged() {
+        ExecutableNotFoundException executableNotFound =
+                new ExecutableNotFoundException("missing executable");
+
+        ExecutableNotFoundException thrown = assertThrows(
+                ExecutableNotFoundException.class,
+                () -> ConfigXml.runOneShot(() -> {
+                    throw executableNotFound;
+                })
+        );
+
+        assertSame(executableNotFound, thrown);
     }
 }

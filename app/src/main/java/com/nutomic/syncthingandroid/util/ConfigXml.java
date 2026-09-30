@@ -236,7 +236,7 @@ public class ConfigXml {
             try {
                 localDeviceID = getLocalDeviceIDandStoreToPref();
             } catch (ExecutableNotFoundException | OpenConfigException e) {
-                Log.e(TAG, "getLocalDeviceIDfromPref: Failed to execute syncthing core");
+                Log.e(TAG, "getLocalDeviceIDfromPref: Failed to execute syncthing core", e);
             }
             if (TextUtils.isEmpty(localDeviceID)) {
                 Log.e(TAG, "getLocalDeviceIDfromPref: Local device ID unavailable");

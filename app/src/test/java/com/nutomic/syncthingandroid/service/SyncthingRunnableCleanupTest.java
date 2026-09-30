@@ -50,42 +50,52 @@ public class SyncthingRunnableCleanupTest {
 
     @Test
     public void repeatedTerminationInterruptionsKeepAdmissionUntilExit() throws Exception {
-        RepeatedlyInterruptedExecution execution = new RepeatedlyInterruptedExecution(2);
-        ExecutionBackend backend = new ExecutionBackend(execution);
-        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
-        SyncthingEnvironment environment = SyncthingEnvironment.builder()
-                .home("/home")
-                .syncthingHome("/state")
-                .trace("")
-                .monitored()
-                .noUpgrade()
-                .versionExtra("app")
-                .sqliteTemporaryDirectory("/tmp")
-                .gogc(100)
-                .build();
+        boolean wasInterrupted = Thread.currentThread().isInterrupted();
+        Thread.interrupted();
 
-        SyncthingExecution first = runtime.start(SyncthingCommand.SERVE, environment);
-        first.destroy();
+        try {
+            RepeatedlyInterruptedExecution execution = new RepeatedlyInterruptedExecution(2);
+            ExecutionBackend backend = new ExecutionBackend(execution);
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+            SyncthingEnvironment environment = SyncthingEnvironment.builder()
+                    .home("/home")
+                    .syncthingHome("/state")
+                    .trace("")
+                    .monitored()
+                    .noUpgrade()
+                    .versionExtra("app")
+                    .sqliteTemporaryDirectory("/tmp")
+                    .gogc(100)
+                    .build();
 
-        SyncthingRunnable.awaitUntilExit(
-                () -> first.await(),
-                () -> {
-                    if (execution.interruptionsObserved == 1) {
-                        assertThrows(
-                                ExecutionAdmissionException.class,
-                                () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
-                        );
+            SyncthingExecution first = runtime.start(SyncthingCommand.SERVE, environment);
+            first.destroy();
+
+            SyncthingRunnable.awaitUntilExit(
+                    () -> first.await(),
+                    () -> {
+                        if (execution.interruptionsObserved == 1) {
+                            assertThrows(
+                                    ExecutionAdmissionException.class,
+                                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
+                            );
+                        }
+                        if (execution.interruptionsObserved == 2) {
+                            execution.exit();
+                        }
                     }
-                    if (execution.interruptionsObserved == 2) {
-                        execution.exit();
-                    }
-                }
-        );
+            );
 
-        assertEquals(2, execution.interruptionsObserved);
-        backend.execution = new ImmediateExecution();
-        SyncthingExecution reset = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
-        assertEquals(0, reset.await());
+            assertEquals(2, execution.interruptionsObserved);
+            backend.execution = new ImmediateExecution();
+            SyncthingExecution reset = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
+            assertEquals(0, reset.await());
+        } finally {
+            Thread.interrupted();
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private static final class RepeatedlyInterruptedWaiter {
