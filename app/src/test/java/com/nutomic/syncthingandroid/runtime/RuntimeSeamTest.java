@@ -3,6 +3,8 @@ package com.nutomic.syncthingandroid.runtime;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -28,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
@@ -403,8 +406,6 @@ public class RuntimeSeamTest {
         assertEquals("/configured/folder", backend.folder.path());
         assertEquals(FolderEvent.SYNC_COMPLETE, backend.event);
         assertEquals("sync_complete", FolderEvent.SYNC_COMPLETE.argument());
-        runtime.terminateBundledSyncthing();
-        assertTrue(backend.terminationRequested);
     }
 
     @Test
@@ -413,11 +414,10 @@ public class RuntimeSeamTest {
         binary.deleteOnExit();
         RecordingProcess process = new RecordingProcess("stdout", "stderr", 23);
         RecordingProcessLauncher launcher = new RecordingProcessLauncher(process);
-        boolean[] terminationRequested = new boolean[1];
         AppUidBackend backend = new AppUidBackend(
                 binary,
                 launcher,
-                () -> terminationRequested[0] = true,
+                unownedExecutionManager(),
                 new InMemoryConfigStorage()
         );
         SyncthingEnvironment environment = SyncthingEnvironment.builder()
@@ -441,15 +441,275 @@ public class RuntimeSeamTest {
                 new String[]{binary.getPath(), "device-id"},
                 launcher.argv
         );
-        assertEquals(environment.values(), launcher.environment);
+        assertTrue(launcher.environment.entrySet().containsAll(environment.values().entrySet()));
+        assertFalse(launcher.environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT).isEmpty());
         assertEquals("stdout", new String(execution.stdout().readAllBytes(), StandardCharsets.UTF_8));
         assertEquals("stderr", new String(execution.stderr().readAllBytes(), StandardCharsets.UTF_8));
         assertEquals(23, execution.await());
         execution.destroy();
-        assertTrue(process.destroyed);
+        assertNull(execution.identity());
+        assertFalse(process.destroyed);
+    }
 
-        backend.terminateBundledSyncthing();
-        assertTrue(terminationRequested[0]);
+    @Test
+    public void appUidBackendRecordsTokenAndExactLiveIdentityAfterLaunch() throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        binary.deleteOnExit();
+        ExecutionIdentity[] liveIdentity = new ExecutionIdentity[1];
+        ExecutionIdentity[] durableIdentity = new ExecutionIdentity[1];
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return durableIdentity[0] == null
+                        ? ReadResult.missing()
+                        : ReadResult.valid(durableIdentity[0]);
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) {
+                durableIdentity[0] = identity;
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                if (durableIdentity[0] == null
+                        || !durableIdentity[0].runToken().equals(runToken)) {
+                    return false;
+                }
+                durableIdentity[0] = null;
+                return true;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public ExecutionIdentity inspect(int pid) {
+                return liveIdentity[0] != null && liveIdentity[0].pid() == pid
+                        ? liveIdentity[0]
+                        : null;
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return liveIdentity[0] != null
+                        && executablePath.equals(liveIdentity[0].executablePath())
+                        ? Collections.singletonList(liveIdentity[0])
+                        : Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return liveIdentity[0] != null
+                        && executablePath.equals(liveIdentity[0].executablePath())
+                        && runToken.equals(liveIdentity[0].runToken())
+                        ? liveIdentity[0]
+                        : null;
+            }
+        };
+        ExecutionOwnershipManager ownershipManager = new ExecutionOwnershipManager(
+                binary.getAbsolutePath(), records, inspector,
+                (pid, signal) -> {
+                    throw new AssertionError("Launch verification must not signal the child");
+                }
+        );
+        AppUidBackend backend = new AppUidBackend(
+                binary,
+                (argv, environment) -> {
+                    liveIdentity[0] = new ExecutionIdentity(
+                            123,
+                            456,
+                            "boot-a",
+                            binary.getAbsolutePath(),
+                            environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT)
+                    );
+                    return new RecordingProcess("", "", 0);
+                },
+                ownershipManager,
+                new InMemoryConfigStorage()
+        );
+
+        PrivilegeBackend.Execution execution = backend.start(
+                SyncthingCommand.DEVICE_ID,
+                normalModeEnvironment()
+        );
+
+        assertNotNull(execution.identity());
+        assertEquals(36, execution.identity().runToken().length());
+        assertSame(liveIdentity[0], durableIdentity[0]);
+        assertSame(liveIdentity[0], execution.identity());
+        assertEquals(ExecutionOwnershipManager.Classification.OWNED_EXECUTION,
+                ownershipManager.recover().classification());
+    }
+
+    @Test
+    public void appUidBackendDoesNotSignalChildWhenDurableIdentityRecordingFails()
+            throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        binary.deleteOnExit();
+        GatedRecordingProcess process = new GatedRecordingProcess();
+        ExecutionIdentity[] launchedIdentity = new ExecutionIdentity[1];
+        int[] signalCount = new int[1];
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return ReadResult.missing();
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) throws IOException {
+                throw new IOException("simulated durable write failure");
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                return false;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public ExecutionIdentity inspect(int pid) {
+                return launchedIdentity[0];
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return launchedIdentity[0];
+            }
+        };
+        ExecutionOwnershipManager ownershipManager = new ExecutionOwnershipManager(
+                binary.getAbsolutePath(),
+                records,
+                inspector,
+                (pid, signal) -> signalCount[0]++
+        );
+        AppUidBackend backend = new AppUidBackend(
+                binary,
+                (argv, environment) -> {
+                    launchedIdentity[0] = new ExecutionIdentity(
+                            123,
+                            456,
+                            "boot-a",
+                            binary.getAbsolutePath(),
+                            environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT)
+                    );
+                    return process;
+                },
+                ownershipManager,
+                new InMemoryConfigStorage()
+        );
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        SyncthingEnvironment environment = normalModeEnvironment();
+        SyncthingExecution execution = runtime.start(
+                SyncthingCommand.DEVICE_ID,
+                environment
+        );
+
+        assertNotNull(launchedIdentity[0]);
+        assertNull(execution.identity());
+        execution.destroy();
+        assertEquals(0, signalCount[0]);
+        assertFalse(process.destroyed);
+
+        CountDownLatch awaitStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> oneShotFailure = new AtomicReference<>();
+        AtomicReference<Integer> oneShotResult = new AtomicReference<>();
+        Thread oneShot = new Thread(() -> {
+            awaitStarted.countDown();
+            try {
+                int exitCode = execution.await();
+                execution.requireIdentityForSuccessfulOneShotResult();
+                oneShotResult.set(exitCode);
+            } catch (Throwable failure) {
+                oneShotFailure.set(failure);
+            }
+        });
+        oneShot.start();
+        awaitStarted.await();
+        process.waitStarted.await();
+        assertThrows(
+                ExecutionAdmissionException.class,
+                () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
+        );
+
+        process.exit(0);
+        oneShot.join();
+
+        assertNull(oneShotResult.get());
+        assertNotNull(oneShotFailure.get());
+        assertEquals(
+                "ExecutionIdentityUnavailableException",
+                oneShotFailure.get().getClass().getSimpleName()
+        );
+        assertEquals(0, signalCount[0]);
+
+        SyncthingExecution afterExit = runtime.start(
+                SyncthingCommand.RESET_DATABASE,
+                environment
+        );
+        assertEquals(0, afterExit.await());
+    }
+
+    private static ExecutionOwnershipManager unownedExecutionManager() {
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return ReadResult.missing();
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) {
+                throw new AssertionError("The fixture cannot identify a launched process");
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                return false;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public ExecutionIdentity inspect(int pid) {
+                return null;
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return null;
+            }
+        };
+        return new ExecutionOwnershipManager(
+                "/expected/syncthing",
+                records,
+                inspector,
+                (pid, signal) -> {
+                    throw new AssertionError("An unidentified process must never be signaled");
+                }
+        );
     }
 
     private static final class RecordingBackend implements PrivilegeBackend {
@@ -460,7 +720,6 @@ public class RuntimeSeamTest {
         private ConfiguredFolderReference folder;
         private FolderEvent event;
         private String[] ignore;
-        private boolean terminationRequested;
 
         @Override
         public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
@@ -509,10 +768,6 @@ public class RuntimeSeamTest {
             this.event = event;
         }
 
-        @Override
-        public void terminateBundledSyncthing() {
-            terminationRequested = true;
-        }
     }
 
     private static final class ImmediateExecution implements PrivilegeBackend.Execution {
@@ -657,10 +912,6 @@ public class RuntimeSeamTest {
             startedCommands.add(command);
             PrivilegeBackend.Execution delegate = queuedExecutions.removeFirst();
             return new CountedExecution(delegate, activeInvocations);
-        }
-
-        @Override
-        public void terminateBundledSyncthing() {
         }
 
         @Override
@@ -850,6 +1101,53 @@ public class RuntimeSeamTest {
         @Override
         public void save(byte[] contents) {
             this.contents = contents.clone();
+        }
+    }
+
+    private static final class GatedRecordingProcess extends Process {
+        private final InputStream stdout = new ByteArrayInputStream(new byte[0]);
+        private final InputStream stderr = new ByteArrayInputStream(new byte[0]);
+        private final CountDownLatch exitGate = new CountDownLatch(1);
+        private final CountDownLatch waitStarted = new CountDownLatch(1);
+        private volatile int exitCode;
+        private volatile boolean destroyed;
+
+        @Override
+        public OutputStream getOutputStream() {
+            return new ByteArrayOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return stdout;
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return stderr;
+        }
+
+        @Override
+        public int waitFor() throws InterruptedException {
+            waitStarted.countDown();
+            exitGate.await();
+            return exitCode;
+        }
+
+        @Override
+        public int exitValue() {
+            if (exitGate.getCount() != 0) throw new IllegalThreadStateException();
+            return exitCode;
+        }
+
+        @Override
+        public void destroy() {
+            destroyed = true;
+        }
+
+        private void exit(int exitCode) {
+            this.exitCode = exitCode;
+            exitGate.countDown();
         }
     }
 }

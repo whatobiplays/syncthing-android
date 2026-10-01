@@ -1,6 +1,9 @@
 package com.nutomic.syncthingandroid.service;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -19,102 +22,132 @@ import com.nutomic.syncthingandroid.runtime.SyncthingExecution;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.concurrent.CountDownLatch;
 
 import org.junit.Test;
 
 public class SyncthingRunnableCleanupTest {
 
     @Test
-    public void terminationWaitContinuesThroughInterveningInterruptions() {
-        RepeatedlyInterruptedWaiter waiter = new RepeatedlyInterruptedWaiter(2);
-        int[] interruptionCount = new int[1];
-        boolean wasInterrupted = Thread.currentThread().isInterrupted();
-        Thread.interrupted();
+    public void exitCodeThreeRestartAfterWorkerTerminationClearsHandlesBeforeReplacement()
+            throws Exception {
+        GatedExitCodeExecution exitingExecution = new GatedExitCodeExecution();
+        ExecutionBackend backend = new ExecutionBackend(exitingExecution);
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingEnvironment environment = normalModeEnvironment();
+        SyncthingExecution active = runtime.startServiceLifecycle(
+                SyncthingCommand.SERVE, environment
+        );
 
-        try {
-            TerminationWait.awaitTermination(
-                    waiter::await,
-                    () -> { },
-                    () -> interruptionCount[0]++
-            );
-
-            assertEquals(3, waiter.awaitCount);
-            assertEquals(2, interruptionCount[0]);
-            assertTrue(Thread.currentThread().isInterrupted());
-        } finally {
-            Thread.interrupted();
-            if (wasInterrupted) {
-                Thread.currentThread().interrupt();
+        boolean[] executionExitProven = {false};
+        boolean[] restartQueued = {false};
+        int[] exitCode = {-1};
+        Throwable[] workerFailure = {null};
+        CountDownLatch outcomePublished = new CountDownLatch(1);
+        CountDownLatch allowWorkerTermination = new CountDownLatch(1);
+        Thread lifecycleThread = new Thread(() -> {
+            try {
+                exitCode[0] = active.await();
+                executionExitProven[0] = true;
+                if (exitCode[0] == 3) restartQueued[0] = true;
+                outcomePublished.countDown();
+                allowWorkerTermination.await();
+            } catch (Throwable error) {
+                workerFailure[0] = error;
+                outcomePublished.countDown();
             }
-        }
+        }, "test Syncthing lifecycle");
+        Runnable lifecycleRunnable = () -> { };
+        Thread[] workerHandle = {lifecycleThread};
+        Runnable[] runnableHandle = {lifecycleRunnable};
+        lifecycleThread.start();
+        exitingExecution.exit(3);
+        outcomePublished.await();
+
+        assertNull(workerFailure[0]);
+        assertEquals(3, exitCode[0]);
+        assertTrue(executionExitProven[0]);
+        assertTrue(restartQueued[0]);
+
+        boolean[] recoveryStarted = {false};
+        boolean readyWhileWorkerAlive = LifecycleShutdownBarrier.runWhenReady(
+                executionExitProven[0],
+                lifecycleThread,
+                () -> {
+                    workerHandle[0] = null;
+                    runnableHandle[0] = null;
+                },
+                () -> recoveryStarted[0] = true
+        );
+        assertFalse(readyWhileWorkerAlive);
+        assertSame(lifecycleThread, workerHandle[0]);
+        assertSame(lifecycleRunnable, runnableHandle[0]);
+        assertFalse(recoveryStarted[0]);
+
+        allowWorkerTermination.countDown();
+        lifecycleThread.join();
+        assertFalse(lifecycleThread.isAlive());
+
+        backend.execution = new ImmediateExecution();
+        boolean restartAdmitted = LifecycleShutdownBarrier.runWhenReady(
+                executionExitProven[0],
+                lifecycleThread,
+                () -> {
+                    workerHandle[0] = null;
+                    runnableHandle[0] = null;
+                },
+                () -> {
+                    assertNull(workerHandle[0]);
+                    assertNull(runnableHandle[0]);
+                    try {
+                        SyncthingExecution replacement = runtime.startServiceLifecycle(
+                                SyncthingCommand.SERVE, environment
+                        );
+                        assertEquals(0, replacement.await());
+                        recoveryStarted[0] = true;
+                    } catch (Exception error) {
+                        throw new AssertionError(error);
+                    }
+                }
+        );
+
+        assertTrue(restartAdmitted);
+        assertTrue(recoveryStarted[0]);
     }
 
     @Test
-    public void repeatedTerminationInterruptionsKeepAdmissionUntilExit() throws Exception {
-        boolean wasInterrupted = Thread.currentThread().isInterrupted();
-        Thread.interrupted();
+    public void interruptedExecutionWaitKeepsAdmissionUntilExitIsObserved() throws Exception {
+        RepeatedlyInterruptedExecution execution = new RepeatedlyInterruptedExecution(2);
+        ExecutionBackend backend = new ExecutionBackend(execution);
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingEnvironment environment = SyncthingEnvironment.builder()
+                .home("/home")
+                .syncthingHome("/state")
+                .trace("")
+                .monitored()
+                .noUpgrade()
+                .versionExtra("app")
+                .sqliteTemporaryDirectory("/tmp")
+                .gogc(100)
+                .build();
 
-        try {
-            RepeatedlyInterruptedExecution execution = new RepeatedlyInterruptedExecution(2);
-            ExecutionBackend backend = new ExecutionBackend(execution);
-            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
-            SyncthingEnvironment environment = SyncthingEnvironment.builder()
-                    .home("/home")
-                    .syncthingHome("/state")
-                    .trace("")
-                    .monitored()
-                    .noUpgrade()
-                    .versionExtra("app")
-                    .sqliteTemporaryDirectory("/tmp")
-                    .gogc(100)
-                    .build();
-
-            SyncthingExecution first = runtime.start(SyncthingCommand.SERVE, environment);
-            first.destroy();
-
-            TerminationWait.awaitTermination(
-                    () -> first.await(),
-                    () -> { },
-                    () -> {
-                        if (execution.interruptionsObserved == 1) {
-                            assertThrows(
-                                    ExecutionAdmissionException.class,
-                                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
-                            );
-                        }
-                        if (execution.interruptionsObserved == 2) {
-                            execution.exit();
-                        }
-                    }
+        SyncthingExecution active = runtime.start(SyncthingCommand.SERVE, environment);
+        active.destroy();
+        for (int interruption = 1; interruption <= 2; interruption++) {
+            assertThrows(InterruptedException.class, active::await);
+            assertThrows(
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
             );
-
-            assertEquals(2, execution.interruptionsObserved);
-            backend.execution = new ImmediateExecution();
-            SyncthingExecution reset = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
-            assertEquals(0, reset.await());
-        } finally {
-            Thread.interrupted();
-            if (wasInterrupted) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private static final class RepeatedlyInterruptedWaiter {
-        private int interruptionsRemaining;
-        private int awaitCount;
-
-        private RepeatedlyInterruptedWaiter(int interruptionsRemaining) {
-            this.interruptionsRemaining = interruptionsRemaining;
+            assertEquals(interruption, execution.interruptionsObserved);
         }
 
-        private void await() throws InterruptedException {
-            awaitCount++;
-            if (interruptionsRemaining > 0) {
-                interruptionsRemaining--;
-                throw new InterruptedException("test interruption");
-            }
-        }
+        execution.exit();
+        assertEquals(0, active.await());
+
+        backend.execution = new ImmediateExecution();
+        SyncthingExecution reset = runtime.start(SyncthingCommand.RESET_DATABASE, environment);
+        assertEquals(0, reset.await());
     }
 
     private static final class ExecutionBackend implements PrivilegeBackend {
@@ -128,10 +161,6 @@ public class SyncthingRunnableCleanupTest {
         public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
                 throws java.io.IOException, ExecutableNotFoundException {
             return execution;
-        }
-
-        @Override
-        public void terminateBundledSyncthing() {
         }
 
         @Override
@@ -213,9 +242,7 @@ public class SyncthingRunnableCleanupTest {
                 interruptionsObserved++;
                 throw new InterruptedException("test interruption");
             }
-            if (!exited) {
-                throw new AssertionError("test execution has not exited");
-            }
+            if (!exited) throw new AssertionError("test execution has not exited");
             return 0;
         }
 
@@ -226,5 +253,48 @@ public class SyncthingRunnableCleanupTest {
         private void exit() {
             exited = true;
         }
+    }
+
+    private static final class GatedExitCodeExecution implements PrivilegeBackend.Execution {
+        private final CountDownLatch exitGate = new CountDownLatch(1);
+        private volatile int exitCode;
+
+        @Override
+        public InputStream stdout() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public InputStream stderr() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public int await() throws InterruptedException {
+            exitGate.await();
+            return exitCode;
+        }
+
+        @Override
+        public void destroy() {
+        }
+
+        private void exit(int code) {
+            exitCode = code;
+            exitGate.countDown();
+        }
+    }
+
+    private static SyncthingEnvironment normalModeEnvironment() {
+        return SyncthingEnvironment.builder()
+                .home("/home")
+                .syncthingHome("/state")
+                .trace("")
+                .monitored()
+                .noUpgrade()
+                .versionExtra("app")
+                .sqliteTemporaryDirectory("/tmp")
+                .gogc(100)
+                .build();
     }
 }

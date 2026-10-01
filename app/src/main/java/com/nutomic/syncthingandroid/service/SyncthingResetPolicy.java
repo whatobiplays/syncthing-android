@@ -11,6 +11,11 @@ final class SyncthingResetPolicy {
         boolean get();
     }
 
+    @FunctionalInterface
+    interface IsDestroying {
+        boolean get();
+    }
+
     private SyncthingResetPolicy() {
     }
 
@@ -38,6 +43,18 @@ final class SyncthingResetPolicy {
             if (shouldRun.get()) {
                 relaunch.run();
             }
+        };
+    }
+
+    /**
+     * Creates a service-thread continuation that rechecks destruction when it is dispatched.
+     *
+     * <p>The reset worker must not read service lifecycle state. Supplying the state reader here
+     * defers that read until the handler runs the returned continuation on the service thread.</p>
+     */
+    static Runnable afterResetUnlessDestroying(IsDestroying isDestroying, Runnable afterReset) {
+        return () -> {
+            if (!isDestroying.get()) afterReset.run();
         };
     }
 }

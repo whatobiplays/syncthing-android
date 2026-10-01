@@ -9,7 +9,14 @@ import java.util.Objects;
  * <p>The runtime owns the invariant that only one bundled Syncthing invocation may be active.
  * Backend-specific process and folder mechanics remain behind {@link PrivilegeBackend}.</p>
  */
-public final class DefaultSyncthingRuntime {
+public final class DefaultSyncthingRuntime
+        implements OwnedExecutionShutdown.ExecutionControl {
+    @FunctionalInterface
+    public interface OwnedExecutionRecoveryHandler {
+        /** Returns true only after the exact owned execution is proven to have exited. */
+        boolean stopOwnedExecution(ExecutionIdentity identity) throws InterruptedException;
+    }
+
     private final PrivilegeBackend backend;
     private final AdmissionGate admission = new AdmissionGate();
 
@@ -18,38 +25,57 @@ public final class DefaultSyncthingRuntime {
     }
 
     /**
-     * Starts a bundled Syncthing invocation if the runtime is idle.
+     * Starts a bundled one-shot invocation if runtime admission and recovery permit it.
      *
-     * <p>This is the ordinary start used by one-shot commands. It never waits for another
-     * invocation, and it does not take admission away from a service lifecycle start that is
-     * already waiting for it.</p>
-     *
-     * @throws ExecutionAdmissionException when another bundled invocation owns admission or a
-     *                                     service lifecycle start is waiting for it
+     * @throws ExecutionAdmissionException when another invocation owns admission
+     * @throws ExecutionRecoveryException when an owned or ambiguous process blocks a new launch
      */
     public SyncthingExecution start(SyncthingCommand command, SyncthingEnvironment environment)
             throws IOException, ExecutableNotFoundException {
+        return start(command, environment, null);
+    }
+
+    /** Starts a one-shot invocation with an optional exact-ownership recovery policy. */
+    public SyncthingExecution start(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler
+    ) throws IOException, ExecutableNotFoundException {
         admission.acquireOneShot();
-        return launch(command, environment);
+        try {
+            return launch(command, environment, recoveryHandler);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("One-shot execution recovery was interrupted", e);
+        }
     }
 
     /**
-     * Starts the service-owned Syncthing lifecycle invocation after the active bundled invocation,
-     * if any, has exited and released admission.
+     * Starts the service-owned invocation after a waiting one-shot releases runtime admission.
      *
-     * <p>Registering as waiting and acquiring admission are one runtime operation, and a registered
-     * service lifecycle start keeps priority, so no other invocation can be admitted between the
-     * release of the previous invocation and this launch. The caller must invoke this on a
-     * background thread because the wait lasts until the active invocation observes its exit.</p>
-     *
-     * @throws InterruptedException when the calling thread is interrupted while waiting
+     * @throws InterruptedException when interrupted while waiting for admission or recovery
      */
     public SyncthingExecution startServiceLifecycle(
             SyncthingCommand command,
             SyncthingEnvironment environment
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
+        return startServiceLifecycle(command, environment, null);
+    }
+
+    /**
+     * Starts a lifecycle invocation after resolving any previously owned execution.
+     *
+     * <p>The recovery handler runs only for an exactly verified owned execution and must report
+     * success only after it proves that execution has exited. Ambiguous candidates never reach the
+     * handler.</p>
+     */
+    public SyncthingExecution startServiceLifecycle(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler
+    ) throws IOException, ExecutableNotFoundException, InterruptedException {
         admission.awaitServiceLifecycleAdmission();
-        return launch(command, environment);
+        return launch(command, environment, recoveryHandler);
     }
 
     /**
@@ -70,22 +96,53 @@ public final class DefaultSyncthingRuntime {
         }
     }
 
-    private SyncthingExecution launch(SyncthingCommand command, SyncthingEnvironment environment)
-            throws IOException, ExecutableNotFoundException {
+    private SyncthingExecution launch(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler
+    ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
+            ExecutionOwnershipManager.RecoveryAssessment recovery =
+                    backend.recoverExecutions();
+            if (recovery.classification()
+                    == ExecutionOwnershipManager.Classification.OWNED_EXECUTION) {
+                if (recoveryHandler == null
+                        || !recoveryHandler.stopOwnedExecution(recovery.ownedExecution())) {
+                    throw new ExecutionRecoveryException(recovery);
+                }
+                recovery = backend.recoverExecutions();
+            }
+            if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
+
             PrivilegeBackend.Execution execution = backend.start(command, environment);
             return new SyncthingExecution(execution, admission::release);
-        } catch (IOException | ExecutableNotFoundException | RuntimeException e) {
+        } catch (IOException | ExecutableNotFoundException | InterruptedException
+                 | RuntimeException e) {
             admission.release();
             throw e;
         }
     }
 
-    /**
-     * Performs the selected backend's Syncthing-specific process compatibility cleanup.
-     */
-    public void terminateBundledSyncthing() {
-        backend.terminateBundledSyncthing();
+    public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+        return backend.recoverExecutions();
+    }
+
+    @Override
+    public ExecutionOwnershipManager.SignalResult signalIfOwned(
+            ExecutionIdentity identity,
+            ExecutionOwnershipManager.Signal signal
+    ) {
+        return backend.signalIfOwned(identity, signal);
+    }
+
+    @Override
+    public ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
+        return backend.observe(identity);
+    }
+
+    /** Removes durable ownership evidence after the exact process exit has been proven. */
+    public boolean clearAfterExit(ExecutionIdentity identity) throws IOException {
+        return backend.clearAfterExit(identity);
     }
 
     public ConfigStorage configStorage() {
@@ -108,16 +165,10 @@ public final class DefaultSyncthingRuntime {
         backend.saveFolderIgnoreList(folder, ignore);
     }
 
-    public void runFolderScripts(
-            ConfiguredFolderReference folder,
-            FolderEvent event
-    ) {
+    public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
         backend.runFolderScripts(folder, event);
     }
 
-    /**
-     * Admission exercise executed while a service lifecycle start waits for admission.
-     */
     @FunctionalInterface
     interface AdmissionExercise {
         void run() throws IOException, ExecutableNotFoundException, InterruptedException;
