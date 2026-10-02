@@ -1245,6 +1245,7 @@ public class SyncthingService extends Service {
         if (FileMutationBarrier.rejectIfShutdownContinuationPending(
                 mShutdownInProgress, mAfterShutdown != null, onLifecycleConflict
         )) return;
+        if (mPostMutationStartupGate.rejectNewMutation(onRejected)) return;
 
         FileMutationBarrier owner = FileMutationBarrier.reserveAsyncOwner(
                 mFileMutationBarrier,
@@ -1253,17 +1254,22 @@ public class SyncthingService extends Service {
                 onLifecycleConflict
         );
         if (owner == null) return;
-        mFileMutationBarrier = owner;
         try {
-            owner.setAsyncMutation(() -> {
-                boolean startupSuppressed = owner.clearDeferredStartIfSuppressed(
-                        mShutdownStartIntent
-                );
-                afterMutation.run(
-                        () -> releaseAsyncFileMutation(owner), !startupSuppressed
-                );
-            });
-            shutdown(State.DISABLED, null);
+            beginReservedAsyncMutation(
+                    owner,
+                    () -> mFileMutationBarrier = owner,
+                    () -> {
+                        owner.setAsyncMutation(() -> {
+                            boolean startupSuppressed = owner.clearDeferredStartIfSuppressed(
+                                    mShutdownStartIntent
+                            );
+                            afterMutation.run(
+                                    () -> releaseAsyncFileMutation(owner), !startupSuppressed
+                            );
+                        });
+                        shutdown(State.DISABLED, null);
+                    }
+            );
         } catch (RuntimeException e) {
             Log.e(TAG, "Could not begin shutdown for HTTPS certificate mutation", e);
             if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
@@ -1273,6 +1279,14 @@ public class SyncthingService extends Service {
 
     private void releaseAsyncFileMutation(FileMutationBarrier owner) {
         if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
+    }
+
+    /** Publishes certificate mutation ownership before beginning its asynchronous shutdown. */
+    static void beginReservedAsyncMutation(FileMutationBarrier owner, Runnable publishOwner,
+                                           Runnable beginShutdown) {
+        if (!owner.isAsyncOwner()) throw new IllegalArgumentException("Expected async owner");
+        publishOwner.run();
+        beginShutdown.run();
     }
 
     private void shutdown(
@@ -1485,6 +1499,7 @@ public class SyncthingService extends Service {
                 }
             } else {
                 barrier.stopCompleted(completion);
+                if (barrier.isAbandoned()) completeAbandonedFileMutation(barrier);
             }
             return;
         }
@@ -1561,6 +1576,7 @@ public class SyncthingService extends Service {
                 barrier.stopFailed();
                 return;
             }
+            if (mPostMutationStartupGate.rejectNewMutation(barrier::stopFailed)) return;
             if (FileMutationBarrier.rejectIfShutdownContinuationPending(
                     mShutdownInProgress,
                     mAfterShutdown != null,
@@ -1569,10 +1585,10 @@ public class SyncthingService extends Service {
                 Log.w(TAG, "Rejecting file mutation while a shutdown continuation is pending");
                 return;
             }
-            boolean lifecycleWorkerLive = mSyncthingRunnableThread != null
-                    && mSyncthingRunnableThread.isAlive();
+            boolean lifecycleHandlePresent = mSyncthingRunnableThread != null
+                    || mSyncthingRunnable != null;
             if (FileMutationBarrier.rejectIfNoSafeShutdownPath(
-                    lifecycleWorkerLive,
+                    lifecycleHandlePresent,
                     mOwnedExecution != null,
                     mLastExecutionExitProven,
                     barrier::stopFailed
@@ -1599,9 +1615,41 @@ public class SyncthingService extends Service {
 
     private void releaseFailedFileMutationWait(FileMutationBarrier barrier) {
         if (mFileMutationBarrier != barrier) return;
+        barrier.abandon();
+        if (mShutdownInProgress) return;
+        completeAbandonedFileMutation(barrier);
+    }
+
+    /** Finishes shutdown for an interrupted file caller without permitting its file writes. */
+    private void completeAbandonedFileMutation(FileMutationBarrier barrier) {
+        if (mFileMutationBarrier != barrier) return;
+        boolean destroying = mDestroying;
+        Runnable deferred = finishAbandonedFileMutation(
+                barrier, mShutdownStartIntent, mLastDeterminedShouldRun, destroying
+        );
         mFileMutationBarrier = null;
+        if (destroying) return;
+        runShutdownCompletion(deferred);
+    }
+
+    /**
+     * Applies the stopped-state policy for an interrupted file mutation. When this mutation still
+     * permits an automatic start, its Run Conditions start is deferred exactly once; explicit STOP
+     * suppression clears any deferred start instead. Returns the shutdown continuation that must run
+     * after the barrier is released, or {@code null} while the service is being destroyed.
+     */
+    static @Nullable Runnable finishAbandonedFileMutation(
+            FileMutationBarrier barrier,
+            ShutdownStartIntent startIntent,
+            boolean shouldRunNow,
+            boolean destroying
+    ) {
+        if (barrier.shouldAutomaticallyStartAfterMutation(shouldRunNow)) {
+            startIntent.onRunConditionChanged(true, true);
+        }
+        barrier.clearDeferredStartIfSuppressed(startIntent);
         Runnable deferred = barrier.takeAfterMutation();
-        if (!mDestroying && !mShutdownInProgress) runShutdownCompletion(deferred);
+        return destroying ? null : deferred;
     }
 
     /** Releases a file-mutation barrier and runs any deferred completion on the service thread. */
@@ -1999,8 +2047,16 @@ public class SyncthingService extends Service {
             }
             return failSuccess;
         } finally {
-            finishFileMutation(afterImport, false, true);
+            finishFileMutation(importCompletionOrFailure(
+                    afterImport, failSuccess, this::failImportLifecycle
+            ), false, true);
         }
+    }
+
+    /** Failed imports release lifecycle ownership without starting from partial managed state. */
+    static Runnable importCompletionOrFailure(@Nullable Runnable completion, boolean succeeded,
+                                              Runnable failure) {
+        return succeeded && completion != null ? completion : failure;
     }
 
     /**

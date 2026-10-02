@@ -251,6 +251,11 @@ public class OwnedExecutionShutdownTest {
         assertEquals(Arrays.asList(
                 ExecutionOwnershipManager.Signal.SIGKILL
         ), signals);
+        int sigintAttempt = events.indexOf("attempt:SIGINT");
+        int sigkillAttempt = events.indexOf("attempt:SIGKILL");
+        assertTrue(sigintAttempt >= 0);
+        assertTrue(sigkillAttempt > sigintAttempt);
+        assertTrue(events.subList(sigintAttempt + 1, sigkillAttempt).contains("observe"));
     }
 
     private static final class RecordingControl

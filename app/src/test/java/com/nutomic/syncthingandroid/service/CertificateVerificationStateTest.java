@@ -19,6 +19,24 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class CertificateVerificationStateTest {
     @Test
+    public void successDispatchCallsOnlySuccessHandler() {
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger pending = new AtomicInteger();
+        AtomicInteger failure = new AtomicInteger();
+
+        CertificateVerificationState.dispatch(
+                CertificateVerificationState.Outcome.SUCCESS,
+                success::incrementAndGet,
+                pending::incrementAndGet,
+                failure::incrementAndGet
+        );
+
+        assertEquals(1, success.get());
+        assertEquals(0, pending.get());
+        assertEquals(0, failure.get());
+    }
+
+    @Test
     public void explicitStopDuringStartingKeepsNewCertificateAndResolvesPendingStartOnce()
             throws IOException {
         try (CertificateFiles files = new CertificateFiles()) {

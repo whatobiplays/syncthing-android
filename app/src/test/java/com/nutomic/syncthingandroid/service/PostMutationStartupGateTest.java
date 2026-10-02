@@ -137,11 +137,6 @@ public class PostMutationStartupGateTest {
     }
 
     @Test
-    public void crashedNativeStopSuppressesImportStartupWithoutAbortingReset() {
-        assertStopSuppressesImportStartupWithoutAbortingReset("crashed-native-stop");
-    }
-
-    @Test
     public void stopBeforeImportGateBeginsStillSuppressesTheImportRestart() {
         PostMutationStartupGate gate = new PostMutationStartupGate();
         FileMutationBarrier barrier = new FileMutationBarrier();

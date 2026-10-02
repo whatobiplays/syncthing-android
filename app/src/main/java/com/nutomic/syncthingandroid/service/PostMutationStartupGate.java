@@ -24,6 +24,13 @@ final class PostMutationStartupGate {
         return operationOwnsStartup;
     }
 
+    /** Refuses another stopped-state file mutation while an import still owns its reset. */
+    boolean rejectNewMutation(Runnable onRejected) {
+        if (!operationOwnsStartup) return false;
+        onRejected.run();
+        return true;
+    }
+
     boolean consumeDeferredStart(
             ShutdownStartIntent startIntent,
             boolean shouldRunNow,

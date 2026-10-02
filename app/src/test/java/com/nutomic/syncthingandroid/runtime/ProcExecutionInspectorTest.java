@@ -6,11 +6,71 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
+import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import org.junit.Test;
 
 public class ProcExecutionInspectorTest {
+    @Test
+    public void differentUidIsSkippedBeforeUnreadableExecutableIsInspected() throws Exception {
+        List<Integer> owned = ProcExecutionInspector.ownedProcessIds(
+                new File[] {new File("/proc/10"), new File("/proc/11")}, 1000,
+                (pid, uid) -> pid == 10
+                        ? ProcExecutionInspector.ProcessOwner.OTHER_UID
+                        : ProcExecutionInspector.ProcessOwner.CURRENT_UID
+        );
+        assertEquals(Arrays.asList(11), owned);
+    }
+
+    @Test
+    public void uncertainUidFailsClosedBeforeCandidateInspection() {
+        assertThrows(IOException.class, () -> ProcExecutionInspector.ownedProcessIds(
+                new File[] {new File("/proc/10")}, 1000,
+                (pid, uid) -> ProcExecutionInspector.ProcessOwner.UNKNOWN
+        ));
+    }
+
+    @Test
+    public void sameUidWithUnreadableIdentityFailsClosed() {
+        assertThrows(IOException.class, () -> ProcExecutionInspector.findLaunchedProcess(
+                "/data/app/lib/libsyncthingnative.so", "new-token",
+                new File[] {new File("/proc/11")}, 1000, "boot-a",
+                (pid, uid) -> ProcExecutionInspector.ProcessOwner.CURRENT_UID,
+                (pid, bootId) -> ExecutionInspector.InspectionResult.unknown(),
+                pid -> { throw new AssertionError("Unknown identity must not read token"); }
+        ));
+    }
+
+    @Test
+    public void launchedProcessRemainsDiscoverableAmongInaccessibleOtherUidProcesses()
+            throws Exception {
+        List<Integer> identityInspections = new ArrayList<>();
+        ExecutionIdentity launched = new ExecutionIdentity(
+                11, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", ""
+        );
+        ExecutionIdentity found = ProcExecutionInspector.findLaunchedProcess(
+                launched.executablePath(), "new-token",
+                new File[] {new File("/proc/10"), new File("/proc/11")}, 1000,
+                "boot-a",
+                (pid, uid) -> pid == 10
+                        ? ProcExecutionInspector.ProcessOwner.OTHER_UID
+                        : ProcExecutionInspector.ProcessOwner.CURRENT_UID,
+                (pid, bootId) -> {
+                    identityInspections.add(pid);
+                    if (pid == 10) throw new AssertionError("Unrelated exe was inspected");
+                    return ExecutionInspector.InspectionResult.live(launched);
+                },
+                pid -> "new-token"
+        );
+        assertEquals(Arrays.asList(11), identityInspections);
+        assertEquals(launched.pid(), found.pid());
+        assertEquals("new-token", found.runToken());
+    }
+
     @Test
     public void parsesStartTimeAfterACommandNameContainingParentheses() throws Exception {
         StringBuilder stat = new StringBuilder("123 (syncthing (worker)) S");

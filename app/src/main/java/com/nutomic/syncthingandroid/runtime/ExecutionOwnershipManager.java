@@ -212,7 +212,8 @@ public final class ExecutionOwnershipManager {
             deleteStaleRecord(recorded);
             return classifyAfterRecordedExit(
                     Classification.BOOT_ID_MISMATCH,
-                    RecordEvidence.BOOT_ID_MISMATCH
+                    RecordEvidence.BOOT_ID_MISMATCH,
+                    InspectionEvidence.NOT_CHECKED
             );
         }
 
@@ -239,7 +240,8 @@ public final class ExecutionOwnershipManager {
             deleteStaleRecord(recorded);
             return classifyAfterRecordedExit(
                     Classification.RECORDED_PROCESS_GONE,
-                    RecordEvidence.PROCESS_GONE
+                    RecordEvidence.PROCESS_GONE,
+                    InspectionEvidence.PROCESS_ABSENT
             );
         }
 
@@ -275,13 +277,15 @@ public final class ExecutionOwnershipManager {
         deleteStaleRecord(recorded);
         return classifyAfterRecordedExit(
                 Classification.NONMATCHING_RECORD,
-                RecordEvidence.NONMATCHING
+                RecordEvidence.NONMATCHING,
+                InspectionEvidence.LIVE
         );
     }
 
     private RecoveryAssessment classifyAfterRecordedExit(
             Classification noCandidateClassification,
-            RecordEvidence recordEvidence
+            RecordEvidence recordEvidence,
+            InspectionEvidence inspectionEvidence
     ) {
         List<ExecutionIdentity> refreshed;
         try {
@@ -289,18 +293,18 @@ public final class ExecutionOwnershipManager {
         } catch (IOException | RuntimeException e) {
             return assessment(
                     Classification.AMBIGUOUS_EXECUTION, recordEvidence,
-                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.PROCESS_ABSENT
+                    CandidateEvidence.UNKNOWN, null, inspectionEvidence
             );
         }
         return refreshed.isEmpty()
                 ? assessment(
                         noCandidateClassification, recordEvidence,
-                        CandidateEvidence.NONE, null, InspectionEvidence.PROCESS_ABSENT
+                        CandidateEvidence.NONE, null, inspectionEvidence
                 )
                 : assessment(
                         Classification.AMBIGUOUS_EXECUTION, recordEvidence,
                         CandidateEvidence.UNOWNED_CANDIDATE, null,
-                        InspectionEvidence.PROCESS_ABSENT
+                        inspectionEvidence
                 );
     }
 

@@ -14,6 +14,7 @@ final class FileMutationBarrier {
     private Runnable afterMutation;
     private Runnable asyncMutation;
     private boolean automaticStartupSuppressed;
+    private boolean abandoned;
 
     FileMutationBarrier() {
         this(false, null, null);
@@ -79,16 +80,16 @@ final class FileMutationBarrier {
     }
 
     /**
-     * Rejects stopped-state mutation when a live lifecycle worker has no exact execution identity
-     * and exit has not been observed.
+     * Rejects stopped-state mutation when a lifecycle handle remains unresolved without exact
+     * execution identity or proven exit. A dead Java thread can still leave an unproven process.
      */
     static boolean rejectIfNoSafeShutdownPath(
-            boolean lifecycleWorkerLive,
+            boolean lifecycleHandlePresent,
             boolean exactIdentityAvailable,
             boolean executionExitProven,
             Runnable onRejected
     ) {
-        if (!lifecycleWorkerLive || exactIdentityAvailable || executionExitProven) return false;
+        if (!lifecycleHandlePresent || exactIdentityAvailable || executionExitProven) return false;
         onRejected.run();
         return true;
     }
@@ -180,6 +181,15 @@ final class FileMutationBarrier {
             return false;
         }
         return safeToMutate;
+    }
+
+    /** Records that an interrupted caller will not perform its file mutation. */
+    void abandon() {
+        abandoned = true;
+    }
+
+    boolean isAbandoned() {
+        return abandoned;
     }
 
     synchronized Runnable takeAfterMutation() {

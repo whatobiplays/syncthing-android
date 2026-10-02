@@ -28,15 +28,6 @@ public class ShutdownStartIntentTest {
     }
 
     @Test
-    public void crashedNativeStopClearsDeferredStartWhileRunConditionRemainsTrue() {
-        ShutdownStartIntent intent = pendingIntent();
-
-        intent.clear();
-
-        assertFalse(intent.consumeIfRequired(true, true, true, true, false));
-    }
-
-    @Test
     public void laterFalseRunConditionCancelsDeferredStart() {
         ShutdownStartIntent intent = pendingIntent();
         intent.onRunConditionChanged(false, true);

@@ -1,5 +1,6 @@
 package com.nutomic.syncthingandroid.runtime;
 
+import android.os.Process;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -39,9 +40,9 @@ final class ProcExecutionInspector implements ExecutionInspector {
         if (processDirectories == null) throw new IOException("Could not list procfs");
         List<ExecutionIdentity> candidates = new ArrayList<>();
         String bootId = currentBootId();
-        for (File processDirectory : processDirectories) {
-            int pid = parsePid(processDirectory.getName());
-            if (pid <= 0) continue;
+        for (int pid : ownedProcessIds(
+                processDirectories, Process.myUid(), ProcExecutionInspector::processOwner
+        )) {
             InspectionResult inspection = readProcess(pid, bootId, false);
             if (inspection.status() == InspectionResult.Status.UNKNOWN) {
                 throw new IOException("Could not inspect procfs process " + pid);
@@ -60,29 +61,46 @@ final class ProcExecutionInspector implements ExecutionInspector {
             throws IOException {
         File[] processDirectories = PROC_DIRECTORY.listFiles();
         if (processDirectories == null) throw new IOException("Could not list procfs");
+        return findLaunchedProcess(
+                executablePath, runToken, processDirectories, Process.myUid(), currentBootId(),
+                ProcExecutionInspector::processOwner,
+                (pid, bootId) -> readProcess(pid, bootId, false),
+                pid -> readRunToken(new File(
+                        new File(PROC_DIRECTORY, Integer.toString(pid)), "environ"
+                ))
+        );
+    }
+
+    @FunctionalInterface
+    interface ProcessReader {
+        InspectionResult inspect(int pid, String bootId);
+    }
+
+    @FunctionalInterface
+    interface TokenReader {
+        String read(int pid) throws IOException;
+    }
+
+    /** Finds a new launch only after its full executable target and run token match. */
+    static ExecutionIdentity findLaunchedProcess(
+            String executablePath, String runToken, File[] processDirectories, int currentUid,
+            String bootId, OwnerReader ownerReader, ProcessReader processReader,
+            TokenReader tokenReader
+    ) throws IOException {
         ExecutionIdentity found = null;
-        String bootId = currentBootId();
-        for (File processDirectory : processDirectories) {
-            int pid = parsePid(processDirectory.getName());
-            if (pid <= 0) continue;
-            InspectionResult inspection = readProcess(pid, bootId, false);
+        for (int pid : ownedProcessIds(processDirectories, currentUid, ownerReader)) {
+            InspectionResult inspection = processReader.inspect(pid, bootId);
             if (inspection.status() == InspectionResult.Status.UNKNOWN) {
                 throw new IOException("Could not inspect procfs process " + pid);
             }
             if (inspection.status() == InspectionResult.Status.PROCESS_ABSENT) continue;
             ExecutionIdentity candidate = inspection.identity();
-            if (!hasExactExecutablePath(candidate.executablePath(), executablePath)) {
-                continue;
-            }
+            if (!hasExactExecutablePath(candidate.executablePath(), executablePath)) continue;
             String candidateToken;
             try {
-                candidateToken = readRunToken(new File(
-                        new File(PROC_DIRECTORY, Integer.toString(pid)), "environ"
-                ));
+                candidateToken = tokenReader.read(pid);
             } catch (IOException e) {
-                if (processPresence(pid) == ProcessPresence.ABSENT) {
-                    continue;
-                }
+                if (processPresence(pid) == ProcessPresence.ABSENT) continue;
                 throw e;
             }
             if (!runToken.equals(candidateToken)) continue;
@@ -95,6 +113,41 @@ final class ProcExecutionInspector implements ExecutionInspector {
             );
         }
         return found;
+    }
+
+    enum ProcessOwner { CURRENT_UID, OTHER_UID, ABSENT, UNKNOWN }
+
+    @FunctionalInterface
+    interface OwnerReader {
+        ProcessOwner ownerOf(int pid, int currentUid);
+    }
+
+    /** Lists only this app's PIDs; unreadable ownership remains a discovery failure. */
+    static List<Integer> ownedProcessIds(File[] directories, int currentUid,
+                                         OwnerReader ownerReader) throws IOException {
+        List<Integer> owned = new ArrayList<>();
+        for (File directory : directories) {
+            int pid = parsePid(directory.getName());
+            if (pid <= 0) continue;
+            ProcessOwner owner = ownerReader.ownerOf(pid, currentUid);
+            if (owner == ProcessOwner.OTHER_UID || owner == ProcessOwner.ABSENT) continue;
+            if (owner != ProcessOwner.CURRENT_UID) {
+                throw new IOException("Could not determine procfs process owner " + pid);
+            }
+            owned.add(pid);
+        }
+        return owned;
+    }
+
+    private static ProcessOwner processOwner(int pid, int currentUid) {
+        try {
+            int ownerUid = Os.stat(new File(PROC_DIRECTORY, Integer.toString(pid))
+                    .getAbsolutePath()).st_uid;
+            return ownerUid == currentUid ? ProcessOwner.CURRENT_UID : ProcessOwner.OTHER_UID;
+        } catch (ErrnoException e) {
+            return e.errno == OsConstants.ENOENT
+                    ? ProcessOwner.ABSENT : ProcessOwner.UNKNOWN;
+        }
     }
 
     private InspectionResult readProcess(int pid, String bootId, boolean includeRunToken) {

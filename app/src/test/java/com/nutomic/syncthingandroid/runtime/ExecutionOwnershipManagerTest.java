@@ -337,6 +337,8 @@ public class ExecutionOwnershipManagerTest {
                 oldBoot.classification());
         assertEquals(ExecutionOwnershipManager.RecordEvidence.BOOT_ID_MISMATCH,
                 oldBoot.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.NOT_CHECKED,
+                oldBoot.inspectionEvidence());
         assertTrue(oldBoot.mayLaunch());
         assertFalse(oldBootRecord.hasRecord());
     }
@@ -382,9 +384,77 @@ public class ExecutionOwnershipManagerTest {
                 recovery.classification());
         assertEquals(ExecutionOwnershipManager.CandidateEvidence.NONE,
                 recovery.candidateEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence());
         assertTrue(recovery.mayLaunch());
         assertEquals(2, inspector.candidateScanCount);
         assertFalse(records.hasRecord());
+    }
+
+    @Test
+    public void recordedExitWithNewCandidateBlocksReplacementAfterRefresh() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        ExecutionIdentity competing = new ExecutionIdentity(
+                42, 9002, "boot-a", "/data/app/old/lib/libsyncthingnative.so", "other"
+        );
+        inspector.set(IDENTITY.pid(), null);
+        inspector.setCandidateSnapshot(0, Collections.singletonList(IDENTITY));
+        inspector.setCandidateSnapshot(1, Collections.singletonList(competing));
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager(
+                records, inspector, new RecordingSignals()
+        ).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
+                recovery.candidateEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertFalse(records.hasRecord());
+        assertEquals(2, inspector.candidateScanCount);
+    }
+
+    @Test
+    public void failedCandidateRefreshPreservesRecordedPidInspectionEvidence() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), null);
+        inspector.failCandidateScanAt = 1;
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager(
+                records, inspector, new RecordingSignals()
+        ).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNKNOWN,
+                recovery.candidateEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertEquals(2, inspector.candidateScanCount);
+    }
+
+    @Test
+    public void reusedPidRetainsLiveInspectionEvidence() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), new ExecutionIdentity(
+                IDENTITY.pid(), IDENTITY.processStartTimeTicks() + 1,
+                IDENTITY.bootId(), IDENTITY.executablePath(), "other"
+        ));
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager(
+                records, inspector, new RecordingSignals()
+        ).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.NONMATCHING_RECORD,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE,
+                recovery.inspectionEvidence());
     }
 
     @Test
@@ -497,6 +567,7 @@ public class ExecutionOwnershipManagerTest {
         private final List<List<ExecutionIdentity>> candidateSnapshots = new ArrayList<>();
         private int inspectCount;
         private int candidateScanCount;
+        private int failCandidateScanAt = -1;
 
         private FakeInspector(String bootId) {
             this.bootId = bootId;
@@ -540,6 +611,7 @@ public class ExecutionOwnershipManagerTest {
         @Override
         public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
             int scan = candidateScanCount++;
+            if (scan == failCandidateScanAt) throw new IllegalStateException("procfs unavailable");
             if (scan < candidateSnapshots.size() && candidateSnapshots.get(scan) != null) {
                 return new ArrayList<>(candidateSnapshots.get(scan));
             }

@@ -268,6 +268,132 @@ public class FileMutationBarrierTest {
     }
 
     @Test
+    public void importLifecycleOwnerRejectsSyncAndAsyncFileMutationAdmission() {
+        PostMutationStartupGate gate = new PostMutationStartupGate();
+        gate.beginOperation();
+        AtomicInteger syncRejections = new AtomicInteger();
+        AtomicInteger asyncRejections = new AtomicInteger();
+
+        assertTrue(gate.rejectNewMutation(syncRejections::incrementAndGet));
+        assertTrue(gate.rejectNewMutation(asyncRejections::incrementAndGet));
+        assertEquals(1, syncRejections.get());
+        assertEquals(1, asyncRejections.get());
+        assertTrue(gate.ownsStartup());
+    }
+
+    @Test
+    public void failedImportCompletionReleasesGateWithoutStartingService() {
+        PostMutationStartupGate gate = new PostMutationStartupGate();
+        ShutdownStartIntent startIntent = new ShutdownStartIntent();
+        AtomicInteger serveLaunches = new AtomicInteger();
+        gate.beginOperation();
+        startIntent.onRunConditionChanged(true, true);
+
+        Runnable afterImport = null;
+        try {
+            throw new IllegalStateException("Import aborted before assigning its continuation");
+        } catch (IllegalStateException expected) {
+            assertEquals("Import aborted before assigning its continuation",
+                    expected.getMessage());
+        } finally {
+            SyncthingService.importCompletionOrFailure(
+                    afterImport, true, () -> gate.cancel(startIntent)
+            ).run();
+        }
+
+        assertFalse(gate.ownsStartup());
+        assertFalse(startIntent.consumeIfRequired(true, true, true, true, false));
+        assertEquals(0, serveLaunches.get());
+        assertFalse(gate.rejectNewMutation(
+                () -> { throw new AssertionError("still wedged"); }
+        ));
+    }
+
+    @Test
+    public void partiallyFailedImportDoesNotStartServiceToReleaseGate() {
+        PostMutationStartupGate gate = new PostMutationStartupGate();
+        ShutdownStartIntent intent = new ShutdownStartIntent();
+        AtomicInteger launches = new AtomicInteger();
+        gate.beginOperation();
+
+        SyncthingService.importCompletionOrFailure(
+                () -> gate.completeOperation(intent, true, launches::incrementAndGet),
+                false,
+                () -> gate.cancel(intent)
+        ).run();
+
+        assertFalse(gate.ownsStartup());
+        assertEquals(0, launches.get());
+    }
+
+    @Test
+    public void abandonedWaitKeepsOwnerUntilShutdownCompletes() {
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        barrier.abandon();
+        assertTrue(barrier.isAbandoned());
+        barrier.stopCompleted(null);
+        assertTrue(barrier.isAbandoned());
+    }
+
+    @Test
+    public void interruptedFileWaitCompletesShutdownAndRestartsOnceWhenAllowed() {
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        ShutdownStartIntent intent = new ShutdownStartIntent();
+        AtomicInteger writes = new AtomicInteger();
+        AtomicInteger launches = new AtomicInteger();
+
+        Thread.currentThread().interrupt();
+        try {
+            assertFalse(barrier.awaitSafeToMutate());
+        } finally {
+            Thread.interrupted();
+        }
+        barrier.abandon();
+        assertTrue(barrier.isAbandoned());
+        assertEquals(0, writes.get());
+
+        barrier.stopCompleted(null);
+        assertNull(SyncthingService.finishAbandonedFileMutation(barrier, intent, true, false));
+        if (intent.consumeIfRequired(true, true, true, true, false)) {
+            launches.incrementAndGet();
+        }
+        assertFalse(intent.consumeIfRequired(true, true, true, true, false));
+
+        assertEquals(0, writes.get());
+        assertEquals(1, launches.get());
+    }
+
+    @Test
+    public void explicitStopDuringInterruptedFileWaitSuppressesShutdownRestart() {
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        AtomicInteger launches = new AtomicInteger();
+        ShutdownStartIntent intent = new ShutdownStartIntent();
+        intent.onRunConditionChanged(true, true);
+
+        barrier.abandon();
+        barrier.suppressAutomaticStartup();
+        barrier.stopCompleted(null);
+        assertNull(SyncthingService.finishAbandonedFileMutation(barrier, intent, true, false));
+        if (intent.consumeIfRequired(true, true, true, true, false)) launches.incrementAndGet();
+
+        assertEquals(0, launches.get());
+        assertFalse(intent.consumeIfRequired(true, true, true, true, false));
+    }
+
+    @Test
+    public void abandonedMutationDuringDestructionDropsShutdownContinuation() {
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        ShutdownStartIntent intent = new ShutdownStartIntent();
+        AtomicInteger continuations = new AtomicInteger();
+        barrier.abandon();
+        barrier.stopCompleted(continuations::incrementAndGet);
+
+        assertNull(SyncthingService.finishAbandonedFileMutation(barrier, intent, true, true));
+
+        assertEquals(0, continuations.get());
+    }
+
+    @Test
     public void asyncCertificateMutationOwnsBarrierBeforePendingShutdownCompletes() {
         AtomicReference<FileMutationBarrier> serviceOwner = new AtomicReference<>();
         AtomicInteger shutdownFailures = new AtomicInteger();
@@ -282,14 +408,18 @@ public class FileMutationBarrierTest {
                 () -> { }
         );
         assertNotNull(owner);
-        assertSame(owner, serviceOwner.updateAndGet(current -> owner));
-
-        boolean shutdownPending = true;
-        events.add("shutdown-pending");
-        assertTrue(shutdownPending);
-        assertTrue(FileMutationBarrier.rejectConcurrentMutation(
-                serviceOwner.get(), rejectedMutations::incrementAndGet
-        ));
+        SyncthingService.beginReservedAsyncMutation(
+                owner,
+                () -> serviceOwner.set(owner),
+                () -> {
+                    events.add("shutdown-pending");
+                    assertSame(owner, serviceOwner.get());
+                    assertNull(FileMutationBarrier.reserveAsyncOwner(
+                            serviceOwner.get(), rejectedMutations::incrementAndGet,
+                            shutdownFailures::incrementAndGet, () -> { }
+                    ));
+                }
+        );
         assertEquals(1, rejectedMutations.get());
         assertEquals(0, mutations.get());
         assertEquals(0, shutdownFailures.get());
@@ -301,8 +431,6 @@ public class FileMutationBarrierTest {
             events.add("verification-handoff");
         });
         Runnable completion = owner.completeAsyncOwner();
-        shutdownPending = false;
-        assertFalse(shutdownPending);
         events.add("shutdown-completed");
         completion.run();
 
@@ -417,6 +545,23 @@ public class FileMutationBarrierTest {
         assertTrue(rejected);
         assertEquals(0, processSignals.get());
         assertEquals(0, mutations.get());
+        assertFalse(barrier.awaitSafeToMutate());
+    }
+
+    @Test
+    public void deadWorkerHandleWithoutExitProofRejectsImmediately() {
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        AtomicInteger signals = new AtomicInteger();
+        Thread lifecycleThread = new Thread();
+        assertFalse(lifecycleThread.isAlive());
+
+        boolean rejected = FileMutationBarrier.rejectIfNoSafeShutdownPath(
+                lifecycleThread != null, false, false, barrier::stopFailed
+        );
+        if (!rejected) signals.incrementAndGet();
+
+        assertTrue(rejected);
+        assertEquals(0, signals.get());
         assertFalse(barrier.awaitSafeToMutate());
     }
 
