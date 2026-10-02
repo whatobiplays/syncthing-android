@@ -1,0 +1,229 @@
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_6e0fee904268ff 1593-1595,1597,1600-1606,1634
+  s_cd5eaf9ab3e468::t_58e353fd0afe1c 2197-2206
+  s_cd5eaf9ab3e468::t_393c7f55ad725f 364-367,1226,1258-1265,1623-1625,1629-1631,1645-1647,2055,2068,2076-2078,2095,2114,2121-2123,2140,2155-2157
+  s_cd5eaf9ab3e468::t_c21a7342546123 1009-1026,1028-1033,1035-1043,1390-1391,1426-1433,1446,1580-1589,2145-2147
+  s_cd5eaf9ab3e468::t_b29c7b546c4a26 385,401
+  s_cd5eaf9ab3e468::t_99c5eeadf6121d 1936-1938,2001
+  s_cd5eaf9ab3e468::t_5dd01d1fcf4fba 485,493-495
+  s_cd5eaf9ab3e468::t_efce9695f5fe78 680-684,689-690,809,811-824,826,829-830,832
+  s_cd5eaf9ab3e468::t_0ff016c294d7bc 260,274-277,359-363,368
+  s_cd5eaf9ab3e468::t_50e486a24db402 1229,1266,1469-1470
+  s_cd5eaf9ab3e468::t_a5aabd8a1a135f 1516,1519,1521,1526-1527
+  s_cd5eaf9ab3e468::t_a4a1e96cf96922 1564-1571
+  s_cd5eaf9ab3e468::t_819a9c31f0e962 2013-2014,2067,2075,2081-2088,2092-2094,2096,2120,2126-2133,2137-2139,2141
+  s_cd5eaf9ab3e468::t_515b89e53e05c2 2168-2172
+  s_cd5eaf9ab3e468::t_2b2304c31c298f 1649-1650,2177-2178,2181-2188,2191,2196,2207,2209-2222,2231-2236,2241,2245-2246,2250-2255,2258-2272,2280-2297
+  s_cd5eaf9ab3e468::t_aa99b0e81fadf0 786,810,980
+  s_cd5eaf9ab3e468::t_351d20e2191c35 1468,1476,1478-1488
+  s_cd5eaf9ab3e468::t_88c3cecb06126d 492,498-499,1522-1525
+  s_cd5eaf9ab3e468::t_a89ac6145001cc 1233-1234,1238,1245-1248,2015-2016,2089-2091,2134-2136
+  s_cd5eaf9ab3e468::t_0ecabcd01cfce1 1250-1253,1472-1475,1477
+  s_cd5eaf9ab3e468::t_4c6e9237864780 486
+  s_cd5eaf9ab3e468::t_42a73a2f3c5484 1362,1442
+  s_cd5eaf9ab3e468::t_9cddca84d7d867 1088-1094,1114,1123,1127-1132,1139-1144,1150-1155
+  s_cd5eaf9ab3e468::t_3cd191fcd89220 955
+  s_cd5eaf9ab3e468::t_84ef4472d66491 1392-1413,1416-1421,1423-1425,1778-1779,1781-1784,1786-1789,1791-1794,1796-1808,1811-1813,1815-1816,1818-1819,1821,1823-1824,1826-1827,1829-1834,1836-1849,1851-1858,1862-1863,1865-1870,1941-1948,1951-1957,1959-1961,1963-1964,1966-1967,1969-1975,1978-1984,1986,1988-1990,2000
+  s_cd5eaf9ab3e468::t_4b8c9feda2776c 1221-1223,1276-1287,1293,1317-1321
+  s_cd5eaf9ab3e468::t_f710e2cd6011d3 787,1187
+  s_cd5eaf9ab3e468::t_8e5acb0c3098a5 1224-1225,1227-1228,1230-1232,1237,1239-1244,1249,1254-1257,1267-1275
+  s_cd5eaf9ab3e468::t_0fd1990215660e 1558-1563,1592,1598-1599,1607-1611,1620-1622,1626-1627,1632-1633,1643-1644,1648
+  s_cd5eaf9ab3e468::t_4ef7593c137c6a 1572-1579
+  s_cd5eaf9ab3e468::t_9a0a240474cb1a 386-399,402-417,1186,1662
+  s_cd5eaf9ab3e468::t_a9732ce738b7c2 261,484,488-491,500,515
+  s_cd5eaf9ab3e468::t_35f7e6cc7fd2b5 2011-2012,2042-2047,2100-2105
+  s_cd5eaf9ab3e468::t_1e4860e4322acc 643,1517-1518,1534,1536
+  s_cd5eaf9ab3e468::t_80a11618294fc7 943
+  s_cd5eaf9ab3e468::t_6d52d872bc4884 262-263
+  s_cd5eaf9ab3e468::t_bad9bec9d687f7 259
+  s_cd5eaf9ab3e468::t_a1ba819862f07b 644-646
+  s_cd5eaf9ab3e468::t_83b23d1bc93194 1065
+  s_cd5eaf9ab3e468::t_c2643f537defba 487,1513,1520
+  s_cd5eaf9ab3e468::t_ef5c9bca0b1e18 1366,1449,1462-1465,1467,1489-1491,1512,1514-1515,1528-1533,1535
+  s_cd5eaf9ab3e468::t_7bd07d0a85a0fa 1471
+  s_cd5eaf9ab3e468::t_7be8cead95ff4c 1156,1220,1537,1612-1619,1628,1635-1642,1651-1661,2298
+  s_cd5eaf9ab3e468::t_f6f220d1001c34 1775,1871-1872
+  s_cd5eaf9ab3e468::t_6221260df2aa67 1987,1992-1999,2002,2352
+  s_cd5eaf9ab3e468::t_a559b03a95e91c 496-497
+  s_cd5eaf9ab3e468::t_98d9274b9920d6 1157
+  s_cd5eaf9ab3e468::t_26a6d232046333 1538
+  s_cd5eaf9ab3e468::t_dd52736c35d032 2299
+app/src/test/java/com/nutomic/syncthingandroid/runtime/FileExecutionRecordStoreTest.java
+  s_cd5eaf9ab3e468::t_a1be37ba224272 52-88
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionOwnershipManager.java
+  s_cd5eaf9ab3e468::t_237669dd506469 41-47,70,73-77,79,87,95-105,110,126-129,182,213-216,219,221,224-225,229-238,240-243,246-247,257,262,271,275-280,282-295,297-298,301-303,310-312,317,323-324,328-329,332-335,337,346-356,372-373,382-391,394-395,437-449
+  s_cd5eaf9ab3e468::t_a6c4f557cb8331 188-197
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionInspector.java
+  s_cd5eaf9ab3e468::t_ac797fd3106a64 8-39,42
+app/src/main/java/com/nutomic/syncthingandroid/runtime/AndroidProcessSignalTransport.java
+  s_cd5eaf9ab3e468::t_83f367704b7b87 3-4,6,9,11-14
+app/src/main/java/com/nutomic/syncthingandroid/runtime/PrivilegeBackend.java
+  s_cd5eaf9ab3e468::t_5a1a979a4ddba3 59,62
+  s_cd5eaf9ab3e468::t_35c943735e5e0f 8-9,13,15,19
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_cd5eaf9ab3e468::t_e85125408abd90 20-25,52,60,82-91,94,118-119,122,135,150
+app/src/main/java/com/nutomic/syncthingandroid/runtime/FileExecutionRecordStore.java
+  s_cd5eaf9ab3e468::t_2602813c338ce2 5-6,8,28-41,43,45
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicyTest.java
+  s_cd5eaf9ab3e468::t_9393bbcc6bf50c 4,8,62-117
+  s_7a6e5a1c75951d::t_1078abbb155d7a 118
+app/src/main/java/com/nutomic/syncthingandroid/service/FileMutationBarrier.java
+  s_cd5eaf9ab3e468::t_7a57d58c067158 96-110
+  s_cd5eaf9ab3e468::t_54c6bcd2fb395e 71-95,175-180
+  s_cd5eaf9ab3e468::t_8a805f41c37da9 1-5,7-9,13-14,17,138-142,157-159,168-170,172-174,181-190
+  s_cd5eaf9ab3e468::t_7f8d08c0be44c5 10-11,18,20-21,27-28,30-35,38-42,44-47,69-70,150-151,154,156
+  s_cd5eaf9ab3e468::t_1b7c5f48114a47 6,66
+  s_cd5eaf9ab3e468::t_41a8b1ae1670cb 12,15,19,22-26,29,36-37,43,143-149,152-153,155,160-167,171
+  s_cd5eaf9ab3e468::t_cd5095a52c9640 111-124
+  s_cd5eaf9ab3e468::t_6af272266fc7bf 16,48-65,67-68
+  s_cd5eaf9ab3e468::t_f204b0c68d4c53 125-137
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicy.java
+  s_cd5eaf9ab3e468::t_720ae8dd4e3313 37-47
+app/src/test/java/com/nutomic/syncthingandroid/runtime/ExecutionOwnershipManagerTest.java
+  s_cd5eaf9ab3e468::t_bd14c16a2aadd4 58,87,118,129,206,274,294,316,398,404,452,513,531,533-537,563,565
+  s_cd5eaf9ab3e468::t_55c4c66a605fba 174-190,460,468,477
+  s_cd5eaf9ab3e468::t_0fbefecf8e19b7 173,344-356,358,361-389
+  s_cd5eaf9ab3e468::t_6ff1ea0e2d94e3 357,359-360
+  s_cd5eaf9ab3e468::t_fbbee01177eee1 11,13,496-497,499,514,516-522,542-545
+  s_cd5eaf9ab3e468::t_2411b05ef1a899 515
+app/src/test/java/com/nutomic/syncthingandroid/service/ShutdownStartIntentTest.java
+  s_cd5eaf9ab3e468::t_ddae318f6f21ad 15-18,27,36,44,52
+  s_cd5eaf9ab3e468::t_b420dd2c9a33f1 55-62
+  s_cd5eaf9ab3e468::t_5157526dbd7e0f 1-14,19-26,28-35,37-43,45-51,53-54,63-68
+app/src/main/java/com/nutomic/syncthingandroid/service/ShutdownStartIntent.java
+  s_cd5eaf9ab3e468::t_54c6bcd2fb395e 1-45
+app/src/main/java/com/nutomic/syncthingandroid/service/PostMutationStartupGate.java
+  s_cd5eaf9ab3e468::t_a201257d1be953 11,14-16,18,20,53-61,65,68
+  s_cd5eaf9ab3e468::t_1fe28a86451f23 3-7,17
+  s_cd5eaf9ab3e468::t_4a744d8c6727cc 10
+  s_cd5eaf9ab3e468::t_f8e944b74c6a41 1-2,8-9,12-13,19,21-52,62-64,67,70-71
+  s_cd5eaf9ab3e468::t_d21e35e58658d5 66,69
+app/src/test/java/com/nutomic/syncthingandroid/runtime/ProcExecutionInspectorTest.java
+  s_cd5eaf9ab3e468::t_7b804ce15f82dc 83-84
+  s_cd5eaf9ab3e468::t_13ab21057147aa 31-32,35-59
+  s_cd5eaf9ab3e468::t_fcfa89d24bc430 85
+app/src/test/java/com/nutomic/syncthingandroid/util/ConfigXmlOneShotTest.java
+  s_cd5eaf9ab3e468::t_630bef9f51994d 9-10,46-59
+  s_66f791c4ab49f1::t_f396d43a9df911 60-61
+app/src/main/java/com/nutomic/syncthingandroid/runtime/AppUidBackend.java
+  s_cd5eaf9ab3e468::t_188ffa17aef189 71-74,79,110
+  s_cd5eaf9ab3e468::t_338a0cd0879d5a 260,263
+  s_cd5eaf9ab3e468::t_6dccd20af6cca1 70
+app/src/test/java/com/nutomic/syncthingandroid/runtime/OwnedExecutionShutdownTest.java
+  s_cd5eaf9ab3e468::t_100d182e7fedcf 224,231,234,270,276,279,282
+  s_cd5eaf9ab3e468::t_fed2f4ca521d43 116-187,208-223,225-230,232-233,235-237,239-240,243-255
+  s_cd5eaf9ab3e468::t_3d6560d8e470d1 188-207
+  s_cd5eaf9ab3e468::t_6d210d3d7c1360 238,241-242
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingRunnableCleanupTest.java
+  s_cd5eaf9ab3e468::t_a96a10a977c229 14-15,20,35-74,76
+  s_cd5eaf9ab3e468::t_34162d4920258a 29,126,180-187
+  s_cd5eaf9ab3e468::t_7629b6a1af56dd 77-93
+  s_cd5eaf9ab3e468::t_84ef4472d66491 128-129,131-134,136-174,176,178-179
+  s_cd5eaf9ab3e468::t_b1da9e62084c58 232-242
+  s_cd5eaf9ab3e468::t_1dc28b9cca3e17 75
+app/src/test/java/com/nutomic/syncthingandroid/service/CertificateVerificationStateTest.java
+  s_cd5eaf9ab3e468::t_d4f69a762c0816 5,77-100
+  s_cd5eaf9ab3e468::t_dc5a96c30aab67 1-4,6-39,47-49,51-63,65-76,101-104,118-140,159-288
+  s_cd5eaf9ab3e468::t_2379a3e74eacb5 105-117
+  s_cd5eaf9ab3e468::t_a94a4a51378b81 40-46,64
+  s_cd5eaf9ab3e468::t_17448cd06127a4 50
+  s_cd5eaf9ab3e468::t_62b530aa545e89 141-158
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ProcExecutionInspector.java
+  s_cd5eaf9ab3e468::t_4c88ba366e98b9 29-33,83,103-105,111,121,129,133-135,138,141-149
+  s_cd5eaf9ab3e468::t_3766875ad708d4 5,24,28,45-47,49-51,68-70,72-74,77-82,84-87,100,106,113-114,116-120,122-127,136-137,139-140,150,167-174
+  s_cd5eaf9ab3e468::t_a656faed806ca6 151
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_cd5eaf9ab3e468::t_8e34f18407c916 794,963-971
+  s_cd5eaf9ab3e468::t_7e85a850c52bfd 147-180
+  s_cd5eaf9ab3e468::t_5d4912ca4da414 633-636
+  s_cd5eaf9ab3e468::t_75b6d2d257885b 524,526-527,613-616,738-739
+  s_cd5eaf9ab3e468::t_aa91351fe43b81 697
+  s_cd5eaf9ab3e468::t_a18cecb5a2bdc1 680-696
+  s_cd5eaf9ab3e468::t_d79571f2dc5c9b 764,766-767,774-779,783,789-793
+  s_cd5eaf9ab3e468::t_f77dfba87e1252 795
+app/src/main/java/com/nutomic/syncthingandroid/util/ConfigXml.java
+  s_cd5eaf9ab3e468::t_4a2b68211c93a3 100-102
+app/src/main/java/com/nutomic/syncthingandroid/runtime/OwnedExecutionShutdown.java
+  s_cd5eaf9ab3e468::t_a1254d4ebb9ce8 29,128-129,132,136-142,154
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ProcessSignalTransport.java
+  s_cd5eaf9ab3e468::t_9bfea28a03b7f1 7
+app/src/test/java/com/nutomic/syncthingandroid/service/FileMutationBarrierTest.java
+  s_cd5eaf9ab3e468::t_0797ddc539e0e6 37-41,44-46,48-49,52-53,55-57,59-61,63,65-77,79-83,85-87,89-90,92-95,97-102,107-109
+  s_cd5eaf9ab3e468::t_8cf2c8ecd54fcc 306,310-315
+  s_cd5eaf9ab3e468::t_c9add6cea1c108 118-129,450
+  s_cd5eaf9ab3e468::t_b420dd2c9a33f1 424-439
+  s_cd5eaf9ab3e468::t_275d895015cde7 42,50,62
+  s_cd5eaf9ab3e468::t_8b8d4683b554cd 13,147-149,271-280,283,286-296,298-302,307-309,316-323,325-331
+  s_cd5eaf9ab3e468::t_14ea4917a8ef8b 281-282,297,303,324,338,342,348-354,356-361,370,375,377-380
+  s_cd5eaf9ab3e468::t_e9d9c791c43a91 355,362-369,371-374,376,381-400
+  s_cd5eaf9ab3e468::t_798ff39507e960 6,284-285,304-305
+  s_cd5eaf9ab3e468::t_0928feae4fc09b 5,332-337,339-341,343-347
+  s_cd5eaf9ab3e468::t_cb95876dbf7640 150-192,194-232,234-270
+  s_cd5eaf9ab3e468::t_5272167c64970e 193,233
+  s_cd5eaf9ab3e468::t_6f9a32d9bf3eb8 43,47,51,54,58,64,78,84,88,91,96,103-106
+  s_cd5eaf9ab3e468::t_81da472d70fe99 1-4,7-12,15-28,32-36,110-117,451
+  s_cd5eaf9ab3e468::t_5157526dbd7e0f 14,130-146,401-423,440-449
+  s_cd5eaf9ab3e468::t_fa90e714e5aa9b 29-31
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingRunnable.java
+  s_cd5eaf9ab3e468::t_7c48aecaa2f617 256
+  s_cd5eaf9ab3e468::t_34280c91b0440c 135,205,214,226,237-250,254-255,257-260,266-267,276,495
+  s_cd5eaf9ab3e468::t_581af21f504282 26,307,405,415-425,488-494
+  s_cd5eaf9ab3e468::t_ebd88bf632b24c 173-176
+  s_cd5eaf9ab3e468::t_f34d6cb751ed42 70,79,131-133
+  s_cd5eaf9ab3e468::t_f43fbde55170d1 134,396-399,481-483
+  s_cd5eaf9ab3e468::t_c2da46f2a49725 136
+  s_cd5eaf9ab3e468::t_8b65e757fe318a 496
+app/src/test/java/com/nutomic/syncthingandroid/service/PostMutationStartupGateTest.java
+  s_cd5eaf9ab3e468::t_faa2c36866718e 29-30,54,77
+  s_cd5eaf9ab3e468::t_fbbfbca89591f6 36
+  s_cd5eaf9ab3e468::t_d0957114e812ae 122-124,126-127,129-130,132-133
+  s_cd5eaf9ab3e468::t_4fa409f9dabcbd 144-146,148-150,152-153,159,162-165,169-170,195-208
+  s_cd5eaf9ab3e468::t_b363ebbf390ba3 5,60
+  s_cd5eaf9ab3e468::t_96cf94d02b110a 151,155,160-161,166-168
+  s_cd5eaf9ab3e468::t_e563a2e7aeb6af 125,128,131,134,137-139,142-143,182-183,185-192,194,209-222
+  s_cd5eaf9ab3e468::t_ea541e31b03f70 110
+  s_cd5eaf9ab3e468::t_8e13014ae341ac 11,24,43-51,55-57,62-64,175-181
+  s_cd5eaf9ab3e468::t_7491033e17bfd4 1-4,6-10,12-22,25,27-28,31-35,41-42,52-53,58-59,61,65-70,72-76,78-109,111-121,171-174,223-224
+  s_cd5eaf9ab3e468::t_71d01255679752 147,154,156-158,193
+  s_cd5eaf9ab3e468::t_b5d71569ea49c3 23,37-40
+  s_cd5eaf9ab3e468::t_04b4aa2f4f618e 135-136,140-141,184
+  s_cd5eaf9ab3e468::t_d17040fd353bec 26,71
+app/src/main/java/com/nutomic/syncthingandroid/service/CertificateVerificationState.java
+  s_cd5eaf9ab3e468::t_df79f1607b58ce 13-16,137,147
+  s_cd5eaf9ab3e468::t_52f713fe9015ec 8-10,70-81
+  s_cd5eaf9ab3e468::t_9a3ee95b7a3878 1-7,11-12,17-34,36-69,82-92,98-103,105-118,128-136,138-146,148-179
+  s_cd5eaf9ab3e468::t_e5462e782e1df9 93-97
+  s_cd5eaf9ab3e468::t_40e05111a7e410 35,104,119-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "32794d6041808e313f4e4fd45a76b5331f98cee8",
+  "prompts": {},
+  "sessions": {
+    "s_66f791c4ab49f1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3ae-5178-7a42-8e9f-531122b57503",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_7a6e5a1c75951d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f65d-dd83-72f3-84aa-edf89b8f640e",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
