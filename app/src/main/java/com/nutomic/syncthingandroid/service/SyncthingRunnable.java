@@ -23,6 +23,7 @@ import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
+import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.runtime.SyncthingEnvironment;
 import com.nutomic.syncthingandroid.runtime.SyncthingExecution;
@@ -66,6 +67,7 @@ public class SyncthingRunnable implements Runnable {
     private final File mSyncthingLogFile;
     private final DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler mRecoveryHandler;
     private final LifecycleListener mLifecycleListener;
+    private final DefaultSyncthingRuntime.LifecycleLaunchCheck mLifecycleLaunchCheck;
 
     /** Immutable lifecycle result produced by the background execution worker. */
     static final class LifecycleOutcome {
@@ -74,6 +76,7 @@ public class SyncthingRunnable implements Runnable {
             IDENTITY_UNAVAILABLE,
             EXECUTION_EXITED,
             RECOVERY_BLOCKED,
+            GUI_PORT_UNAVAILABLE,
             WORKER_FINISHED
         }
 
@@ -125,6 +128,12 @@ public class SyncthingRunnable implements Runnable {
             );
         }
 
+        static LifecycleOutcome guiPortUnavailable() {
+            return new LifecycleOutcome(
+                    Type.GUI_PORT_UNAVAILABLE, null, -1, false, false, null
+            );
+        }
+
         static LifecycleOutcome workerFinished(
                 ExecutionIdentity identity,
                 int exitCode,
@@ -161,6 +170,10 @@ public class SyncthingRunnable implements Runnable {
             return exitObserved;
         }
 
+        boolean provesNoExecutionExit() {
+            return type == Type.WORKER_FINISHED && !executionCreated;
+        }
+
         ExecutionOwnershipManager.RecoveryAssessment recoveryAssessment() {
             return recoveryAssessment;
         }
@@ -189,7 +202,7 @@ public class SyncthingRunnable implements Runnable {
      * @param command Which type of Syncthing command to execute.
      */
     public SyncthingRunnable(Context context, SyncthingCommand command) {
-        this(context, command, false, null, null);
+        this(context, command, false, null, null, null);
     }
 
     /** Creates a one-shot command that can stop a previous execution after proving ownership. */
@@ -198,7 +211,7 @@ public class SyncthingRunnable implements Runnable {
             SyncthingCommand command,
             DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler
     ) {
-        return new SyncthingRunnable(context, command, false, recoveryHandler, null);
+        return new SyncthingRunnable(context, command, false, recoveryHandler, null, null);
     }
 
     /**
@@ -210,7 +223,7 @@ public class SyncthingRunnable implements Runnable {
      * @param command Which service lifecycle command to execute.
      */
     static SyncthingRunnable forServiceLifecycle(Context context, SyncthingCommand command) {
-        return new SyncthingRunnable(context, command, true, null, null);
+        return new SyncthingRunnable(context, command, true, null, null, null);
     }
 
     /** Creates a service lifecycle worker with immutable outcome and exact recovery callbacks. */
@@ -221,8 +234,28 @@ public class SyncthingRunnable implements Runnable {
             LifecycleListener lifecycleListener
     ) {
         return new SyncthingRunnable(
-                context, command, true, recoveryHandler, lifecycleListener
+                context, command, true, recoveryHandler, lifecycleListener, null
         );
+    }
+
+    /** Creates a lifecycle worker with a final check after exact prior-owner recovery. */
+    static SyncthingRunnable forServiceLifecycle(
+            Context context,
+            SyncthingCommand command,
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleListener lifecycleListener,
+            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
+    ) {
+        return new SyncthingRunnable(
+                context, command, true, recoveryHandler, lifecycleListener, launchCheck
+        );
+    }
+
+    /** Raised when a prior owner exited but a replacement launch precondition remains unmet. */
+    static final class GuiPortUnavailableException extends RuntimeException {
+        GuiPortUnavailableException() {
+            super("The Web GUI port remains occupied after execution recovery");
+        }
     }
 
     private SyncthingRunnable(
@@ -230,7 +263,8 @@ public class SyncthingRunnable implements Runnable {
             SyncthingCommand command,
             boolean waitForAdmission,
             DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler,
-            LifecycleListener lifecycleListener
+            LifecycleListener lifecycleListener,
+            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
     ) {
         ((SyncthingApp) context.getApplicationContext()).component().inject(this);
         ENABLE_VERBOSE_LOG = AppPrefs.getPrefVerboseLog(mPreferences);
@@ -239,6 +273,7 @@ public class SyncthingRunnable implements Runnable {
         mWaitForAdmission = waitForAdmission;
         mRecoveryHandler = recoveryHandler;
         mLifecycleListener = lifecycleListener;
+        mLifecycleLaunchCheck = launchCheck;
         mSyncthingLogFile = Constants.getSyncthingLogFile(mContext);
     }
 
@@ -269,6 +304,7 @@ public class SyncthingRunnable implements Runnable {
         MulticastLock multicastLock = null;
         SyncthingExecution execution = null;
         boolean executionExitObserved = false;
+        boolean aborted = false;
         try {
             // Android 11 blocks local discovery if we did not acquire MulticastLock.
             WifiManager wifi = (WifiManager) mContext.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -357,11 +393,16 @@ public class SyncthingRunnable implements Runnable {
         } catch (ExecutableNotFoundException e) {
             Log.e(TAG, "CRITICAL - Syncthing core binary is missing in APK package location " + e.getMessage());
             throw e;
+        } catch (GuiPortUnavailableException e) {
+            if (!mWaitForAdmission) throw e;
+            publishLifecycleOutcome(LifecycleOutcome.guiPortUnavailable());
+            return capturedStdOut;
         } catch (ExecutionRecoveryException e) {
             if (!mWaitForAdmission) throw e;
             publishLifecycleOutcome(LifecycleOutcome.recoveryBlocked(e.assessment()));
             return capturedStdOut;
         } catch (IOException | InterruptedException e) {
+            aborted = true;
             Log.e(TAG, "Failed to execute syncthing binary or read output", e);
         } finally {
             if (multicastLock != null) {
@@ -371,6 +412,17 @@ public class SyncthingRunnable implements Runnable {
             if (execution != null) {
                 if (!executionExitObserved) {
                     boolean interrupted = Thread.interrupted();
+                    if (aborted && !mWaitForAdmission) {
+                        try {
+                            stopAbortedOneShot(
+                                    execution.identity(),
+                                    mRuntime,
+                                    OwnedExecutionShutdown.processWaiter()
+                            );
+                        } catch (InterruptedException e) {
+                            interrupted = true;
+                        }
+                    }
                     while (!executionExitObserved) {
                         try {
                             exitCode = execution.await();
@@ -426,9 +478,20 @@ public class SyncthingRunnable implements Runnable {
     private SyncthingExecution startExecution(SyncthingEnvironment targetEnv)
             throws IOException, ExecutableNotFoundException, InterruptedException {
         if (mWaitForAdmission) {
-            return mRuntime.startServiceLifecycle(mCommand, targetEnv, mRecoveryHandler);
+            return mRuntime.startServiceLifecycle(
+                    mCommand, targetEnv, mRecoveryHandler, mLifecycleLaunchCheck
+            );
         }
         return mRuntime.start(mCommand, targetEnv, mRecoveryHandler);
+    }
+
+    static OwnedExecutionShutdown.Outcome stopAbortedOneShot(
+            ExecutionIdentity identity,
+            OwnedExecutionShutdown.ExecutionControl control,
+            OwnedExecutionShutdown.Waiter waiter
+    ) throws InterruptedException {
+        if (identity == null) return null;
+        return OwnedExecutionShutdown.stop(identity, () -> { }, control, waiter);
     }
 
     private void publishLifecycleOutcome(LifecycleOutcome outcome) {

@@ -1,9 +1,11 @@
 package com.nutomic.syncthingandroid.service;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayDeque;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
@@ -55,6 +57,63 @@ public class SyncthingResetPolicyTest {
         serviceThreadQueue.remove().run();
 
         assertFalse(continuationRan[0]);
+    }
+
+    @Test
+    public void externalDatabaseResetIsRejectedWhileFileMutationOwnsStoppedState() {
+        AtomicInteger resetInvocations = new AtomicInteger();
+
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                true, false, resetInvocations::incrementAndGet
+        );
+
+        assertFalse(accepted);
+        assertEquals(0, resetInvocations.get());
+    }
+
+    @Test
+    public void externalDatabaseResetIsRejectedWhileImportOwnsStartup() {
+        AtomicInteger resetInvocations = new AtomicInteger();
+
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, true, resetInvocations::incrementAndGet
+        );
+
+        assertFalse(accepted);
+        assertEquals(0, resetInvocations.get());
+    }
+
+    @Test
+    public void rejectedDeltaResetDoesNotLaunchOrLeaveStopAfterState() {
+        boolean[] stopAfterDeltaReset = {false};
+        AtomicInteger launches = new AtomicInteger();
+
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                true, false, () -> {
+                    stopAfterDeltaReset[0] = true;
+                    launches.incrementAndGet();
+                }
+        );
+
+        assertFalse(accepted);
+        assertFalse(stopAfterDeltaReset[0]);
+        assertEquals(0, launches.get());
+    }
+
+    @Test
+    public void externalResetActionsRunAfterMutationOwnershipEnds() {
+        AtomicInteger databaseResets = new AtomicInteger();
+        AtomicInteger deltaResets = new AtomicInteger();
+
+        assertTrue(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, databaseResets::incrementAndGet
+        ));
+        assertTrue(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, deltaResets::incrementAndGet
+        ));
+
+        assertEquals(1, databaseResets.get());
+        assertEquals(1, deltaResets.get());
     }
 
 }

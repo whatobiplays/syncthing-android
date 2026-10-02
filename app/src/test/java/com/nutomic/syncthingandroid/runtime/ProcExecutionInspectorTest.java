@@ -28,12 +28,35 @@ public class ProcExecutionInspectorTest {
 
     @Test
     public void rejectsMalformedOrNonpositiveStartTime() {
-        assertThrows(IOException.class, () -> ProcExecutionInspector.readStartTimeTicks(
+        IOException malformed = assertThrows(IOException.class,
+                () -> ProcExecutionInspector.readStartTimeTicks(
                 "123 no-closing-parenthesis".getBytes(StandardCharsets.UTF_8)
         ));
-        assertThrows(IOException.class, () -> ProcExecutionInspector.readStartTimeTicks(
-                "123 (syncthing) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-                        .getBytes(StandardCharsets.UTF_8)
+        assertEquals("Malformed proc stat record", malformed.getMessage());
+
+        StringBuilder nonpositive = new StringBuilder("123 (syncthing) S");
+        for (int fieldIndex = 0; fieldIndex < 20; fieldIndex++) {
+            nonpositive.append(" 0");
+        }
+        IOException invalidStart = assertThrows(IOException.class,
+                () -> ProcExecutionInspector.readStartTimeTicks(
+                        nonpositive.toString().getBytes(StandardCharsets.UTF_8)
+                ));
+        assertEquals("Invalid proc start time", invalidStart.getMessage());
+    }
+
+    @Test
+    public void bootIdParsingRejectsEmptyAndWhitespaceOnlyValues() {
+        assertThrows(IOException.class,
+                () -> ProcExecutionInspector.parseBootId(new byte[0]));
+        assertThrows(IOException.class,
+                () -> ProcExecutionInspector.parseBootId(" \n\t ".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    public void bootIdParsingTrimsValidProcfsValue() throws Exception {
+        assertEquals("boot-a", ProcExecutionInspector.parseBootId(
+                " boot-a\n".getBytes(StandardCharsets.UTF_8)
         ));
     }
 
@@ -56,6 +79,9 @@ public class ProcExecutionInspectorTest {
         ));
         assertFalse(ProcExecutionInspector.hasExactExecutablePath(
                 "/data/app/previous/lib/libsyncthingnative.so (deleted)", currentPath
+        ));
+        assertTrue(ProcExecutionInspector.hasExactExecutablePath(
+                currentPath + " (deleted)", currentPath
         ));
     }
 }

@@ -17,6 +17,12 @@ public final class DefaultSyncthingRuntime
         boolean stopOwnedExecution(ExecutionIdentity identity) throws InterruptedException;
     }
 
+    @FunctionalInterface
+    public interface LifecycleLaunchCheck {
+        /** Runs after prior ownership recovery and immediately before a lifecycle launch. */
+        void check();
+    }
+
     private final PrivilegeBackend backend;
     private final AdmissionGate admission = new AdmissionGate();
 
@@ -43,7 +49,7 @@ public final class DefaultSyncthingRuntime
     ) throws IOException, ExecutableNotFoundException {
         admission.acquireOneShot();
         try {
-            return launch(command, environment, recoveryHandler);
+            return launch(command, environment, recoveryHandler, null);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("One-shot execution recovery was interrupted", e);
@@ -51,7 +57,7 @@ public final class DefaultSyncthingRuntime
     }
 
     /**
-     * Starts the service-owned invocation after a waiting one-shot releases runtime admission.
+     * Starts the service-owned invocation after the current admission owner exits.
      *
      * @throws InterruptedException when interrupted while waiting for admission or recovery
      */
@@ -74,8 +80,18 @@ public final class DefaultSyncthingRuntime
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
+        return startServiceLifecycle(command, environment, recoveryHandler, null);
+    }
+
+    /** Starts a lifecycle invocation with a final check before replacement launch. */
+    public SyncthingExecution startServiceLifecycle(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleLaunchCheck launchCheck
+    ) throws IOException, ExecutableNotFoundException, InterruptedException {
         admission.awaitServiceLifecycleAdmission();
-        return launch(command, environment, recoveryHandler);
+        return launch(command, environment, recoveryHandler, launchCheck);
     }
 
     /**
@@ -99,9 +115,11 @@ public final class DefaultSyncthingRuntime
     private SyncthingExecution launch(
             SyncthingCommand command,
             SyncthingEnvironment environment,
-            OwnedExecutionRecoveryHandler recoveryHandler
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleLaunchCheck launchCheck
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
+            backend.validateLaunchPrerequisites();
             ExecutionOwnershipManager.RecoveryAssessment recovery =
                     backend.recoverExecutions();
             if (recovery.classification()
@@ -114,6 +132,7 @@ public final class DefaultSyncthingRuntime
             }
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
+            if (launchCheck != null) launchCheck.check();
             PrivilegeBackend.Execution execution = backend.start(command, environment);
             return new SyncthingExecution(execution, admission::release);
         } catch (IOException | ExecutableNotFoundException | InterruptedException
@@ -128,7 +147,7 @@ public final class DefaultSyncthingRuntime
     }
 
     @Override
-    public ExecutionOwnershipManager.SignalResult signalIfOwned(
+    public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
             ExecutionIdentity identity,
             ExecutionOwnershipManager.Signal signal
     ) {

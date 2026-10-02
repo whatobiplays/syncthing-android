@@ -1,17 +1,17 @@
 package com.nutomic.syncthingandroid.runtime;
 
-import android.os.Process;
+import android.system.ErrnoException;
+import android.system.Os;
 
-import java.io.IOException;
-
-/** Sends Linux process signals through Android's API-1 process transport. */
+/** Sends Linux process signals through Android's errno-reporting syscall API. */
 final class AndroidProcessSignalTransport implements ProcessSignalTransport {
     @Override
-    public void sendSignal(int pid, int signal) throws IOException {
+    public ExecutionOwnershipManager.SignalResult sendSignal(int pid, int signal) {
         try {
-            Process.sendSignal(pid, signal);
-        } catch (IllegalArgumentException | SecurityException e) {
-            throw new IOException("Android rejected process signal", e);
+            Os.kill(pid, signal);
+            return ExecutionOwnershipManager.SignalResult.SIGNALED;
+        } catch (ErrnoException | IllegalArgumentException | SecurityException e) {
+            return ExecutionOwnershipManager.SignalResult.SIGNAL_FAILED;
         }
     }
 }

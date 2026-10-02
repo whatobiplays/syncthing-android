@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.runtime;
 
 import android.system.ErrnoException;
 import android.system.Os;
+import android.system.OsConstants;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -20,12 +21,16 @@ final class ProcExecutionInspector implements ExecutionInspector {
 
     @Override
     public String currentBootId() throws IOException {
-        return new String(readAll(BOOT_ID_FILE), StandardCharsets.UTF_8).trim();
+        return parseBootId(readAll(BOOT_ID_FILE));
     }
 
     @Override
-    public ExecutionIdentity inspect(int pid) throws IOException {
-        return readProcess(pid, currentBootId(), true);
+    public InspectionResult inspect(int pid) {
+        try {
+            return readProcess(pid, currentBootId(), true);
+        } catch (IOException | RuntimeException e) {
+            return InspectionResult.unknown();
+        }
     }
 
     @Override
@@ -37,14 +42,13 @@ final class ProcExecutionInspector implements ExecutionInspector {
         for (File processDirectory : processDirectories) {
             int pid = parsePid(processDirectory.getName());
             if (pid <= 0) continue;
-            ExecutionIdentity snapshot;
-            try {
-                snapshot = readProcess(pid, bootId, false);
-            } catch (IOException e) {
-                continue;
+            InspectionResult inspection = readProcess(pid, bootId, false);
+            if (inspection.status() == InspectionResult.Status.UNKNOWN) {
+                throw new IOException("Could not inspect procfs process " + pid);
             }
-            if (snapshot != null
-                    && isBundledExecutableCandidate(snapshot.executablePath(), executablePath)) {
+            if (inspection.status() == InspectionResult.Status.PROCESS_ABSENT) continue;
+            ExecutionIdentity snapshot = inspection.identity();
+            if (isBundledExecutableCandidate(snapshot.executablePath(), executablePath)) {
                 candidates.add(snapshot);
             }
         }
@@ -61,19 +65,26 @@ final class ProcExecutionInspector implements ExecutionInspector {
         for (File processDirectory : processDirectories) {
             int pid = parsePid(processDirectory.getName());
             if (pid <= 0) continue;
-            ExecutionIdentity candidate;
+            InspectionResult inspection = readProcess(pid, bootId, false);
+            if (inspection.status() == InspectionResult.Status.UNKNOWN) {
+                throw new IOException("Could not inspect procfs process " + pid);
+            }
+            if (inspection.status() == InspectionResult.Status.PROCESS_ABSENT) continue;
+            ExecutionIdentity candidate = inspection.identity();
+            if (!hasExactExecutablePath(candidate.executablePath(), executablePath)) {
+                continue;
+            }
+            String candidateToken;
             try {
-                candidate = readProcess(pid, bootId, false);
+                candidateToken = readRunToken(new File(
+                        new File(PROC_DIRECTORY, Integer.toString(pid)), "environ"
+                ));
             } catch (IOException e) {
-                continue;
+                if (processPresence(pid) == ProcessPresence.ABSENT) {
+                    continue;
+                }
+                throw e;
             }
-            if (candidate == null
-                    || !hasExactExecutablePath(candidate.executablePath(), executablePath)) {
-                continue;
-            }
-            String candidateToken = readRunToken(new File(
-                    new File(PROC_DIRECTORY, Integer.toString(pid)), "environ"
-            ));
             if (!runToken.equals(candidateToken)) continue;
             if (found != null) {
                 throw new IOException("Multiple processes carry the new launch token");
@@ -86,27 +97,56 @@ final class ProcExecutionInspector implements ExecutionInspector {
         return found;
     }
 
-    private ExecutionIdentity readProcess(int pid, String bootId, boolean includeRunToken)
-            throws IOException {
+    private InspectionResult readProcess(int pid, String bootId, boolean includeRunToken) {
         File processDirectory = new File(PROC_DIRECTORY, Integer.toString(pid));
         File executable = new File(processDirectory, "exe");
-        if (!processDirectory.isDirectory()) return null;
+        ProcessPresence presence = processPresence(pid);
+        if (presence == ProcessPresence.ABSENT) return InspectionResult.processAbsent();
+        if (presence == ProcessPresence.UNKNOWN) return InspectionResult.unknown();
+        if (!processDirectory.isDirectory()) return InspectionResult.unknown();
         String executablePath;
         try {
             executablePath = Os.readlink(executable.getAbsolutePath());
         } catch (ErrnoException e) {
-            return null;
+            return inspectionAfterReadFailure(pid);
         }
-        long startTicks = readStartTimeTicks(new File(processDirectory, "stat"));
-        String runToken = includeRunToken
-                ? readRunToken(new File(processDirectory, "environ"))
-                : "";
+        long startTicks;
+        String runToken = "";
         try {
-            return new ExecutionIdentity(pid, startTicks, bootId, executablePath,
-                    runToken == null ? "" : runToken);
-        } catch (IllegalArgumentException e) {
-            return null;
+            startTicks = readStartTimeTicks(new File(processDirectory, "stat"));
+            if (includeRunToken) {
+                runToken = readRunToken(new File(processDirectory, "environ"));
+            }
+        } catch (IOException e) {
+            return inspectionAfterReadFailure(pid);
         }
+        try {
+            return InspectionResult.live(new ExecutionIdentity(
+                    pid, startTicks, bootId, executablePath,
+                    runToken == null ? "" : runToken
+            ));
+        } catch (IllegalArgumentException e) {
+            return inspectionAfterReadFailure(pid);
+        }
+    }
+
+    private enum ProcessPresence { PRESENT, ABSENT, UNKNOWN }
+
+    private static ProcessPresence processPresence(int pid) {
+        try {
+            Os.stat(new File(PROC_DIRECTORY, Integer.toString(pid)).getAbsolutePath());
+            return ProcessPresence.PRESENT;
+        } catch (ErrnoException e) {
+            return e.errno == OsConstants.ENOENT
+                    ? ProcessPresence.ABSENT
+                    : ProcessPresence.UNKNOWN;
+        }
+    }
+
+    private static InspectionResult inspectionAfterReadFailure(int pid) {
+        return processPresence(pid) == ProcessPresence.ABSENT
+                ? InspectionResult.processAbsent()
+                : InspectionResult.unknown();
     }
 
     /**
@@ -124,7 +164,14 @@ final class ProcExecutionInspector implements ExecutionInspector {
 
     /** Matches the full executable target for identifying a process launched in this run. */
     static boolean hasExactExecutablePath(String processPath, String expectedPath) {
-        return expectedPath != null && expectedPath.equals(processPath);
+        return expectedPath != null
+                && ExecutionIdentity.sameExecutableTarget(processPath, expectedPath);
+    }
+
+    static String parseBootId(byte[] contents) throws IOException {
+        String bootId = new String(contents, StandardCharsets.UTF_8).trim();
+        if (bootId.isEmpty()) throw new IOException("Empty procfs boot ID");
+        return bootId;
     }
 
     private static String executableBasename(String path) {

@@ -34,6 +34,17 @@ final class SyncthingResetPolicy {
         return state != SyncthingService.State.DISABLED || serviceRunnablePresent;
     }
 
+    /** Runs an external reset action only when no stopped-state mutation owns lifecycle admission. */
+    static boolean runExternalResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            Runnable resetAction
+    ) {
+        if (fileMutationOwnsStoppedState || postMutationOwnsStartup) return false;
+        resetAction.run();
+        return true;
+    }
+
     /**
      * Creates the relaunch action for a reset without freezing the run-conditions decision when
      * reset is requested. The decision is read when the reset completion action is invoked.

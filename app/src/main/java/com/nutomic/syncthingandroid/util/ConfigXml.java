@@ -97,7 +97,9 @@ public class ConfigXml {
     static String runOneShot(OneShotCommand command) throws ExecutableNotFoundException {
         try {
             return command.run();
-        } catch (ExecutionAdmissionException | ExecutionIdentityUnavailableException e) {
+        } catch (ExecutionAdmissionException
+                 | ExecutionIdentityUnavailableException
+                 | com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException e) {
             throw new OpenConfigException(e);
         }
     }

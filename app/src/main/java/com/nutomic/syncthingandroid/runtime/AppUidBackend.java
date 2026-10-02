@@ -68,12 +68,15 @@ public final class AppUidBackend implements PrivilegeBackend {
     }
 
     @Override
+    public void validateLaunchPrerequisites() throws ExecutableNotFoundException {
+        if (!binary.exists()) throw new ExecutableNotFoundException(binary.getPath());
+    }
+
+    @Override
     public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
             throws IOException, ExecutableNotFoundException {
         String binaryPath = binary.getPath();
-        if (!binary.exists()) {
-            throw new ExecutableNotFoundException(binaryPath);
-        }
+        validateLaunchPrerequisites();
 
         ExecutionOwnershipManager.RecoveryAssessment recovery = ownershipManager.recover();
         if (!recovery.mayLaunch()) {
@@ -104,7 +107,7 @@ public final class AppUidBackend implements PrivilegeBackend {
     }
 
     @Override
-    public ExecutionOwnershipManager.SignalResult signalIfOwned(
+    public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
             ExecutionIdentity identity,
             ExecutionOwnershipManager.Signal signal
     ) {
@@ -254,10 +257,10 @@ public final class AppUidBackend implements PrivilegeBackend {
         }
 
         @Override
-        public ExecutionOwnershipManager.SignalResult signalIfOwned(
+        public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
                 ExecutionOwnershipManager.Signal signal
         ) {
-            if (identity == null) return ExecutionOwnershipManager.SignalResult.NOT_OWNED;
+            if (identity == null) return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
             return ownershipManager.signalIfOwned(identity, signal);
         }
     }

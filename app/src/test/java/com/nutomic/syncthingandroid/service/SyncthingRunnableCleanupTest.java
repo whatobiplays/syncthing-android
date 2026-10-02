@@ -11,10 +11,13 @@ import com.nutomic.syncthingandroid.runtime.ConfigStorage;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
+import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 import com.nutomic.syncthingandroid.runtime.FolderEvent;
 import com.nutomic.syncthingandroid.runtime.FolderIgnoreResult;
 import com.nutomic.syncthingandroid.runtime.FolderWriteability;
+import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.PrivilegeBackend;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.runtime.SyncthingEnvironment;
@@ -23,10 +26,70 @@ import com.nutomic.syncthingandroid.runtime.SyncthingExecution;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Test;
 
 public class SyncthingRunnableCleanupTest {
+
+    @Test
+    public void abortedOneShotShutdownRequiresAnExactIdentityAndUsesFakeTiming()
+            throws Exception {
+        ExecutionIdentity identity = new ExecutionIdentity(
+                41, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", "run-a"
+        );
+        java.util.List<ExecutionOwnershipManager.Signal> signals = new java.util.ArrayList<>();
+        OwnedExecutionShutdown.ExecutionControl control =
+                new OwnedExecutionShutdown.ExecutionControl() {
+                    @Override
+                    public ExecutionOwnershipManager.Observation observe(ExecutionIdentity target) {
+                        return ExecutionOwnershipManager.Observation.OWNED;
+                    }
+
+                    @Override
+                    public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                            ExecutionIdentity target,
+                            ExecutionOwnershipManager.Signal signal
+                    ) {
+                        signals.add(signal);
+                        return ExecutionOwnershipManager.SignalAttempt.SIGNALED;
+                    }
+                };
+        java.util.List<Long> waits = new java.util.ArrayList<>();
+        OwnedExecutionShutdown.Waiter waiter = (target, timeout, ignored) -> {
+            waits.add(timeout);
+            return false;
+        };
+
+        assertNull(SyncthingRunnable.stopAbortedOneShot(null, control, waiter));
+        assertTrue(signals.isEmpty());
+
+        assertEquals(OwnedExecutionShutdown.Outcome.EXIT_NOT_PROVEN,
+                SyncthingRunnable.stopAbortedOneShot(identity, control, waiter));
+        assertEquals(java.util.Arrays.asList(
+                ExecutionOwnershipManager.Signal.SIGINT,
+                ExecutionOwnershipManager.Signal.SIGKILL
+        ), signals);
+        assertEquals(java.util.Arrays.asList(10000L, 5000L, 5000L), waits);
+    }
+
+    @Test
+    public void workerCompletionWithoutExecutionProvesThereIsNoChildToWaitFor() {
+        SyncthingRunnable.LifecycleOutcome withoutExecution =
+                SyncthingRunnable.LifecycleOutcome.workerFinished(null, -1, false, false);
+        SyncthingRunnable.LifecycleOutcome withExecution =
+                SyncthingRunnable.LifecycleOutcome.workerFinished(
+                        new com.nutomic.syncthingandroid.runtime.ExecutionIdentity(
+                                41, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", "run-a"
+                        ),
+                        -1,
+                        true,
+                        false
+                );
+
+        assertTrue(withoutExecution.provesNoExecutionExit());
+        assertFalse(withExecution.provesNoExecutionExit());
+    }
 
     @Test
     public void exitCodeThreeRestartAfterWorkerTerminationClearsHandlesBeforeReplacement()
@@ -60,59 +123,68 @@ public class SyncthingRunnableCleanupTest {
         Runnable lifecycleRunnable = () -> { };
         Thread[] workerHandle = {lifecycleThread};
         Runnable[] runnableHandle = {lifecycleRunnable};
+        try {
         lifecycleThread.start();
-        exitingExecution.exit(3);
-        outcomePublished.await();
+            exitingExecution.exit(3);
+            assertTrue(outcomePublished.await(1, TimeUnit.SECONDS));
 
-        assertNull(workerFailure[0]);
-        assertEquals(3, exitCode[0]);
-        assertTrue(executionExitProven[0]);
-        assertTrue(restartQueued[0]);
+            assertNull(workerFailure[0]);
+            assertEquals(3, exitCode[0]);
+            assertTrue(executionExitProven[0]);
+            assertTrue(restartQueued[0]);
 
-        boolean[] recoveryStarted = {false};
-        boolean readyWhileWorkerAlive = LifecycleShutdownBarrier.runWhenReady(
-                executionExitProven[0],
-                lifecycleThread,
-                () -> {
-                    workerHandle[0] = null;
-                    runnableHandle[0] = null;
-                },
-                () -> recoveryStarted[0] = true
-        );
-        assertFalse(readyWhileWorkerAlive);
-        assertSame(lifecycleThread, workerHandle[0]);
-        assertSame(lifecycleRunnable, runnableHandle[0]);
-        assertFalse(recoveryStarted[0]);
+            boolean[] recoveryStarted = {false};
+            boolean readyWhileWorkerAlive = LifecycleShutdownBarrier.runWhenReady(
+                    executionExitProven[0],
+                    lifecycleThread,
+                    () -> {
+                        workerHandle[0] = null;
+                        runnableHandle[0] = null;
+                    },
+                    () -> recoveryStarted[0] = true
+            );
+            assertFalse(readyWhileWorkerAlive);
+            assertSame(lifecycleThread, workerHandle[0]);
+            assertSame(lifecycleRunnable, runnableHandle[0]);
+            assertFalse(recoveryStarted[0]);
 
-        allowWorkerTermination.countDown();
-        lifecycleThread.join();
-        assertFalse(lifecycleThread.isAlive());
+            allowWorkerTermination.countDown();
+            lifecycleThread.join(1_000);
+            assertFalse(lifecycleThread.isAlive());
 
-        backend.execution = new ImmediateExecution();
-        boolean restartAdmitted = LifecycleShutdownBarrier.runWhenReady(
-                executionExitProven[0],
-                lifecycleThread,
-                () -> {
-                    workerHandle[0] = null;
-                    runnableHandle[0] = null;
-                },
-                () -> {
-                    assertNull(workerHandle[0]);
-                    assertNull(runnableHandle[0]);
-                    try {
-                        SyncthingExecution replacement = runtime.startServiceLifecycle(
-                                SyncthingCommand.SERVE, environment
-                        );
-                        assertEquals(0, replacement.await());
-                        recoveryStarted[0] = true;
-                    } catch (Exception error) {
-                        throw new AssertionError(error);
+            backend.execution = new ImmediateExecution();
+            boolean restartAdmitted = LifecycleShutdownBarrier.runWhenReady(
+                    executionExitProven[0],
+                    lifecycleThread,
+                    () -> {
+                        workerHandle[0] = null;
+                        runnableHandle[0] = null;
+                    },
+                    () -> {
+                        assertNull(workerHandle[0]);
+                        assertNull(runnableHandle[0]);
+                        try {
+                            SyncthingExecution replacement = runtime.startServiceLifecycle(
+                                    SyncthingCommand.SERVE, environment
+                            );
+                            assertEquals(0, replacement.await());
+                            recoveryStarted[0] = true;
+                        } catch (Exception error) {
+                            throw new AssertionError(error);
+                        }
                     }
-                }
-        );
+            );
 
-        assertTrue(restartAdmitted);
-        assertTrue(recoveryStarted[0]);
+            assertTrue(restartAdmitted);
+            assertTrue(recoveryStarted[0]);
+        } finally {
+            exitingExecution.exit(3);
+            allowWorkerTermination.countDown();
+            if (lifecycleThread.isAlive()) {
+                lifecycleThread.interrupt();
+                lifecycleThread.join(1_000);
+            }
+        }
     }
 
     @Test
@@ -155,6 +227,17 @@ public class SyncthingRunnableCleanupTest {
 
         private ExecutionBackend(PrivilegeBackend.Execution execution) {
             this.execution = execution;
+        }
+
+        @Override
+        public void validateLaunchPrerequisites() {
+        }
+
+        @Override
+        public com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager.RecoveryAssessment
+        recoverExecutions() {
+            return com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager.RecoveryAssessment
+                    .noCandidate();
         }
 
         @Override

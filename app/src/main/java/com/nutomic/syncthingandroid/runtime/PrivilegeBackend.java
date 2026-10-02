@@ -5,18 +5,18 @@ import java.io.InputStream;
 
 /** Backend contract for launching and controlling bundled Syncthing executions. */
 public interface PrivilegeBackend {
+    void validateLaunchPrerequisites() throws IOException, ExecutableNotFoundException;
+
     Execution start(SyncthingCommand command, SyncthingEnvironment environment)
             throws IOException, ExecutableNotFoundException;
 
-    default ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
-        return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
-    }
+    ExecutionOwnershipManager.RecoveryAssessment recoverExecutions();
 
-    default ExecutionOwnershipManager.SignalResult signalIfOwned(
+    default ExecutionOwnershipManager.SignalAttempt signalIfOwned(
             ExecutionIdentity identity,
             ExecutionOwnershipManager.Signal signal
     ) {
-        return ExecutionOwnershipManager.SignalResult.NOT_OWNED;
+        return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
     }
 
     default ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
@@ -56,10 +56,10 @@ public interface PrivilegeBackend {
             return ExecutionOwnershipManager.Observation.UNKNOWN;
         }
 
-        default ExecutionOwnershipManager.SignalResult signalIfOwned(
+        default ExecutionOwnershipManager.SignalAttempt signalIfOwned(
                 ExecutionOwnershipManager.Signal signal
         ) {
-            return ExecutionOwnershipManager.SignalResult.NOT_OWNED;
+            return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
         }
     }
 }

@@ -2,7 +2,10 @@ package com.nutomic.syncthingandroid.runtime;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -22,12 +25,24 @@ final class FileExecutionRecordStore implements ExecutionRecordStore {
 
     @Override
     public synchronized ReadResult read() {
-        if (!recordFile.exists()) return ReadResult.missing();
-        if (recordFile.length() <= 0 || recordFile.length() > MAX_RECORD_BYTES) {
-            return ReadResult.corrupt();
+        byte[] bytes;
+        try (FileInputStream fileInput = new FileInputStream(recordFile);
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[1024];
+            int count;
+            while ((count = fileInput.read(buffer)) != -1) {
+                if (output.size() + count > MAX_RECORD_BYTES) return ReadResult.corrupt();
+                output.write(buffer, 0, count);
+            }
+            bytes = output.toByteArray();
+        } catch (FileNotFoundException e) {
+            return recordFile.exists() ? ReadResult.readFailed() : ReadResult.missing();
+        } catch (IOException e) {
+            return ReadResult.readFailed();
         }
+        if (bytes.length == 0) return ReadResult.corrupt();
 
-        try (DataInputStream input = new DataInputStream(new FileInputStream(recordFile))) {
+        try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
             if (input.readInt() != MAGIC) return ReadResult.corrupt();
             int version = input.readInt();
             if (version != VERSION) return ReadResult.unsupportedVersion();

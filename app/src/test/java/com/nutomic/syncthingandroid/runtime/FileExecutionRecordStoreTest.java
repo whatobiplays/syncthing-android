@@ -50,6 +50,43 @@ public class FileExecutionRecordStoreTest {
     }
 
     @Test
+    public void trailingBytesAfterValidRecordAreClassifiedAsCorrupt() throws Exception {
+        File record = new File(temporaryFolder.getRoot(), "execution.bin");
+        FileExecutionRecordStore store = new FileExecutionRecordStore(record);
+        store.write(IDENTITY);
+        try (FileOutputStream output = new FileOutputStream(record, true)) {
+            output.write(0x7f);
+        }
+
+        assertEquals(ExecutionRecordStore.ReadResult.Status.CORRUPT, store.read().status());
+    }
+
+    @Test
+    public void emptyRunTokenIsClassifiedAsCorrupt() throws Exception {
+        File record = new File(temporaryFolder.getRoot(), "execution.bin");
+        try (DataOutputStream output = new DataOutputStream(new FileOutputStream(record))) {
+            output.writeInt(0x53544558);
+            output.writeInt(1);
+            output.writeInt(41);
+            output.writeLong(9001);
+            output.writeUTF("boot-a");
+            output.writeUTF(IDENTITY.executablePath());
+            output.writeUTF("");
+        }
+
+        assertEquals(ExecutionRecordStore.ReadResult.Status.CORRUPT,
+                new FileExecutionRecordStore(record).read().status());
+    }
+
+    @Test
+    public void filesystemReadFailureIsNotClassifiedAsCorruption() throws Exception {
+        File unreadableRecord = temporaryFolder.newFolder("execution.bin");
+
+        assertEquals(ExecutionRecordStore.ReadResult.Status.READ_FAILED,
+                new FileExecutionRecordStore(unreadableRecord).read().status());
+    }
+
+    @Test
     public void unsupportedRecordVersionIsRetainedAsTypedEvidence() throws Exception {
         File record = new File(temporaryFolder.getRoot(), "execution.bin");
         try (DataOutputStream output = new DataOutputStream(new FileOutputStream(record))) {

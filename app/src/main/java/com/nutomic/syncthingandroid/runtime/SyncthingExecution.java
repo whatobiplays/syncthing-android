@@ -59,17 +59,6 @@ public final class SyncthingExecution {
         return execution.identity();
     }
 
-    public ExecutionOwnershipManager.Observation observe() {
-        if (exitObserved.get()) return ExecutionOwnershipManager.Observation.EXITED;
-        return execution.observe();
-    }
-
-    public ExecutionOwnershipManager.SignalResult signalIfOwned(
-            ExecutionOwnershipManager.Signal signal
-    ) {
-        return execution.signalIfOwned(signal);
-    }
-
     private void release() {
         if (released.compareAndSet(false, true)) {
             releaseAdmission.run();

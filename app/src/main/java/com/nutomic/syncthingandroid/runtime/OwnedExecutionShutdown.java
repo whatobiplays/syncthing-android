@@ -26,7 +26,7 @@ public final class OwnedExecutionShutdown {
     public interface ExecutionControl {
         ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity);
 
-        ExecutionOwnershipManager.SignalResult signalIfOwned(
+        ExecutionOwnershipManager.SignalAttempt signalIfOwned(
                 ExecutionIdentity identity,
                 ExecutionOwnershipManager.Signal signal
         );
@@ -125,19 +125,21 @@ public final class OwnedExecutionShutdown {
         Outcome beforeSignal = currentOwnership(identity, control);
         if (beforeSignal != null) return beforeSignal;
 
-        ExecutionOwnershipManager.SignalResult result = control.signalIfOwned(identity, signal);
-        if (result != ExecutionOwnershipManager.SignalResult.SIGNALED) {
+        ExecutionOwnershipManager.SignalAttempt result = control.signalIfOwned(identity, signal);
+        if (result != ExecutionOwnershipManager.SignalAttempt.SIGNALED) {
             Outcome afterFailedSignal = currentOwnership(identity, control);
             if (afterFailedSignal == Outcome.EXITED) return Outcome.EXITED;
-            if (result != ExecutionOwnershipManager.SignalResult.SIGNAL_FAILED) {
-                return Outcome.OWNERSHIP_LOST;
-            }
+            if (afterFailedSignal != null) return afterFailedSignal;
             Outcome afterFailedSignalWait = waitThenCheck(
                     identity, waitMillis, control, waiter
             );
-            return afterFailedSignalWait == null
-                    ? Outcome.SIGNAL_FAILED
-                    : afterFailedSignalWait;
+            if (afterFailedSignalWait != null) return afterFailedSignalWait;
+            if (result == ExecutionOwnershipManager.SignalAttempt.SIGNAL_FAILED) {
+                return Outcome.SIGNAL_FAILED;
+            }
+            return signal == ExecutionOwnershipManager.Signal.SIGKILL
+                    ? Outcome.EXIT_NOT_PROVEN
+                    : null;
         }
 
         return waitThenCheck(identity, waitMillis, control, waiter);
@@ -149,7 +151,7 @@ public final class OwnedExecutionShutdown {
             ExecutionControl control,
             Waiter waiter
     ) throws InterruptedException {
-        waiter.awaitExit(identity, waitMillis, control);
+        if (waiter.awaitExit(identity, waitMillis, control)) return Outcome.EXITED;
         return currentOwnership(identity, control);
     }
 

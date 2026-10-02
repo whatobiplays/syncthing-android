@@ -145,6 +145,40 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void launchPrerequisiteFailureHappensBeforeRecoveryCanStopAnOwner() {
+        RecordingBackend backend = new RecordingBackend();
+        backend.launchPrerequisiteFailure = new ExecutableNotFoundException("missing binary");
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        ExecutableNotFoundException failure = assertThrows(
+                ExecutableNotFoundException.class,
+                () -> runtime.start(SyncthingCommand.SERVE, normalModeEnvironment())
+        );
+
+        assertSame(backend.launchPrerequisiteFailure, failure);
+        assertEquals(0, backend.recoveryChecks);
+        assertTrue(backend.events.isEmpty());
+    }
+
+    @Test
+    public void lifecycleLaunchCheckRunsAfterRecoveryAndBeforeReplacementStart()
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        SyncthingExecution execution = runtime.startServiceLifecycle(
+                SyncthingCommand.SERVE,
+                normalModeEnvironment(),
+                null,
+                () -> backend.events.add("port-check")
+        );
+        execution.await();
+
+        assertEquals(Arrays.asList("validate", "recover", "port-check", "start"),
+                backend.events);
+    }
+
+    @Test
     public void destroyingAnInvocationKeepsAdmissionUntilExecutionExit() throws Exception {
         RecordingBackend backend = new RecordingBackend();
         DelayedTerminationExecution execution = new DelayedTerminationExecution();
@@ -487,10 +521,10 @@ public class RuntimeSeamTest {
             }
 
             @Override
-            public ExecutionIdentity inspect(int pid) {
+            public InspectionResult inspect(int pid) {
                 return liveIdentity[0] != null && liveIdentity[0].pid() == pid
-                        ? liveIdentity[0]
-                        : null;
+                        ? InspectionResult.live(liveIdentity[0])
+                        : InspectionResult.processAbsent();
             }
 
             @Override
@@ -576,8 +610,10 @@ public class RuntimeSeamTest {
             }
 
             @Override
-            public ExecutionIdentity inspect(int pid) {
-                return launchedIdentity[0];
+            public InspectionResult inspect(int pid) {
+                return launchedIdentity[0] == null
+                        ? InspectionResult.processAbsent()
+                        : InspectionResult.live(launchedIdentity[0]);
             }
 
             @Override
@@ -594,7 +630,10 @@ public class RuntimeSeamTest {
                 binary.getAbsolutePath(),
                 records,
                 inspector,
-                (pid, signal) -> signalCount[0]++
+                (pid, signal) -> {
+                    signalCount[0]++;
+                    return ExecutionOwnershipManager.SignalResult.SIGNALED;
+                }
         );
         AppUidBackend backend = new AppUidBackend(
                 binary,
@@ -638,16 +677,24 @@ public class RuntimeSeamTest {
                 oneShotFailure.set(failure);
             }
         });
-        oneShot.start();
-        awaitStarted.await();
-        process.waitStarted.await();
-        assertThrows(
-                ExecutionAdmissionException.class,
-                () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
-        );
-
-        process.exit(0);
-        oneShot.join();
+        try {
+            oneShot.start();
+            assertTrue(awaitStarted.await(1, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(process.waitStarted.await(1, java.util.concurrent.TimeUnit.SECONDS));
+            assertThrows(
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
+            );
+        } finally {
+            process.exit(0);
+            awaitStarted.countDown();
+            oneShot.join(1_000);
+            if (oneShot.isAlive()) {
+                oneShot.interrupt();
+                oneShot.join(1_000);
+            }
+        }
+        assertFalse(oneShot.isAlive());
 
         assertNull(oneShotResult.get());
         assertNotNull(oneShotFailure.get());
@@ -688,8 +735,8 @@ public class RuntimeSeamTest {
             }
 
             @Override
-            public ExecutionIdentity inspect(int pid) {
-                return null;
+            public InspectionResult inspect(int pid) {
+                return InspectionResult.processAbsent();
             }
 
             @Override
@@ -714,7 +761,10 @@ public class RuntimeSeamTest {
 
     private static final class RecordingBackend implements PrivilegeBackend {
         private final ConfigStorage storage = new InMemoryConfigStorage();
+        private final List<String> events = new ArrayList<>();
         private Execution execution = new ImmediateExecution();
+        private ExecutableNotFoundException launchPrerequisiteFailure;
+        private int recoveryChecks;
         private SyncthingCommand command;
         private SyncthingEnvironment environment;
         private ConfiguredFolderReference folder;
@@ -722,11 +772,25 @@ public class RuntimeSeamTest {
         private String[] ignore;
 
         @Override
+        public void validateLaunchPrerequisites() throws ExecutableNotFoundException {
+            if (launchPrerequisiteFailure != null) throw launchPrerequisiteFailure;
+            events.add("validate");
+        }
+
+        @Override
         public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
                 throws IOException, ExecutableNotFoundException {
+            events.add("start");
             this.command = command;
             this.environment = environment;
             return execution;
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
         }
 
         @Override
@@ -894,6 +958,15 @@ public class RuntimeSeamTest {
 
         void queueExecution(PrivilegeBackend.Execution execution) {
             queuedExecutions.addLast(execution);
+        }
+
+        @Override
+        public void validateLaunchPrerequisites() {
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
         }
 
         int startCount() {

@@ -38,6 +38,13 @@ public final class ExecutionOwnershipManager {
         UNKNOWN
     }
 
+    public enum InspectionEvidence {
+        NOT_CHECKED,
+        LIVE,
+        PROCESS_ABSENT,
+        UNKNOWN
+    }
+
     public enum Signal {
         SIGINT(2),
         SIGKILL(9);
@@ -60,9 +67,16 @@ public final class ExecutionOwnershipManager {
         }
     }
 
+    /** Result of the kernel signal transport after exact ownership was verified. */
     public enum SignalResult {
         SIGNALED,
+        SIGNAL_FAILED
+    }
+
+    /** Result of an ownership-checked signal attempt, including attempts rejected before transport. */
+    public enum SignalAttempt {
         NOT_OWNED,
+        SIGNALED,
         SIGNAL_FAILED
     }
 
@@ -70,6 +84,7 @@ public final class ExecutionOwnershipManager {
         private final Classification classification;
         private final RecordEvidence recordEvidence;
         private final CandidateEvidence candidateEvidence;
+        private final InspectionEvidence inspectionEvidence;
         private final ExecutionIdentity ownedExecution;
 
         private RecoveryAssessment(
@@ -78,9 +93,21 @@ public final class ExecutionOwnershipManager {
                 CandidateEvidence candidateEvidence,
                 ExecutionIdentity ownedExecution
         ) {
+            this(classification, recordEvidence, candidateEvidence,
+                    InspectionEvidence.NOT_CHECKED, ownedExecution);
+        }
+
+        private RecoveryAssessment(
+                Classification classification,
+                RecordEvidence recordEvidence,
+                CandidateEvidence candidateEvidence,
+                InspectionEvidence inspectionEvidence,
+                ExecutionIdentity ownedExecution
+        ) {
             this.classification = classification;
             this.recordEvidence = recordEvidence;
             this.candidateEvidence = candidateEvidence;
+            this.inspectionEvidence = inspectionEvidence;
             this.ownedExecution = ownedExecution;
         }
 
@@ -94,6 +121,10 @@ public final class ExecutionOwnershipManager {
 
         public CandidateEvidence candidateEvidence() {
             return candidateEvidence;
+        }
+
+        public InspectionEvidence inspectionEvidence() {
+            return inspectionEvidence;
         }
 
         public ExecutionIdentity ownedExecution() {
@@ -148,8 +179,18 @@ public final class ExecutionOwnershipManager {
         } catch (IOException | RuntimeException e) {
             return assessment(
                     Classification.AMBIGUOUS_EXECUTION,
-                    evidence == RecordEvidence.VALID ? RecordEvidence.READ_FAILED : evidence,
+                    evidence,
                     CandidateEvidence.UNKNOWN,
+                    null
+            );
+        }
+
+        if (stored.status() == ExecutionRecordStore.ReadResult.Status.READ_FAILED) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, RecordEvidence.READ_FAILED,
+                    candidates.isEmpty()
+                            ? CandidateEvidence.NONE
+                            : CandidateEvidence.UNOWNED_CANDIDATE,
                     null
             );
         }
@@ -169,39 +210,40 @@ public final class ExecutionOwnershipManager {
         ExecutionIdentity recorded = stored.identity();
         if (!recorded.bootId().equals(currentBootId)) {
             deleteStaleRecord(recorded);
-            return candidates.isEmpty()
-                    ? assessment(
-                            Classification.BOOT_ID_MISMATCH, RecordEvidence.BOOT_ID_MISMATCH,
-                            CandidateEvidence.NONE, null
-                    )
-                    : assessment(
-                            Classification.AMBIGUOUS_EXECUTION, RecordEvidence.BOOT_ID_MISMATCH,
-                            CandidateEvidence.UNOWNED_CANDIDATE, null
-                    );
-        }
-
-        ExecutionIdentity live;
-        try {
-            live = inspector.inspect(recorded.pid());
-        } catch (IOException | RuntimeException e) {
-            return assessment(
-                    Classification.AMBIGUOUS_EXECUTION, RecordEvidence.READ_FAILED,
-                    CandidateEvidence.UNKNOWN, null
+            return classifyAfterRecordedExit(
+                    Classification.BOOT_ID_MISMATCH,
+                    RecordEvidence.BOOT_ID_MISMATCH
             );
         }
 
-        if (live == null) {
-            deleteStaleRecord(recorded);
-            return candidates.isEmpty()
-                    ? assessment(
-                            Classification.RECORDED_PROCESS_GONE, RecordEvidence.PROCESS_GONE,
-                            CandidateEvidence.NONE, null
-                    )
-                    : assessment(
-                            Classification.AMBIGUOUS_EXECUTION, RecordEvidence.PROCESS_GONE,
-                            CandidateEvidence.UNOWNED_CANDIDATE, null
-                    );
+        ExecutionInspector.InspectionResult inspection;
+        try {
+            inspection = inspector.inspect(recorded.pid());
+        } catch (IOException | RuntimeException e) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, evidence,
+                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.UNKNOWN
+            );
         }
+
+        if (inspection == null
+                || inspection.status() == ExecutionInspector.InspectionResult.Status.UNKNOWN) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, evidence,
+                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.UNKNOWN
+            );
+        }
+
+        if (inspection.status()
+                == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
+            deleteStaleRecord(recorded);
+            return classifyAfterRecordedExit(
+                    Classification.RECORDED_PROCESS_GONE,
+                    RecordEvidence.PROCESS_GONE
+            );
+        }
+
+        ExecutionIdentity live = inspection.identity();
 
         if (recorded.matches(live)) {
             boolean competingCandidate = candidates.stream()
@@ -212,12 +254,12 @@ public final class ExecutionOwnershipManager {
                             candidates.isEmpty()
                                     ? CandidateEvidence.NONE
                                     : CandidateEvidence.EXACTLY_RECORDED_PROCESS,
-                            recorded
+                            recorded, InspectionEvidence.LIVE
                     )
                     : assessment(
                             Classification.AMBIGUOUS_EXECUTION, RecordEvidence.VALID,
                             CandidateEvidence.UNOWNED_CANDIDATE,
-                            null
+                            null, InspectionEvidence.LIVE
                     );
         }
 
@@ -226,51 +268,73 @@ public final class ExecutionOwnershipManager {
                     Classification.AMBIGUOUS_EXECUTION,
                     RecordEvidence.NONMATCHING,
                     CandidateEvidence.UNOWNED_CANDIDATE,
-                    null
+                    null, InspectionEvidence.LIVE
             );
         }
 
-        boolean oldProcessGone = !recorded.sameProcess(live);
-        if (oldProcessGone) deleteStaleRecord(recorded);
+        deleteStaleRecord(recorded);
+        return classifyAfterRecordedExit(
+                Classification.NONMATCHING_RECORD,
+                RecordEvidence.NONMATCHING
+        );
+    }
 
-        return candidates.isEmpty()
+    private RecoveryAssessment classifyAfterRecordedExit(
+            Classification noCandidateClassification,
+            RecordEvidence recordEvidence
+    ) {
+        List<ExecutionIdentity> refreshed;
+        try {
+            refreshed = inspector.findBundledCandidates(expectedExecutable);
+        } catch (IOException | RuntimeException e) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, recordEvidence,
+                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.PROCESS_ABSENT
+            );
+        }
+        return refreshed.isEmpty()
                 ? assessment(
-                        Classification.NONMATCHING_RECORD, RecordEvidence.NONMATCHING,
-                        CandidateEvidence.NONE, null
+                        noCandidateClassification, recordEvidence,
+                        CandidateEvidence.NONE, null, InspectionEvidence.PROCESS_ABSENT
                 )
                 : assessment(
-                        Classification.AMBIGUOUS_EXECUTION, RecordEvidence.NONMATCHING,
-                        CandidateEvidence.UNOWNED_CANDIDATE, null
+                        Classification.AMBIGUOUS_EXECUTION, recordEvidence,
+                        CandidateEvidence.UNOWNED_CANDIDATE, null,
+                        InspectionEvidence.PROCESS_ABSENT
                 );
     }
 
     ExecutionIdentity recordLaunchedProcess(String runToken) throws IOException {
         ExecutionIdentity launched = inspector.findLaunchedProcess(expectedExecutable, runToken);
         if (launched == null
-                || !expectedExecutable.equals(launched.executablePath())
+                || !ExecutionIdentity.sameExecutableTarget(
+                        expectedExecutable, launched.executablePath()
+                )
                 || !runToken.equals(launched.runToken())) {
             throw new IOException("Could not identify the newly launched bundled process");
         }
         records.write(launched);
-        if (verify(launched) != SignalResult.SIGNALED) {
+        if (!verify(launched)) {
             throw new IOException("New process identity did not verify after recording");
         }
         return launched;
     }
 
-    SignalResult signalIfOwned(ExecutionIdentity identity, Signal signal) {
-        if (identity == null) return SignalResult.NOT_OWNED;
+    SignalAttempt signalIfOwned(ExecutionIdentity identity, Signal signal) {
+        if (identity == null) return SignalAttempt.NOT_OWNED;
         RecoveryAssessment assessment = recover();
         if (assessment.classification() != Classification.OWNED_EXECUTION
                 || !identity.matches(assessment.ownedExecution())
-                || verify(identity) != SignalResult.SIGNALED) {
-            return SignalResult.NOT_OWNED;
+                || !verify(identity)) {
+            return SignalAttempt.NOT_OWNED;
         }
         try {
-            signals.sendSignal(identity.pid(), signal.value());
-            return SignalResult.SIGNALED;
+            return signals.sendSignal(identity.pid(), signal.value())
+                    == SignalResult.SIGNALED
+                    ? SignalAttempt.SIGNALED
+                    : SignalAttempt.SIGNAL_FAILED;
         } catch (IOException | RuntimeException e) {
-            return SignalResult.SIGNAL_FAILED;
+            return SignalAttempt.SIGNAL_FAILED;
         }
     }
 
@@ -279,8 +343,17 @@ public final class ExecutionOwnershipManager {
         try {
             String bootId = inspector.currentBootId();
             if (!identity.bootId().equals(bootId)) return Observation.EXITED;
-            ExecutionIdentity live = inspector.inspect(identity.pid());
-            if (live == null) return Observation.EXITED;
+            ExecutionInspector.InspectionResult inspection = inspector.inspect(identity.pid());
+            if (inspection == null
+                    || inspection.status()
+                    == ExecutionInspector.InspectionResult.Status.UNKNOWN) {
+                return Observation.UNKNOWN;
+            }
+            if (inspection.status()
+                    == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
+                return Observation.EXITED;
+            }
+            ExecutionIdentity live = inspection.identity();
             if (!identity.sameProcess(live)) {
                 return Observation.EXITED;
             }
@@ -296,10 +369,8 @@ public final class ExecutionOwnershipManager {
         }
     }
 
-    public SignalResult verify(ExecutionIdentity identity) {
-        return observe(identity) == Observation.OWNED
-                ? SignalResult.SIGNALED
-                : SignalResult.NOT_OWNED;
+    public boolean verify(ExecutionIdentity identity) {
+        return observe(identity) == Observation.OWNED;
     }
 
     boolean clearAfterExit(ExecutionIdentity identity) throws IOException {
@@ -308,10 +379,20 @@ public final class ExecutionOwnershipManager {
         try {
             currentBootId = inspector.currentBootId();
             if (identity.bootId().equals(currentBootId)) {
-                ExecutionIdentity live = inspector.inspect(identity.pid());
-                if (identity.sameProcess(live)) {
+                ExecutionInspector.InspectionResult inspection =
+                        inspector.inspect(identity.pid());
+                if (inspection == null
+                        || inspection.status()
+                        == ExecutionInspector.InspectionResult.Status.UNKNOWN) {
                     return false;
                 }
+                if (inspection.status()
+                        == ExecutionInspector.InspectionResult.Status.LIVE
+                        && identity.sameProcess(inspection.identity())) {
+                    return false;
+                }
+            } else {
+                // A different kernel boot proves that the recorded process cannot still exist.
             }
         } catch (IOException | RuntimeException e) {
             return false;
@@ -351,6 +432,19 @@ public final class ExecutionOwnershipManager {
     ) {
         return new RecoveryAssessment(
                 classification, recordEvidence, candidateEvidence, ownedExecution
+        );
+    }
+
+    private static RecoveryAssessment assessment(
+            Classification classification,
+            RecordEvidence recordEvidence,
+            CandidateEvidence candidateEvidence,
+            ExecutionIdentity ownedExecution,
+            InspectionEvidence inspectionEvidence
+    ) {
+        return new RecoveryAssessment(
+                classification, recordEvidence, candidateEvidence,
+                inspectionEvidence, ownedExecution
         );
     }
 }

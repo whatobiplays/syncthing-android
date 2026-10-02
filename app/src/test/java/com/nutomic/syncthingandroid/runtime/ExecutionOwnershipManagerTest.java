@@ -8,7 +8,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.junit.Test;
 
@@ -53,7 +55,7 @@ public class ExecutionOwnershipManagerTest {
                 recovery.classification());
         assertSame(recorded, recovery.ownedExecution());
         assertEquals(ExecutionOwnershipManager.Observation.OWNED, manager.observe(recorded));
-        assertEquals(ExecutionOwnershipManager.SignalResult.SIGNALED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.SIGNALED,
                 manager.signalIfOwned(recorded, ExecutionOwnershipManager.Signal.SIGINT));
         assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
                 signals.sent);
@@ -82,7 +84,7 @@ public class ExecutionOwnershipManagerTest {
                 recovery.classification());
         assertSame(recorded, recovery.ownedExecution());
         assertEquals(ExecutionOwnershipManager.Observation.OWNED, manager.observe(recorded));
-        assertEquals(ExecutionOwnershipManager.SignalResult.SIGNALED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.SIGNALED,
                 manager.signalIfOwned(recorded, ExecutionOwnershipManager.Signal.SIGINT));
         assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
                 signals.sent);
@@ -113,7 +115,7 @@ public class ExecutionOwnershipManagerTest {
         ExecutionOwnershipManager manager = manager(records, inspector, signals);
 
         ExecutionOwnershipManager.RecoveryAssessment result = manager.recover();
-        ExecutionOwnershipManager.SignalResult signal = manager.signalIfOwned(
+        ExecutionOwnershipManager.SignalAttempt signal = manager.signalIfOwned(
                 IDENTITY, ExecutionOwnershipManager.Signal.SIGINT
         );
 
@@ -124,7 +126,7 @@ public class ExecutionOwnershipManagerTest {
                 result.candidateEvidence());
         assertFalse(result.mayLaunch());
         assertNull(result.ownedExecution());
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED, signal);
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED, signal);
         assertTrue(signals.sent.isEmpty());
     }
 
@@ -169,6 +171,24 @@ public class ExecutionOwnershipManagerTest {
     }
 
     @Test
+    public void unreadableRecordBlocksLaunchEvenWhenCandidateScanIsEmpty() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.readFailed = true;
+
+        ExecutionOwnershipManager.RecoveryAssessment result = manager(
+                records, new FakeInspector("boot-a"), new RecordingSignals()
+        ).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                result.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.READ_FAILED,
+                result.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.NONE,
+                result.candidateEvidence());
+        assertFalse(result.mayLaunch());
+    }
+
+    @Test
     public void corruptEvidenceWithCandidateIsAmbiguousAndCannotBeSignaled() throws Exception {
         InMemoryRecordStore records = new InMemoryRecordStore(null);
         records.corrupt = true;
@@ -183,7 +203,7 @@ public class ExecutionOwnershipManagerTest {
         assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
                 result.classification());
         assertFalse(result.mayLaunch());
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
         assertTrue(signals.sent.isEmpty());
     }
@@ -251,7 +271,7 @@ public class ExecutionOwnershipManagerTest {
                 result.candidateEvidence());
         assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
                 result.classification());
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGKILL));
         assertTrue(signals.sent.isEmpty());
     }
@@ -271,7 +291,7 @@ public class ExecutionOwnershipManagerTest {
         ExecutionOwnershipManager manager = manager(records, inspector, signals);
 
         assertEquals(ExecutionOwnershipManager.Observation.EXITED, manager.observe(IDENTITY));
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
         assertTrue(signals.sent.isEmpty());
     }
@@ -293,7 +313,7 @@ public class ExecutionOwnershipManagerTest {
         assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
                 result.classification());
         assertFalse(result.mayLaunch());
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
         assertTrue(signals.sent.isEmpty());
     }
@@ -322,6 +342,52 @@ public class ExecutionOwnershipManagerTest {
     }
 
     @Test
+    public void unknownInspectionPreservesRecordAndBlocksRecoveryAndCleanup() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.setUnknown(IDENTITY.pid());
+        ExecutionOwnershipManager manager = manager(
+                records, inspector, new RecordingSignals()
+        );
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.VALID,
+                recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.UNKNOWN,
+                recovery.inspectionEvidence());
+        assertEquals(ExecutionOwnershipManager.Observation.UNKNOWN,
+                manager.observe(IDENTITY));
+        assertFalse(manager.clearAfterExit(IDENTITY));
+        assertTrue(records.hasRecord());
+        assertFalse(recovery.mayLaunch());
+    }
+
+    @Test
+    public void confirmedRecordedExitRefreshesCandidatesBeforeClassifying() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.add(IDENTITY);
+        inspector.set(IDENTITY.pid(), null);
+        inspector.setCandidateSnapshot(0, Collections.singletonList(IDENTITY));
+        inspector.setCandidateSnapshot(1, Collections.emptyList());
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager(
+                records, inspector, new RecordingSignals()
+        ).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.RECORDED_PROCESS_GONE,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.NONE,
+                recovery.candidateEvidence());
+        assertTrue(recovery.mayLaunch());
+        assertEquals(2, inspector.candidateScanCount);
+        assertFalse(records.hasRecord());
+    }
+
+    @Test
     public void pidReuseIsRejectedAndEachSignalPerformsFreshVerification() throws Exception {
         InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
         FakeInspector inspector = new FakeInspector("boot-a");
@@ -329,13 +395,13 @@ public class ExecutionOwnershipManagerTest {
         RecordingSignals signals = new RecordingSignals();
         ExecutionOwnershipManager manager = manager(records, inspector, signals);
 
-        assertEquals(ExecutionOwnershipManager.SignalResult.SIGNALED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.SIGNALED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
         inspector.set(IDENTITY.pid(), new ExecutionIdentity(
                 IDENTITY.pid(), IDENTITY.processStartTimeTicks() + 1,
                 IDENTITY.bootId(), IDENTITY.executablePath(), IDENTITY.runToken()
         ));
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGKILL));
         assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
                 signals.sent);
@@ -383,7 +449,7 @@ public class ExecutionOwnershipManagerTest {
         assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
                 result.candidateEvidence());
         assertFalse(result.mayLaunch());
-        assertEquals(ExecutionOwnershipManager.SignalResult.NOT_OWNED,
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
                 manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
         assertTrue(signals.sent.isEmpty());
     }
@@ -391,6 +457,7 @@ public class ExecutionOwnershipManagerTest {
     private static final class InMemoryRecordStore implements ExecutionRecordStore {
         private ExecutionIdentity record;
         private boolean corrupt;
+        private boolean readFailed;
 
         private InMemoryRecordStore(ExecutionIdentity record) {
             this.record = record;
@@ -398,6 +465,7 @@ public class ExecutionOwnershipManagerTest {
 
         @Override
         public ReadResult read() {
+            if (readFailed) return ReadResult.readFailed();
             if (corrupt) return ReadResult.corrupt();
             return record == null ? ReadResult.missing() : ReadResult.valid(record);
         }
@@ -406,6 +474,7 @@ public class ExecutionOwnershipManagerTest {
         public void write(ExecutionIdentity identity) {
             record = identity;
             corrupt = false;
+            readFailed = false;
         }
 
         @Override
@@ -424,7 +493,10 @@ public class ExecutionOwnershipManagerTest {
         private final String bootId;
         private final List<ExecutionIdentity> candidates = new ArrayList<>();
         private final List<ExecutionIdentity> byPid = new ArrayList<>();
+        private final Set<Integer> unknownPids = new HashSet<>();
+        private final List<List<ExecutionIdentity>> candidateSnapshots = new ArrayList<>();
         private int inspectCount;
+        private int candidateScanCount;
 
         private FakeInspector(String bootId) {
             this.bootId = bootId;
@@ -438,6 +510,16 @@ public class ExecutionOwnershipManagerTest {
         private void set(int pid, ExecutionIdentity identity) {
             while (byPid.size() <= pid) byPid.add(null);
             byPid.set(pid, identity);
+            unknownPids.remove(pid);
+        }
+
+        private void setUnknown(int pid) {
+            unknownPids.add(pid);
+        }
+
+        private void setCandidateSnapshot(int index, List<ExecutionIdentity> snapshot) {
+            while (candidateSnapshots.size() <= index) candidateSnapshots.add(null);
+            candidateSnapshots.set(index, snapshot);
         }
 
         @Override
@@ -446,13 +528,21 @@ public class ExecutionOwnershipManagerTest {
         }
 
         @Override
-        public ExecutionIdentity inspect(int pid) {
+        public InspectionResult inspect(int pid) {
             inspectCount++;
-            return pid < byPid.size() ? byPid.get(pid) : null;
+            if (unknownPids.contains(pid)) return InspectionResult.unknown();
+            ExecutionIdentity identity = pid < byPid.size() ? byPid.get(pid) : null;
+            return identity == null
+                    ? InspectionResult.processAbsent()
+                    : InspectionResult.live(identity);
         }
 
         @Override
         public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+            int scan = candidateScanCount++;
+            if (scan < candidateSnapshots.size() && candidateSnapshots.get(scan) != null) {
+                return new ArrayList<>(candidateSnapshots.get(scan));
+            }
             return new ArrayList<>(candidates);
         }
 
@@ -470,8 +560,9 @@ public class ExecutionOwnershipManagerTest {
         private final List<ExecutionOwnershipManager.Signal> sent = new ArrayList<>();
 
         @Override
-        public void sendSignal(int pid, int signal) {
+        public ExecutionOwnershipManager.SignalResult sendSignal(int pid, int signal) {
             sent.add(ExecutionOwnershipManager.Signal.fromValue(signal));
+            return ExecutionOwnershipManager.SignalResult.SIGNALED;
         }
     }
 }
