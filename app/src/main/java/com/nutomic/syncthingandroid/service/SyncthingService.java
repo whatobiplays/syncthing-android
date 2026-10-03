@@ -20,6 +20,7 @@ import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
+import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
@@ -260,6 +261,7 @@ public class SyncthingService extends Service {
     private ActionRestartContinuation mActionRestartContinuation;
     @Nullable private FileMutationBarrier mFileMutationBarrier;
     @Nullable private CertificateVerificationStopHandler mCertificateVerificationStopHandler;
+    @Nullable private LifecycleLaunchPermit mStartupLaunchPermit;
     private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
     private final PostMutationStartupGate mPostMutationStartupGate =
             new PostMutationStartupGate();
@@ -277,6 +279,7 @@ public class SyncthingService extends Service {
 
     private interface CertificateVerificationStopHandler {
         void onExplicitStop(boolean crashedNativeStop);
+        void onServiceDestroy();
     }
 
     /**
@@ -369,6 +372,8 @@ public class SyncthingService extends Service {
         } else if (ACTION_STOP.equals(intent.getAction())) {
             boolean crashedNativeStop =
                     intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false);
+            revokeStartupLaunchPermit();
+            mDatabaseResetOwnership.suppressAutomaticStartup();
             boolean restartContinuationCancelled = false;
             if (mActionRestartContinuation != null) {
                 restartContinuationCancelled = mActionRestartContinuation.cancel();
@@ -535,6 +540,7 @@ public class SyncthingService extends Service {
                 }
             } else {
                 mShutdownStartIntent.onRunConditionChanged(false, false);
+                revokeStartupLaunchPermit();
                 // Stop syncthing.
                 if (mCurrentState == State.DISABLED) {
                     return;
@@ -698,12 +704,15 @@ public class SyncthingService extends Service {
         }, this::onStartupDeadlineExceeded);
 
         RestApi recoveryApi = mRecoveryRestApi;
+        LifecycleLaunchPermit startupPermit = new LifecycleLaunchPermit();
+        mStartupLaunchPermit = startupPermit;
         DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
                 identity -> stopOwnedExecution(identity, recoveryApi);
         DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck = () -> {
             if (Util.isTcpPortListening(webGuiTcpPort)) {
                 throw new SyncthingRunnable.GuiPortUnavailableException();
             }
+            startupPermit.commitLaunch();
         };
         mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(
                 this,
@@ -788,6 +797,7 @@ public class SyncthingService extends Service {
     }
 
     private void onLifecycleOutcome(SyncthingRunnable.LifecycleOutcome outcome) {
+        mStartupLaunchPermit = null;
         switch (outcome.type()) {
             case EXECUTION_STARTED:
                 mOwnedExecution = outcome.identity();
@@ -841,6 +851,25 @@ public class SyncthingService extends Service {
                 synchronized (mStateLock) {
                     if (mCurrentState == State.STARTING) onServiceStateChange(State.DISABLED);
                 }
+                clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+                break;
+            case LAUNCH_CANCELLED:
+                mLastExecutionExitProven = true;
+                mShutdownExitProven = true;
+                cancelStartupRequests();
+                if (mStartupReadiness != null) {
+                    mStartupReadiness.cancel();
+                    mStartupReadiness = null;
+                }
+                mRecoveryRestApi = null;
+                if (!mShutdownInProgress && mCurrentState == State.STARTING) {
+                    synchronized (mStateLock) {
+                        onServiceStateChange(
+                                SyncthingLaunchFailurePolicy.cancelledStartupState(mCurrentState)
+                        );
+                    }
+                }
+                if (mShutdownInProgress) checkShutdownRecovery();
                 clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
                 break;
             case WORKER_FINISHED:
@@ -1133,15 +1162,33 @@ public class SyncthingService extends Service {
      * or terminate the invocation that currently owns runtime admission.
      */
     private void requestResetDatabase(@Nullable Runnable afterReset) {
-        requestResetDatabase(afterReset, null);
+        requestResetDatabase(
+                afterReset,
+                null,
+                DatabaseResetOwnership.ContinuationPolicy.AUTOMATIC_STARTUP
+        );
     }
 
     private void requestResetDatabase(
             @Nullable Runnable afterReset,
             @Nullable Runnable onFailure
     ) {
+        requestResetDatabase(
+                afterReset,
+                onFailure,
+                DatabaseResetOwnership.ContinuationPolicy.REQUIRED_OPERATION
+        );
+    }
+
+    private void requestResetDatabase(
+            @Nullable Runnable afterReset,
+            @Nullable Runnable onFailure,
+            DatabaseResetOwnership.ContinuationPolicy continuationPolicy
+    ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            if (!mHandler.post(() -> requestResetDatabase(afterReset, onFailure))) {
+            if (!mHandler.post(() -> requestResetDatabase(
+                    afterReset, onFailure, continuationPolicy
+            ))) {
                 Log.e(TAG, "Could not schedule database reset ownership on the service thread");
                 dispatchResetFailure(onFailure);
             }
@@ -1150,7 +1197,7 @@ public class SyncthingService extends Service {
         if (mDestroying) return;
 
         DatabaseResetOwnership.Operation operation =
-                mDatabaseResetOwnership.reserve(afterReset, onFailure);
+                mDatabaseResetOwnership.reserve(afterReset, onFailure, continuationPolicy);
         if (operation == null) {
             Log.w(TAG, "Database reset rejected because another reset owns lifecycle admission");
             dispatchResetFailure(onFailure);
@@ -1226,14 +1273,11 @@ public class SyncthingService extends Service {
         if (mDestroying) return;
 
         if (outcome.succeeded()) {
-            Runnable afterReset = operation.afterReset();
-            if (afterReset != null) {
-                try {
-                    afterReset.run();
-                } catch (RuntimeException e) {
-                    Log.e(TAG, "Database reset completion failed", e);
-                    runResetFailureContinuation(operation);
-                }
+            try {
+                operation.runAfterReset();
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Database reset completion failed", e);
+                runResetFailureContinuation(operation);
             }
             return;
         }
@@ -1284,6 +1328,10 @@ public class SyncthingService extends Service {
     public void onDestroy() {
         Log.d(TAG, "onDestroy");
         mDestroying = true;
+        revokeStartupLaunchPermit();
+        CertificateVerificationStopHandler certificateVerification =
+                mCertificateVerificationStopHandler;
+        if (certificateVerification != null) certificateVerification.onServiceDestroy();
         mPostMutationStartupGate.cancel(mShutdownStartIntent);
         failFileMutationBarrier();
         if (mRunConditionMonitor != null) {
@@ -1406,6 +1454,7 @@ public class SyncthingService extends Service {
             ));
             return;
         }
+        revokeStartupLaunchPermit();
         if (mCurrentState == State.STARTING && !duringStartup) {
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
@@ -1460,6 +1509,11 @@ public class SyncthingService extends Service {
             mShutdownExitProven = true;
             checkShutdownRecovery();
         }
+    }
+
+    /** Revokes a startup worker before a stop request can defer behind its current state. */
+    private void revokeStartupLaunchPermit() {
+        if (mStartupLaunchPermit != null) mStartupLaunchPermit.revoke();
     }
 
     private void onShutdownOutcome(
@@ -2231,6 +2285,8 @@ public class SyncthingService extends Service {
         final File certFile = Constants.getHttpsCertFile(this);
         final File keyFile = Constants.getHttpsKeyFile(this);
         StoppedFileMutation replaceFiles = (releaseOwnership, automaticStartupAllowed) -> {
+            final boolean certExistedBeforeChange = certFile.exists();
+            final boolean keyExistedBeforeChange = keyFile.exists();
             final File certBak = backupFile(certFile);
             final File keyBak = backupFile(keyFile);
 
@@ -2252,7 +2308,8 @@ public class SyncthingService extends Service {
 
             if (releaseOwnership != null) releaseOwnership.run();
             applyCertChangeWithVerify(
-                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed
+                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
+                    certExistedBeforeChange, keyExistedBeforeChange
             );
         };
 
@@ -2290,6 +2347,8 @@ public class SyncthingService extends Service {
         final File keyFile = Constants.getHttpsKeyFile(this);
 
         StoppedFileMutation resetFiles = (releaseOwnership, automaticStartupAllowed) -> {
+            final boolean certExistedBeforeChange = certFile.exists();
+            final boolean keyExistedBeforeChange = keyFile.exists();
             final File certBak = backupFile(certFile);
             final File keyBak = backupFile(keyFile);
             // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
@@ -2297,7 +2356,8 @@ public class SyncthingService extends Service {
             deleteQuietly(keyFile);
             if (releaseOwnership != null) releaseOwnership.run();
             applyCertChangeWithVerify(
-                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed
+                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
+                    certExistedBeforeChange, keyExistedBeforeChange
             );
         };
 
@@ -2336,9 +2396,14 @@ public class SyncthingService extends Service {
     private void applyCertChangeWithVerify(File certFile, File keyFile,
                                            @Nullable File certBak, @Nullable File keyBak,
                                            OnHttpsCertReplaceResultListener listener,
-                                           boolean automaticStartupAllowed) {
+                                           boolean automaticStartupAllowed,
+                                           boolean certExistedBeforeChange,
+                                           boolean keyExistedBeforeChange) {
         if (automaticStartupAllowed && mLastDeterminedShouldRun) {
-            verifyRestartAndRollback(certFile, keyFile, certBak, keyBak, listener);
+            verifyRestartAndRollback(
+                    certFile, keyFile, certBak, keyBak, listener,
+                    certExistedBeforeChange, keyExistedBeforeChange
+            );
         } else {
             // Not currently meant to run; the new files will take effect on next start.
             deleteQuietly(certBak);
@@ -2356,7 +2421,9 @@ public class SyncthingService extends Service {
      */
     private void verifyRestartAndRollback(File certFile, File keyFile,
                                           @Nullable File certBak, @Nullable File keyBak,
-                                          OnHttpsCertReplaceResultListener listener) {
+                                          OnHttpsCertReplaceResultListener listener,
+                                          boolean certExistedBeforeChange,
+                                          boolean keyExistedBeforeChange) {
         final CertificateVerificationState verification = new CertificateVerificationState();
         verification.beginVerification();
         final OnServiceStateChangeListener[] verifyListener = new OnServiceStateChangeListener[1];
@@ -2438,18 +2505,55 @@ public class SyncthingService extends Service {
             );
         };
 
-        stopHandler[0] = (crashedNativeStop) -> {
-            boolean verificationAlreadyActive = mCurrentState == State.ACTIVE;
-            boolean preserveFailureResolution = crashedNativeStop
-                    || mCurrentState == State.ERROR
-                    || (verification.sawStarting() && mCurrentState == State.DISABLED);
-            CertificateVerificationState.Outcome outcome = verification.onExplicitStop(
-                    verificationAlreadyActive, preserveFailureResolution
-            );
-            scheduleCertificateVerificationResolution(
-                    outcome, verifyListener[0], watchdog[0], finishSuccess,
-                    finishPendingStart, finishFailure
-            );
+        stopHandler[0] = new CertificateVerificationStopHandler() {
+            @Override
+            public void onExplicitStop(boolean crashedNativeStop) {
+                boolean verificationAlreadyActive = mCurrentState == State.ACTIVE;
+                boolean preserveFailureResolution = crashedNativeStop
+                        || mCurrentState == State.ERROR
+                        || (verification.sawStarting() && mCurrentState == State.DISABLED);
+                CertificateVerificationState.Outcome outcome = verification.onExplicitStop(
+                        verificationAlreadyActive, preserveFailureResolution
+                );
+                scheduleCertificateVerificationResolution(
+                        outcome, verifyListener[0], watchdog[0], finishSuccess,
+                        finishPendingStart, finishFailure
+                );
+            }
+
+            @Override
+            public void onServiceDestroy() {
+                try {
+                    mHandler.removeCallbacks(watchdog[0]);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not cancel certificate verification watchdog", e);
+                }
+                try {
+                    unregisterOnServiceStateChangeListener(verifyListener[0]);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not remove certificate verification listener", e);
+                }
+                try {
+                    verification.resolveForDestruction(
+                            () -> {
+                                restoreOriginalFileOrRemoveNew(
+                                        certBak, certFile, certExistedBeforeChange
+                                );
+                                restoreOriginalFileOrRemoveNew(
+                                        keyBak, keyFile, keyExistedBeforeChange
+                                );
+                            },
+                            () -> listener.onResult(
+                                    HttpsCertReplaceResult.FAILED,
+                                    "Service was destroyed before certificate verification completed."
+                            )
+                    );
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not resolve certificate verification during destruction", e);
+                } finally {
+                    clearStopHandler.run();
+                }
+            }
         };
         mCertificateVerificationStopHandler = stopHandler[0];
 
@@ -2501,6 +2605,19 @@ public class SyncthingService extends Service {
         deleteQuietly(target);
         if (!bak.renameTo(target)) {
             Log.w(TAG, "restoreFile: Failed to restore " + target.getName());
+        }
+    }
+
+    /** Restores a prior file when backed up, or removes a new file that had no prior version. */
+    private void restoreOriginalFileOrRemoveNew(
+            @Nullable File backup,
+            File target,
+            boolean existedBeforeChange
+    ) {
+        if (backup != null && backup.exists()) {
+            restoreFile(backup, target);
+        } else if (!existedBeforeChange) {
+            deleteQuietly(target);
         }
     }
 

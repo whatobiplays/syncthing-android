@@ -19,6 +19,117 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class CertificateVerificationStateTest {
     @Test
+    public void destructionWhileStartingRollsBackAndIgnoresLateCallbacks() throws IOException {
+        try (CertificateFiles files = new CertificateFiles()) {
+            CertificateVerificationState state = new CertificateVerificationState();
+            state.beginVerification();
+            state.onStarting();
+            AtomicInteger rollbacks = new AtomicInteger();
+            AtomicInteger serveLaunches = new AtomicInteger();
+            AtomicInteger listenerCalls = new AtomicInteger();
+            AtomicReference<HttpsCertReplaceResult> listenerResult = new AtomicReference<>();
+
+            assertTrue(state.resolveForDestruction(
+                    () -> {
+                        files.restoreOriginalState();
+                        rollbacks.incrementAndGet();
+                    },
+                    () -> {
+                        listenerResult.set(HttpsCertReplaceResult.FAILED);
+                        listenerCalls.incrementAndGet();
+                    }
+            ));
+
+            assertEquals("old certificate", files.readCertificate());
+            assertEquals("old key", files.readKey());
+            assertFalse(Files.exists(files.certBackup));
+            assertFalse(Files.exists(files.keyBackup));
+            assertEquals(1, rollbacks.get());
+            assertEquals(0, serveLaunches.get());
+            assertEquals(HttpsCertReplaceResult.FAILED, listenerResult.get());
+            assertEquals(1, listenerCalls.get());
+            assertFalse(state.isWorkflowActive());
+
+            assertEquals(CertificateVerificationState.Outcome.IGNORED,
+                    state.onVerificationResult(true));
+            assertEquals(CertificateVerificationState.Outcome.IGNORED,
+                    state.onVerificationResult(false));
+            assertFalse(state.resolveForDestruction(
+                    rollbacks::incrementAndGet, listenerCalls::incrementAndGet
+            ));
+            assertEquals(1, rollbacks.get());
+            assertEquals(1, listenerCalls.get());
+            assertEquals(0, serveLaunches.get());
+        }
+    }
+
+    @Test
+    public void destructionDuringFailureRecoveryRollsBackOnlyOnce() throws IOException {
+        try (CertificateFiles files = new CertificateFiles()) {
+            CertificateVerificationState state = new CertificateVerificationState();
+            state.beginVerification();
+            state.onStarting();
+            assertEquals(CertificateVerificationState.Outcome.FAILURE,
+                    state.onVerificationResult(false));
+
+            AtomicInteger rollbacks = new AtomicInteger();
+            AtomicInteger serveLaunches = new AtomicInteger();
+            AtomicInteger listenerCalls = new AtomicInteger();
+            AtomicReference<HttpsCertReplaceResult> listenerResult = new AtomicReference<>();
+            Runnable lateRecovery = state.completeFailureRecovery(
+                    () -> {
+                        files.restoreOriginalState();
+                        rollbacks.incrementAndGet();
+                    },
+                    () -> true,
+                    serveLaunches::incrementAndGet,
+                    () -> { },
+                    () -> listenerCalls.incrementAndGet()
+            );
+
+            assertTrue(state.resolveForDestruction(
+                    () -> {
+                        files.restoreOriginalState();
+                        rollbacks.incrementAndGet();
+                    },
+                    () -> {
+                        listenerResult.set(HttpsCertReplaceResult.FAILED);
+                        listenerCalls.incrementAndGet();
+                    }
+            ));
+            lateRecovery.run();
+
+            assertEquals("old certificate", files.readCertificate());
+            assertEquals("old key", files.readKey());
+            assertEquals(1, rollbacks.get());
+            assertEquals(0, serveLaunches.get());
+            assertEquals(HttpsCertReplaceResult.FAILED, listenerResult.get());
+            assertEquals(1, listenerCalls.get());
+            assertFalse(state.isWorkflowActive());
+        }
+    }
+
+    @Test
+    public void destructionRemovesReplacementFilesWhenNoPreviousCertificateExisted()
+            throws IOException {
+        try (CertificateFiles files = new CertificateFiles(false)) {
+            CertificateVerificationState state = new CertificateVerificationState();
+            state.beginVerification();
+            state.onStarting();
+            AtomicInteger listenerCalls = new AtomicInteger();
+
+            assertTrue(state.resolveForDestruction(
+                    files::restoreOriginalState,
+                    listenerCalls::incrementAndGet
+            ));
+
+            assertFalse(Files.exists(files.cert));
+            assertFalse(Files.exists(files.key));
+            assertEquals(1, listenerCalls.get());
+        }
+    }
+
+    @Test
     public void successDispatchCallsOnlySuccessHandler() {
         AtomicInteger success = new AtomicInteger();
         AtomicInteger pending = new AtomicInteger();
@@ -233,15 +344,21 @@ public class CertificateVerificationStateTest {
         private final Path keyBackup;
 
         private CertificateFiles() throws IOException {
+            this(true);
+        }
+
+        private CertificateFiles(boolean hadPreviousFiles) throws IOException {
             directory = Files.createTempDirectory("certificate-verification-");
             cert = directory.resolve("https-cert.pem");
             key = directory.resolve("https-key.pem");
             certBackup = directory.resolve("https-cert.pem.bak");
             keyBackup = directory.resolve("https-key.pem.bak");
+            if (hadPreviousFiles) {
+                write(certBackup, "old certificate");
+                write(keyBackup, "old key");
+            }
             write(cert, "new certificate");
             write(key, "new key");
-            write(certBackup, "old certificate");
-            write(keyBackup, "old key");
         }
 
         private void deleteBackups() {
@@ -252,6 +369,20 @@ public class CertificateVerificationStateTest {
         private void restorePreviousCertificate() {
             move(certBackup, cert);
             move(keyBackup, key);
+        }
+
+        private void restoreOriginalState() {
+            if (Files.exists(certBackup)) {
+                move(certBackup, cert);
+            } else {
+                delete(cert);
+            }
+            if (Files.exists(keyBackup)) {
+                move(keyBackup, key);
+            } else {
+                delete(key);
+            }
+            deleteBackups();
         }
 
         private String readCertificate() {

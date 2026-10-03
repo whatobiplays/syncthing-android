@@ -91,15 +91,16 @@ public class ConfigXml {
     }
 
     /**
-     * Runs a one-shot bundled Syncthing command and maps admission or missing ownership evidence to
-     * the configuration operation's existing failure type.
+     * Runs a one-shot bundled Syncthing command and maps admission or recovery failures to the
+     * configuration operation's existing failure type.
      */
     static String runOneShot(OneShotCommand command) throws ExecutableNotFoundException {
         try {
             return command.run();
         } catch (ExecutionAdmissionException
                  | ExecutionIdentityUnavailableException
-                 | com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException e) {
+                 | com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException
+                 | com.nutomic.syncthingandroid.runtime.RecoveryShutdownRequestPendingException e) {
             throw new OpenConfigException(e);
         }
     }

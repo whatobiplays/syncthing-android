@@ -9,6 +9,7 @@ import com.nutomic.syncthingandroid.runtime.ExecutionIdentityUnavailableExceptio
 import com.nutomic.syncthingandroid.runtime.RecoveryAssessmentFixture;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
+import com.nutomic.syncthingandroid.runtime.RecoveryShutdownRequestPendingException;
 
 import org.junit.Test;
 
@@ -59,6 +60,21 @@ public class ConfigXmlOneShotTest {
         );
 
         assertSame(recoveryFailure, thrown.getCause());
+    }
+
+    @Test
+    public void pendingRecoveryShutdownMapsToOpenConfigFailure() {
+        RecoveryShutdownRequestPendingException pendingShutdown =
+                new RecoveryShutdownRequestPendingException();
+
+        ConfigXml.OpenConfigException thrown = assertThrows(
+                ConfigXml.OpenConfigException.class,
+                () -> ConfigXml.runOneShot(() -> {
+                    throw pendingShutdown;
+                })
+        );
+
+        assertSame(pendingShutdown, thrown.getCause());
     }
 
     @Test

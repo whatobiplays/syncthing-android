@@ -22,6 +22,7 @@ import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
+import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
@@ -77,6 +78,7 @@ public class SyncthingRunnable implements Runnable {
             EXECUTION_EXITED,
             RECOVERY_BLOCKED,
             GUI_PORT_UNAVAILABLE,
+            LAUNCH_CANCELLED,
             WORKER_FINISHED
         }
 
@@ -134,6 +136,12 @@ public class SyncthingRunnable implements Runnable {
             );
         }
 
+        static LifecycleOutcome launchCancelled() {
+            return new LifecycleOutcome(
+                    Type.LAUNCH_CANCELLED, null, -1, false, false, null
+            );
+        }
+
         static LifecycleOutcome workerFinished(
                 ExecutionIdentity identity,
                 int exitCode,
@@ -171,7 +179,8 @@ public class SyncthingRunnable implements Runnable {
         }
 
         boolean provesNoExecutionExit() {
-            return type == Type.WORKER_FINISHED && !executionCreated;
+            return (type == Type.WORKER_FINISHED || type == Type.LAUNCH_CANCELLED)
+                    && !executionCreated;
         }
 
         ExecutionOwnershipManager.RecoveryAssessment recoveryAssessment() {
@@ -305,6 +314,7 @@ public class SyncthingRunnable implements Runnable {
         SyncthingExecution execution = null;
         boolean executionExitObserved = false;
         boolean aborted = false;
+        boolean launchCancelled = false;
         try {
             // Android 11 blocks local discovery if we did not acquire MulticastLock.
             WifiManager wifi = (WifiManager) mContext.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -401,6 +411,9 @@ public class SyncthingRunnable implements Runnable {
             if (!mWaitForAdmission) throw e;
             publishLifecycleOutcome(LifecycleOutcome.recoveryBlocked(e.assessment()));
             return capturedStdOut;
+        } catch (LifecycleLaunchPermit.CancelledException e) {
+            if (!mWaitForAdmission) throw e;
+            launchCancelled = true;
         } catch (IOException | InterruptedException e) {
             aborted = true;
             Log.e(TAG, "Failed to execute syncthing binary or read output", e);
@@ -440,9 +453,9 @@ public class SyncthingRunnable implements Runnable {
                 }
             }
             if (mWaitForAdmission && execution == null) {
-                publishLifecycleOutcome(
-                        LifecycleOutcome.workerFinished(null, exitCode, false, false)
-                );
+                publishLifecycleOutcome(launchCancelled
+                        ? LifecycleOutcome.launchCancelled()
+                        : LifecycleOutcome.workerFinished(null, exitCode, false, false));
             }
         }
 

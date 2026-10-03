@@ -268,6 +268,188 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void revokedStartupPermitAfterExactOwnerRecoveryPreventsReplacementLaunch()
+            throws Exception {
+        assertStartupCancelledDuringExactRecovery("Run Conditions false");
+        assertStartupCancelledDuringExactRecovery("explicit STOP");
+        assertStartupCancelledDuringExactRecovery("service destruction");
+    }
+
+    @Test
+    public void cancellationWinningAtFinalLaunchBoundaryPreventsBackendStart() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ownedExecution());
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+
+        assertThrows(
+                LifecycleLaunchPermit.CancelledException.class,
+                () -> runtime.startServiceLifecycle(
+                        SyncthingCommand.SERVE,
+                        normalModeEnvironment(),
+                        identity -> {
+                            assertEquals(RecoveryAssessmentFixture.ownedIdentity(), identity);
+                            backend.events.add("old-owner-exit-proven");
+                            return true;
+                        },
+                        () -> {
+                            backend.events.add("cancel-before-launch-commit");
+                            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+                            permit.commitLaunch();
+                        }
+                )
+        );
+
+        assertEquals(0, backend.startCount);
+        assertEquals(Arrays.asList(
+                "validate",
+                "recover",
+                "old-owner-exit-proven",
+                "recover",
+                "cancel-before-launch-commit"
+        ), backend.events);
+    }
+
+    @Test
+    public void launchCommitWinningMakesLaterStopTooLateToPreventExactOwnedStart()
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        ExecutionIdentity launchedIdentity = RecoveryAssessmentFixture.ownedIdentity();
+        backend.execution = new ImmediateExecution(launchedIdentity);
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch launchCommitted = new CountDownLatch(1);
+        CountDownLatch allowBackendStart = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<SyncthingExecution> launch = worker.submit(() ->
+                    runtime.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            null,
+                            () -> {
+                                permit.commitLaunch();
+                                launchCommitted.countDown();
+                                try {
+                                    allowBackendStart.await();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new AssertionError(e);
+                                }
+                            }
+                    )
+            );
+
+            assertTrue("Launch did not reach its commit boundary",
+                    launchCommitted.await(1, TimeUnit.SECONDS));
+            assertEquals("STOP must observe that launch already committed",
+                    LifecycleLaunchPermit.State.LAUNCH_COMMITTED, permit.revoke());
+            allowBackendStart.countDown();
+
+            SyncthingExecution execution = launch.get(5, TimeUnit.SECONDS);
+            assertEquals(1, backend.startCount);
+            assertSame("The started execution must retain identity for exact shutdown",
+                    launchedIdentity, execution.identity());
+
+            List<ExecutionOwnershipManager.Signal> signals = new ArrayList<>();
+            int[] waitCalls = {0};
+            OwnedExecutionShutdown.Outcome shutdown = OwnedExecutionShutdown.stop(
+                    execution.identity(),
+                    () -> null,
+                    new OwnedExecutionShutdown.ExecutionControl() {
+                        @Override
+                        public ExecutionOwnershipManager.Observation observe(
+                                ExecutionIdentity identity
+                        ) {
+                            assertSame(launchedIdentity, identity);
+                            return ExecutionOwnershipManager.Observation.OWNED;
+                        }
+
+                        @Override
+                        public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                                ExecutionIdentity identity,
+                                ExecutionOwnershipManager.Signal signal
+                        ) {
+                            assertSame(launchedIdentity, identity);
+                            signals.add(signal);
+                            return ExecutionOwnershipManager.SignalAttempt.SIGNALED;
+                        }
+                    },
+                    (identity, timeoutMillis, control) -> {
+                        assertSame(launchedIdentity, identity);
+                        if (waitCalls[0]++ == 0) {
+                            assertEquals(OwnedExecutionShutdown.REST_SHUTDOWN_WAIT_MS,
+                                    timeoutMillis);
+                            return false;
+                        }
+                        assertEquals(OwnedExecutionShutdown.SIGINT_WAIT_MS, timeoutMillis);
+                        return true;
+                    }
+            );
+
+            assertEquals(OwnedExecutionShutdown.Outcome.EXITED, shutdown);
+            assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
+                    signals);
+        } finally {
+            allowBackendStart.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    private static void assertStartupCancelledDuringExactRecovery(String cancellationReason)
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ownedExecution());
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch recoveryStarted = new CountDownLatch(1);
+        CountDownLatch allowRecoveryToFinish = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<String> launch = worker.submit(() -> {
+                try {
+                    runtime.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                assertEquals(RecoveryAssessmentFixture.ownedIdentity(), identity);
+                                recoveryStarted.countDown();
+                                allowRecoveryToFinish.await();
+                                backend.events.add("old-owner-exit-proven");
+                                return true;
+                            },
+                            permit::commitLaunch
+                    );
+                    return "launched";
+                } catch (LifecycleLaunchPermit.CancelledException expected) {
+                    return "cancelled";
+                }
+            });
+
+            assertTrue("Recovery did not start for " + cancellationReason,
+                    recoveryStarted.await(1, TimeUnit.SECONDS));
+            // Each service stop boundary revokes this one startup's permit while exact recovery is
+            // still in progress.
+            permit.revoke();
+            allowRecoveryToFinish.countDown();
+
+            assertEquals("cancelled", launch.get(5, TimeUnit.SECONDS));
+            assertEquals(0, backend.startCount);
+            assertTrue(backend.events.contains("old-owner-exit-proven"));
+            assertTrue(backend.events.indexOf("old-owner-exit-proven")
+                    < backend.events.lastIndexOf("recover"));
+        } finally {
+            allowRecoveryToFinish.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
     public void destroyingAnInvocationKeepsAdmissionUntilExecutionExit() throws Exception {
         RecordingBackend backend = new RecordingBackend();
         DelayedTerminationExecution execution = new DelayedTerminationExecution();
@@ -851,6 +1033,8 @@ public class RuntimeSeamTest {
     private static final class RecordingBackend implements PrivilegeBackend {
         private final ConfigStorage storage = new InMemoryConfigStorage();
         private final List<String> events = new ArrayList<>();
+        private final Deque<ExecutionOwnershipManager.RecoveryAssessment> recoveryAssessments =
+                new ConcurrentLinkedDeque<>();
         private Execution execution = new ImmediateExecution();
         private ExecutableNotFoundException launchPrerequisiteFailure;
         private int recoveryChecks;
@@ -883,7 +1067,10 @@ public class RuntimeSeamTest {
         public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
             events.add("recover");
             recoveryChecks++;
-            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+            ExecutionOwnershipManager.RecoveryAssessment assessment = recoveryAssessments.poll();
+            return assessment != null
+                    ? assessment
+                    : ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
         }
 
         @Override
@@ -933,6 +1120,16 @@ public class RuntimeSeamTest {
     }
 
     private static final class ImmediateExecution implements PrivilegeBackend.Execution {
+        private final ExecutionIdentity identity;
+
+        private ImmediateExecution() {
+            this(null);
+        }
+
+        private ImmediateExecution(ExecutionIdentity identity) {
+            this.identity = identity;
+        }
+
         @Override
         public InputStream stdout() {
             return new ByteArrayInputStream(new byte[0]);
@@ -950,6 +1147,11 @@ public class RuntimeSeamTest {
 
         @Override
         public void destroy() {
+        }
+
+        @Override
+        public ExecutionIdentity identity() {
+            return identity;
         }
     }
 

@@ -14,6 +14,68 @@ import org.junit.Test;
 
 public class DatabaseResetOwnershipTest {
     @Test
+    public void explicitStopSuppressesExternalResetStartupAndReleasesOwnership() {
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        AtomicInteger serveLaunches = new AtomicInteger();
+        AtomicInteger failureContinuations = new AtomicInteger();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(
+                serveLaunches::incrementAndGet,
+                failureContinuations::incrementAndGet,
+                DatabaseResetOwnership.ContinuationPolicy.AUTOMATIC_STARTUP
+        );
+
+        assertTrue(ownership.isReserved());
+        ownership.suppressAutomaticStartup();
+        assertTrue(ownership.complete(operation));
+        operation.runAfterReset();
+
+        assertFalse(ownership.isReserved());
+        assertEquals(0, serveLaunches.get());
+        assertEquals(0, failureContinuations.get());
+
+        DatabaseResetOwnership.Operation failedOperation = ownership.reserve(
+                serveLaunches::incrementAndGet,
+                failureContinuations::incrementAndGet,
+                DatabaseResetOwnership.ContinuationPolicy.AUTOMATIC_STARTUP
+        );
+        ownership.suppressAutomaticStartup();
+        assertTrue(ownership.complete(failedOperation));
+        failedOperation.onFailure().run();
+
+        assertEquals(0, serveLaunches.get());
+        assertEquals(1, failureContinuations.get());
+    }
+
+    @Test
+    public void stopDuringImportResetRunsRequiredCompletionButSuppressesServe() {
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        PostMutationStartupGate importGate = new PostMutationStartupGate();
+        ShutdownStartIntent startIntent = new ShutdownStartIntent();
+        startIntent.onRunConditionChanged(true, true);
+        importGate.beginOperation();
+        AtomicInteger importCompletions = new AtomicInteger();
+        AtomicInteger serveLaunches = new AtomicInteger();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(
+                () -> {
+                    importCompletions.incrementAndGet();
+                    importGate.completeOperation(startIntent, true, serveLaunches::incrementAndGet);
+                },
+                null,
+                DatabaseResetOwnership.ContinuationPolicy.REQUIRED_OPERATION
+        );
+
+        importGate.suppressAutomaticStartup(startIntent);
+        ownership.suppressAutomaticStartup();
+        assertTrue(ownership.complete(operation));
+        operation.runAfterReset();
+
+        assertEquals(1, importCompletions.get());
+        assertEquals(0, serveLaunches.get());
+        assertFalse(importGate.ownsStartup());
+        assertFalse(ownership.isReserved());
+    }
+
+    @Test
     public void reservationBlocksRunConditionStartUntilResetCompletes() {
         DatabaseResetOwnership ownership = new DatabaseResetOwnership();
         List<String> events = new ArrayList<>();

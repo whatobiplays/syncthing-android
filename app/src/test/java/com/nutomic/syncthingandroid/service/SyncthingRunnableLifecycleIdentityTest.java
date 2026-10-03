@@ -1,6 +1,8 @@
 package com.nutomic.syncthingandroid.service;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 
@@ -31,5 +33,15 @@ public class SyncthingRunnableLifecycleIdentityTest {
                 SyncthingRunnable.LifecycleOutcome.Type.EXECUTION_STARTED,
                 outcome.type()
         );
+    }
+
+    @Test
+    public void cancelledLifecycleLaunchReportsNoExecutionWithoutFailureOutcome() {
+        SyncthingRunnable.LifecycleOutcome outcome =
+                SyncthingRunnable.LifecycleOutcome.launchCancelled();
+
+        assertEquals(SyncthingRunnable.LifecycleOutcome.Type.LAUNCH_CANCELLED, outcome.type());
+        assertFalse(outcome.executionCreated());
+        assertTrue(outcome.provesNoExecutionExit());
     }
 }

@@ -6,6 +6,10 @@ import java.util.List;
 
 /** Builds recovery evidence through the same ownership manager used by runtime launches. */
 public final class RecoveryAssessmentFixture {
+    private static final ExecutionIdentity OWNED_IDENTITY = new ExecutionIdentity(
+            42, 9002, "boot-a", "/data/app/lib/libsyncthingnative.so", "owned-run"
+    );
+
     private RecoveryAssessmentFixture() { }
 
     public static ExecutionOwnershipManager.RecoveryAssessment ambiguousMissingRecord() {
@@ -52,5 +56,57 @@ public final class RecoveryAssessmentFixture {
             throw new AssertionError("Candidate discovery must not authorize signals");
         };
         return new ExecutionOwnershipManager(executable, records, inspector, signals).recover();
+    }
+
+    public static ExecutionIdentity ownedIdentity() {
+        return OWNED_IDENTITY;
+    }
+
+    public static ExecutionOwnershipManager.RecoveryAssessment ownedExecution() {
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return ReadResult.valid(OWNED_IDENTITY);
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) {
+                throw new AssertionError("Recovery must not write an existing record");
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                throw new AssertionError("A live execution record must not be deleted");
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return OWNED_IDENTITY.bootId();
+            }
+
+            @Override
+            public InspectionResult inspect(int pid) {
+                return pid == OWNED_IDENTITY.pid()
+                        ? InspectionResult.live(OWNED_IDENTITY)
+                        : InspectionResult.processAbsent();
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return Collections.singletonList(OWNED_IDENTITY);
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                throw new AssertionError("Recovery must not perform launch identity discovery");
+            }
+        };
+        ProcessSignalTransport signals = (identity, signal) -> {
+            throw new AssertionError("The runtime recovery callback owns shutdown");
+        };
+        return new ExecutionOwnershipManager(
+                OWNED_IDENTITY.executablePath(), records, inspector, signals
+        ).recover();
     }
 }

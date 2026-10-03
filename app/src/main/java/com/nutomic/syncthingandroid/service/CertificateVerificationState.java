@@ -128,6 +128,28 @@ final class CertificateVerificationState {
     }
 
     /**
+     * Resolves an unfinished verification during service destruction.
+     *
+     * <p>Destruction restores the pre-change files instead of accepting an unverified replacement
+     * or attempting an automatic restart. The phase closes before callbacks run, so queued state or
+     * watchdog callbacks cannot resolve or relaunch the workflow a second time.</p>
+     *
+     * @return true when this call performed the terminal rollback and failure notification
+     */
+    boolean resolveForDestruction(Runnable rollback, Runnable notifyFailure) {
+        if (!isWorkflowActive()) return false;
+        mPhase = Phase.FINISHED;
+        mPendingStartResolution = false;
+        mAutomaticContinuationAllowed = false;
+        try {
+            rollback.run();
+        } finally {
+            notifyFailure.run();
+        }
+        return true;
+    }
+
+    /**
      * Creates the post-shutdown recovery action for a genuine verification failure.
      *
      * <p>Restart permission and Run Conditions are checked when the action executes, after the

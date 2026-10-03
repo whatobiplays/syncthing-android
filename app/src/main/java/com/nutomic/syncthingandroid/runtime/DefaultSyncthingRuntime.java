@@ -138,9 +138,9 @@ public final class DefaultSyncthingRuntime
             }
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
-            if (launchCheck != null) launchCheck.check();
             try (OwnedExecutionShutdown.LaunchPermit ignored =
                          OwnedExecutionShutdown.acquireLaunchPermit(serviceLifecycle)) {
+                if (launchCheck != null) launchCheck.check();
                 PrivilegeBackend.Execution execution = backend.start(command, environment);
                 return new SyncthingExecution(execution, admission::release);
             }
