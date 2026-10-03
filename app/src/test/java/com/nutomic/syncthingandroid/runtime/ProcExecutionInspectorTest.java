@@ -67,7 +67,7 @@ public class ProcExecutionInspectorTest {
                 pid -> "new-token"
         );
         assertEquals(Arrays.asList(11), identityInspections);
-        assertEquals(launched.pid(), found.pid());
+        assertTrue(launched.sameProcess(found));
         assertEquals("new-token", found.runToken());
     }
 
