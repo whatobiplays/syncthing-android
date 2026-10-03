@@ -259,9 +259,13 @@ public class SyncthingService extends Service {
     private Runnable mAfterShutdown;
     @Nullable
     private ActionRestartContinuation mActionRestartContinuation;
+    @Nullable
+    private ActionResetDeltasContinuation mActionResetDeltasContinuation;
     @Nullable private FileMutationBarrier mFileMutationBarrier;
     @Nullable private CertificateVerificationStopHandler mCertificateVerificationStopHandler;
     @Nullable private LifecycleLaunchPermit mStartupLaunchPermit;
+    private final StartingShutdownDeferral mStartingShutdownDeferral =
+            new StartingShutdownDeferral();
     private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
     private final PostMutationStartupGate mPostMutationStartupGate =
             new PostMutationStartupGate();
@@ -379,6 +383,7 @@ public class SyncthingService extends Service {
                 restartContinuationCancelled = mActionRestartContinuation.cancel();
                 mActionRestartContinuation = null;
             }
+            if (!crashedNativeStop) cancelActionResetDeltasContinuation();
             if (mCertificateVerificationStopHandler != null) {
                 mCertificateVerificationStopHandler.onExplicitStop(crashedNativeStop);
             }
@@ -430,11 +435,22 @@ public class SyncthingService extends Service {
                     () -> {
                         Log.i(TAG, "Invoking reset of delta indexes");
                         mStopAfterDeltaResetWhenNotRequired = true;
-                        Runnable resetDeltas = () -> launchStartupTask(SyncthingCommand.RESET_DELTAS);
+                        ActionResetDeltasContinuation deltaReset =
+                                new ActionResetDeltasContinuation(
+                                        () -> launchStartupTask(SyncthingCommand.RESET_DELTAS),
+                                        () -> mStopAfterDeltaResetWhenNotRequired = false
+                                );
+                        mActionResetDeltasContinuation = deltaReset;
+                        Runnable completeDeltaReset = () -> {
+                            if (mActionResetDeltasContinuation == deltaReset) {
+                                mActionResetDeltasContinuation = null;
+                            }
+                            deltaReset.complete();
+                        };
                         if (mCurrentState != State.DISABLED || mSyncthingRunnable != null) {
-                            shutdown(State.DISABLED, resetDeltas);
+                            shutdown(State.DISABLED, completeDeltaReset);
                         } else {
-                            resetDeltas.run();
+                            completeDeltaReset.run();
                         }
                     }
             );
@@ -506,7 +522,8 @@ public class SyncthingService extends Service {
 
             // React to the shouldRun condition change.
             if (newShouldRunDecision) {
-                boolean lifecycleBlocksStartup = mShutdownInProgress
+                boolean lifecycleBlocksStartup = mStartingShutdownDeferral
+                        .blocksStartup(mShutdownInProgress)
                         || mFileMutationBarrier != null
                         || mPostMutationStartupGate.ownsStartup()
                         || !mDatabaseResetOwnership.canStartLifecycle()
@@ -516,7 +533,7 @@ public class SyncthingService extends Service {
                         || mSyncthingRunnableThread != null));
                 mShutdownStartIntent.onRunConditionChanged(true, lifecycleBlocksStartup);
                 if (lifecycleBlocksStartup) {
-                    if (!mShutdownInProgress
+                    if (!mShutdownInProgress && !mStartingShutdownDeferral.isPending()
                             && mFileMutationBarrier == null
                             && !mPostMutationStartupGate.ownsStartup()
                             && mDatabaseResetOwnership.canStartLifecycle()) {
@@ -1456,6 +1473,7 @@ public class SyncthingService extends Service {
         }
         revokeStartupLaunchPermit();
         if (mCurrentState == State.STARTING && !duringStartup) {
+            mStartingShutdownDeferral.defer();
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
                 shutdown(newState, afterShutdown, false, mutationBeforeDeferredCompletion);
@@ -1482,6 +1500,7 @@ public class SyncthingService extends Service {
         mRecoveryRestApi = null;
 
         if (mShutdownInProgress) {
+            mStartingShutdownDeferral.transferToShutdown();
             mAfterShutdown = mutationBeforeDeferredCompletion
                     ? FileMutationBarrier.mutationBeforeDeferredCompletion(
                             afterShutdown, mAfterShutdown
@@ -1492,6 +1511,7 @@ public class SyncthingService extends Service {
         }
 
         mShutdownInProgress = true;
+        mStartingShutdownDeferral.transferToShutdown();
         mShutdownExitProven = mLastExecutionExitProven;
         mShutdownWorkerStarted = false;
         mShutdownRecoveryCheckStarted = false;
@@ -1514,6 +1534,15 @@ public class SyncthingService extends Service {
     /** Revokes a startup worker before a stop request can defer behind its current state. */
     private void revokeStartupLaunchPermit() {
         if (mStartupLaunchPermit != null) mStartupLaunchPermit.revoke();
+    }
+
+    private void cancelActionResetDeltasContinuation() {
+        ActionResetDeltasContinuation continuation = mActionResetDeltasContinuation;
+        if (continuation == null) return;
+        continuation.cancel();
+        if (mActionResetDeltasContinuation == continuation) {
+            mActionResetDeltasContinuation = null;
+        }
     }
 
     private void onShutdownOutcome(
