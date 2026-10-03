@@ -1,0 +1,88 @@
+app/src/test/java/com/nutomic/syncthingandroid/service/DatabaseResetOwnershipTest.java
+  s_cd5eaf9ab3e468::t_7dbdf4b08e7a53 16-19,21-22,24-33,47-77
+  s_cd5eaf9ab3e468::t_9ff17029e838a9 20,23,34-46
+app/src/main/java/com/nutomic/syncthingandroid/service/DatabaseResetOwnership.java
+  s_cd5eaf9ab3e468::t_eb9978afc78343 7-13,17-18,20-22,25,35-50,57-64,66,70-73
+  s_6e45b70b7be182::t_2cb336b738ff5f 74
+app/src/main/java/com/nutomic/syncthingandroid/service/CertificateVerificationState.java
+  s_cd5eaf9ab3e468::t_3614a0be9c4311 131-151
+  s_6e45b70b7be182::t_cb3746902087d0 130
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingRunnableLifecycleIdentityTest.java
+  s_cd5eaf9ab3e468::t_3104aecdd0e20c 4-5,37-45
+  s_6e45b70b7be182::t_7b1ccd8890e9ff 46
+app/src/test/java/com/nutomic/syncthingandroid/service/CertificateVerificationStateTest.java
+  s_cd5eaf9ab3e468::t_7dbdf4b08e7a53 21-131,347-350,356-359,374-386
+  s_6e45b70b7be182::t_94175c21421d58 387
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RecoveryAssessmentFixture.java
+  s_cd5eaf9ab3e468::t_05c1add00c1237 9-12,60-111
+app/src/main/java/com/nutomic/syncthingandroid/util/ConfigXml.java
+  s_cd5eaf9ab3e468::t_248833374d3eea 102-103
+  s_cd5eaf9ab3e468::t_8f22ccfc09c1be 94-95
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingLaunchFailurePolicyTest.java
+  s_cd5eaf9ab3e468::t_05c1add00c1237 23-32
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_cd5eaf9ab3e468::t_05c1add00c1237 271-272,404-425,427-433,438-444,446-451,1036-1037,1070-1073
+  s_cd5eaf9ab3e468::t_6148301309741e 445
+  s_cd5eaf9ab3e468::t_9ff17029e838a9 273-277,402-403,434-437
+  s_cd5eaf9ab3e468::t_2289c94af06c2e 270,278-297,299-347,350-355,396-401,426,1123-1132,1151-1155
+  s_cd5eaf9ab3e468::t_8271149499ab93 298,348-349
+  s_cd5eaf9ab3e468::t_a289c600974bf2 356-395
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_cd5eaf9ab3e468::t_248833374d3eea 143
+app/src/test/java/com/nutomic/syncthingandroid/util/ConfigXmlOneShotTest.java
+  s_cd5eaf9ab3e468::t_76d57d1d45abe3 12,65-77
+  s_09b05cf592369e::t_dc55be31a1c8f0 78-79
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LifecycleLaunchPermit.java
+  s_cd5eaf9ab3e468::t_23ef018793a62f 3,8-11,14-25,28-32
+  s_cd5eaf9ab3e468::t_248833374d3eea 1-2,4-7,12-13,26-27,33-41
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingLaunchFailurePolicy.java
+  s_cd5eaf9ab3e468::t_9ccda4b2024f69 19-28
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingRunnable.java
+  s_cd5eaf9ab3e468::t_248833374d3eea 25,81,139-144,182-183,317,414-416,456-458
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_e7f47982caf493 715
+  s_cd5eaf9ab3e468::t_a625d31b5101f0 282,1331-1334,2288-2289,2311-2312,2350-2351,2359-2360,2399-2401,2403-2406,2424-2426
+  s_cd5eaf9ab3e468::t_fe29f5131f1c42 2527,2532,2551-2552
+  s_cd5eaf9ab3e468::t_d28f3d835b705a 2528-2531,2533-2536
+  s_cd5eaf9ab3e468::t_8c1168620f5805 2508-2526,2537-2550,2553-2556,2611-2620
+  s_cd5eaf9ab3e468::t_df30ee83fab1d5 707-708,800,856-872
+  s_cd5eaf9ab3e468::t_41f3dc59777f8a 1165-1169,1175-1186,1189-1191,1200,1276-1280,1517,2622
+  s_cd5eaf9ab3e468::t_9ccda4b2024f69 23,264,375-376
+  s_cd5eaf9ab3e468::t_350a66eb41953a 543,1457,1514-1516
+  s_cd5eaf9ab3e468::t_ca65d77fdafba2 873-874
+  s_cd5eaf9ab3e468::t_3785594974bf90 1518
+  s_cd5eaf9ab3e468::t_d45b5fab683f32 2621
+  s_cd5eaf9ab3e468::t_9459061a7c0a02 2623
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0e47771ff0dd0b1632d87dc8df7ed6ad3f424658",
+  "prompts": {},
+  "sessions": {
+    "s_09b05cf592369e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f8e2-4b10-7ff1-bbb2-622c77762fbd",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_6e45b70b7be182": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e67d-0812-78b0-a9f2-1a3c3d5e671b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
