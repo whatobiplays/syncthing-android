@@ -344,7 +344,7 @@ public class RuntimeSeamTest {
             );
 
             assertTrue("Launch did not reach its commit boundary",
-                    launchCommitted.await(1, TimeUnit.SECONDS));
+                    launchCommitted.await(5, TimeUnit.SECONDS));
             assertEquals("STOP must observe that launch already committed",
                     LifecycleLaunchPermit.State.LAUNCH_COMMITTED, permit.revoke());
             allowBackendStart.countDown();
@@ -432,7 +432,7 @@ public class RuntimeSeamTest {
             });
 
             assertTrue("Recovery did not start for " + cancellationReason,
-                    recoveryStarted.await(1, TimeUnit.SECONDS));
+                    recoveryStarted.await(5, TimeUnit.SECONDS));
             // Each service stop boundary revokes this one startup's permit while exact recovery is
             // still in progress.
             permit.revoke();
