@@ -1,0 +1,21 @@
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingStopPolicyTest.java
+  s_cd5eaf9ab3e468::t_a03fd56314cb9f 103-108
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicyTest.java
+  s_cd5eaf9ab3e468::t_2dc4f50a6b3f3f 152,156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c029b971ac4d7a788ce675d91f2ea4b724e1b45",
+  "prompts": {},
+  "sessions": {
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
