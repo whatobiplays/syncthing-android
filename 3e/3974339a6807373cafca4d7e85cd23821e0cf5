@@ -1,0 +1,91 @@
+app/src/main/java/com/nutomic/syncthingandroid/service/ActionRestartContinuation.java
+  s_cd5eaf9ab3e468::t_a1f7be8a73f6a6 1-32
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingStopPolicy.java
+  s_cd5eaf9ab3e468::t_e412d036609abc 26-42
+app/src/main/java/com/nutomic/syncthingandroid/runtime/OwnedExecutionShutdown.java
+  s_cd5eaf9ab3e468::t_c20272b4571988 3-4,58-59,62,67-72,138,149,175,181-182,187-189,235,237,241-242,263,265,270-271,305,307-308,318,320-321,345,347-348,374,376-377
+  s_cd5eaf9ab3e468::t_d46e52d180ec0e 6,24,97-114,121-125,141-145,158,160,162,164,167,169-174,176-180,183,185,190,192-193,196,234,243-246,250,252,264,269,299,304,306,313,319,323,328,331,336,346,363-366,375
+  s_cd5eaf9ab3e468::t_ceb38889c8e8bf 21-23,25,64-66,80-96,115-120,126-137,139-140,146-148,159,161,184,186,191,194,197-198,247-249,251,253-254,259-262,266-268
+  s_cd5eaf9ab3e468::t_91e9e16b5032be 55
+  s_cd5eaf9ab3e468::t_f2a65cac8810ad 255-258
+  s_cd5eaf9ab3e468::t_358bd1be7b40ca 150
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_cd5eaf9ab3e468::t_2882f34abf5c8c 32,184
+  s_cd5eaf9ab3e468::t_df7d7c46c12621 149-161,163-165,171-183,185-197,199-235,862-864,875,889-891
+  s_cd5eaf9ab3e468::t_15b38550dea781 162,166-170,198
+  s_cd5eaf9ab3e468::t_2143203de91b04 148
+  s_cd5eaf9ab3e468::t_4e7f2e96b2eb73 892-893
+app/src/main/java/com/nutomic/syncthingandroid/service/RestApi.java
+  s_cd5eaf9ab3e468::t_0d3f29cfc96e92 616-617,619
+app/src/test/java/com/nutomic/syncthingandroid/service/ActionRestartContinuationTest.java
+  s_cd5eaf9ab3e468::t_665c5b3a0d2aa6 1-7,9-14,16,20-23,39-53
+  s_cd5eaf9ab3e468::t_fc1160d1da574b 15,24,26
+  s_cd5eaf9ab3e468::t_454b49e7277063 8,17,28-31,33-34,36-37
+  s_cd5eaf9ab3e468::t_ed23d80069f8c4 35
+  s_cd5eaf9ab3e468::t_1609ea376c366a 18-19,25,27,32,38
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingStopPolicyTest.java
+  s_cd5eaf9ab3e468::t_0ec4f5ca22053a 43,99-104
+app/src/test/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicyTest.java
+  s_cd5eaf9ab3e468::t_a5e93eddd4c0db 152
+  s_cd5eaf9ab3e468::t_032126823a3ca3 144-149,154,156-158,160-163,166-168,183
+  s_cd5eaf9ab3e468::t_5a48eec156d9de 151,153,155,159
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_cd5eaf9ab3e468::t_60d95f36165cce 144-146
+  s_cd5eaf9ab3e468::t_67c865acdc6087 52,94,119-120,123-127,142-143
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_5a48eec156d9de 406,424
+  s_cd5eaf9ab3e468::t_7396ec5d733cd5 259-260,355,362-367,373,375-376
+  s_cd5eaf9ab3e468::t_0d3f29cfc96e92 757,1036
+  s_cd5eaf9ab3e468::t_e412d036609abc 372,374,396
+  s_cd5eaf9ab3e468::t_ef4032e64d5779 1527
+  s_6e45b70b7be182::t_026cc5bd08eefb 368
+app/src/main/java/com/nutomic/syncthingandroid/http/PostRequest.java
+  s_cd5eaf9ab3e468::t_0d3f29cfc96e92 33
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicy.java
+  s_cd5eaf9ab3e468::t_5a48eec156d9de 62,67,71
+app/src/main/java/com/nutomic/syncthingandroid/http/RecoveryShutdownRequest.java
+  s_cd5eaf9ab3e468::t_34963afd8802dc 21,23-27,29-33,36-44,48,57,60-70,80,88-93,95-97,127,170
+  s_cd5eaf9ab3e468::t_c95f8ee65b9362 34-35,45,98-121,167
+  s_cd5eaf9ab3e468::t_9f93d2a7bc582f 76-78
+  s_cd5eaf9ab3e468::t_18b9e9b9e5487b 135-166,168-169
+  s_cd5eaf9ab3e468::t_91e9e16b5032be 73-74,81-87
+app/src/test/java/com/nutomic/syncthingandroid/runtime/OwnedExecutionShutdownTest.java
+  s_cd5eaf9ab3e468::t_3d1a6ab319282e 251-259,264-266,268-274,276,278,283-295,297-301,303-319,321-324
+  s_cd5eaf9ab3e468::t_c0f08d23841b41 131-148,150-154,579,591-596,633
+  s_cd5eaf9ab3e468::t_a5fe2e619aa3cf 260-261,267,279-280,282,296,302,320
+  s_cd5eaf9ab3e468::t_8003504e903a95 570
+  s_cd5eaf9ab3e468::t_b745169d4c30ca 262-263,275,277,281
+  s_cd5eaf9ab3e468::t_ed362424ba0fb0 243
+  s_cd5eaf9ab3e468::t_bfb4a1b17cf57d 125-127,149,578,588,609,619,630-632
+  s_cd5eaf9ab3e468::t_2882f34abf5c8c 606-608,610-612
+  s_cd5eaf9ab3e468::t_03d2c9012319a7 114,128,130,215-242,244-246
+  s_cd5eaf9ab3e468::t_f03ccc2f74c111 190
+  s_cd5eaf9ab3e468::t_e41ed0e6d95826 181-189,191-214,250
+  s_cd5eaf9ab3e468::t_1c6209c5bfd3c1 103,585-587,589-590
+  s_cd5eaf9ab3e468::t_91e9e16b5032be 155-172,176,178-180
+  s_cd5eaf9ab3e468::t_f8ccd86c97470d 597
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3e3974339a6807373cafca4d7e85cd23821e0cf5",
+  "prompts": {},
+  "sessions": {
+    "s_6e45b70b7be182": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e67d-0812-78b0-a9f2-1a3c3d5e671b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
