@@ -20,6 +20,7 @@ import com.nutomic.syncthingandroid.runtime.ConfigStorage;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.ExecutionIdentityUnavailableException;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 import com.nutomic.syncthingandroid.runtime.FolderIgnoreResult;
 import com.nutomic.syncthingandroid.service.AppPrefs;
@@ -90,13 +91,16 @@ public class ConfigXml {
     }
 
     /**
-     * Runs a one-shot bundled Syncthing command and maps admission rejection to the configuration
-     * operation's existing failure type.
+     * Runs a one-shot bundled Syncthing command and maps admission or recovery failures to the
+     * configuration operation's existing failure type.
      */
     static String runOneShot(OneShotCommand command) throws ExecutableNotFoundException {
         try {
             return command.run();
-        } catch (ExecutionAdmissionException e) {
+        } catch (ExecutionAdmissionException
+                 | ExecutionIdentityUnavailableException
+                 | com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException
+                 | com.nutomic.syncthingandroid.runtime.RecoveryShutdownRequestPendingException e) {
             throw new OpenConfigException(e);
         }
     }

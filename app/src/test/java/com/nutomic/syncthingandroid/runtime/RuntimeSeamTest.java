@@ -3,6 +3,8 @@ package com.nutomic.syncthingandroid.runtime;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -27,7 +29,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
@@ -139,6 +143,310 @@ public class RuntimeSeamTest {
         first.await();
         SyncthingExecution second = runtime.start(SyncthingCommand.DEVICE_ID, environment);
         second.await();
+    }
+
+    @Test
+    public void recoveryShutdownLeaseBlocksReplacementUntilRequestIsTerminal() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        GatedExecution oldProcess = new GatedExecution();
+        backend.execution = oldProcess;
+        backend.observation = ExecutionOwnershipManager.Observation.OWNED;
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingExecution oldExecution = runtime.start(
+                SyncthingCommand.SERVE,
+                normalModeEnvironment()
+        );
+        List<String> events = new ArrayList<>();
+        AtomicBoolean requestTerminal = new AtomicBoolean();
+        AtomicInteger terminalWaits = new AtomicInteger();
+        Runnable[] terminalListener = {null};
+        OwnedExecutionShutdown.RestShutdownRequest preparedRequest =
+                new OwnedExecutionShutdown.RestShutdownRequest() {
+                    @Override
+                    public void setTerminalListener(Runnable listener) {
+                        terminalListener[0] = listener;
+                    }
+
+                    @Override
+                    public boolean send() {
+                        assertTrue(OwnedExecutionShutdown.hasUnquiescedRestShutdownRequests());
+                        events.add("blocked-before-request-delivery");
+                        return true;
+                    }
+
+                    @Override
+                    public void cancel() {
+                        events.add("request-canceled");
+                    }
+
+                    @Override
+                    public boolean awaitTerminal(long timeoutMillis) {
+                        if (timeoutMillis == 0) return requestTerminal.get();
+                        if (terminalWaits.incrementAndGet() == 1) {
+                            assertThrows(
+                                    RecoveryShutdownRequestPendingException.class,
+                                    () -> runtime.start(
+                                            SyncthingCommand.DEVICE_ID,
+                                            normalModeEnvironment()
+                                    )
+                            );
+                            assertEquals(1, backend.startCount);
+                            events.add("replacement-rejected-before-terminal");
+                            return false;
+                        }
+                        requestTerminal.set(true);
+                        if (terminalListener[0] != null) terminalListener[0].run();
+                        events.add("request-terminal");
+                        return true;
+                    }
+                };
+
+        OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
+                new ExecutionIdentity(
+                        41, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", "run-a"
+                ),
+                () -> preparedRequest,
+                runtime,
+                (identity, timeout, ignored) -> {
+                    oldProcess.exit(0);
+                    assertEquals(0, oldExecution.await());
+                    events.add("old-admission-released");
+                    return true;
+                }
+        );
+
+        assertEquals(OwnedExecutionShutdown.Outcome.EXITED, outcome);
+        assertTrue(requestTerminal.get());
+        backend.execution = new ImmediateExecution();
+        SyncthingExecution replacement = runtime.start(
+                SyncthingCommand.DEVICE_ID,
+                normalModeEnvironment()
+        );
+        assertEquals(0, replacement.await());
+        assertEquals(2, backend.startCount);
+        assertEquals(Arrays.asList(
+                "blocked-before-request-delivery",
+                "old-admission-released",
+                "replacement-rejected-before-terminal",
+                "request-canceled",
+                "request-terminal"
+        ), events);
+    }
+
+    @Test
+    public void launchPrerequisiteFailureHappensBeforeRecoveryCanStopAnOwner() {
+        RecordingBackend backend = new RecordingBackend();
+        backend.launchPrerequisiteFailure = new ExecutableNotFoundException("missing binary");
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        ExecutableNotFoundException failure = assertThrows(
+                ExecutableNotFoundException.class,
+                () -> runtime.start(SyncthingCommand.SERVE, normalModeEnvironment())
+        );
+
+        assertSame(backend.launchPrerequisiteFailure, failure);
+        assertEquals(0, backend.recoveryChecks);
+        assertTrue(backend.events.isEmpty());
+    }
+
+    @Test
+    public void lifecycleLaunchCheckRunsAfterRecoveryAndBeforeReplacementStart()
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        SyncthingExecution execution = runtime.startServiceLifecycle(
+                SyncthingCommand.SERVE,
+                normalModeEnvironment(),
+                null,
+                () -> backend.events.add("port-check")
+        );
+        execution.await();
+
+        assertEquals(Arrays.asList("validate", "recover", "port-check", "start"),
+                backend.events);
+    }
+
+    @Test
+    public void revokedStartupPermitAfterExactOwnerRecoveryPreventsReplacementLaunch()
+            throws Exception {
+        assertStartupCancelledDuringExactRecovery("Run Conditions false");
+        assertStartupCancelledDuringExactRecovery("explicit STOP");
+        assertStartupCancelledDuringExactRecovery("service destruction");
+    }
+
+    @Test
+    public void cancellationWinningAtFinalLaunchBoundaryPreventsBackendStart() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ownedExecution());
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+
+        assertThrows(
+                LifecycleLaunchPermit.CancelledException.class,
+                () -> runtime.startServiceLifecycle(
+                        SyncthingCommand.SERVE,
+                        normalModeEnvironment(),
+                        identity -> {
+                            assertEquals(RecoveryAssessmentFixture.ownedIdentity(), identity);
+                            backend.events.add("old-owner-exit-proven");
+                            return true;
+                        },
+                        () -> {
+                            backend.events.add("cancel-before-launch-commit");
+                            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+                            permit.commitLaunch();
+                        }
+                )
+        );
+
+        assertEquals(0, backend.startCount);
+        assertEquals(Arrays.asList(
+                "validate",
+                "recover",
+                "old-owner-exit-proven",
+                "recover",
+                "cancel-before-launch-commit"
+        ), backend.events);
+    }
+
+    @Test
+    public void launchCommitWinningMakesLaterStopTooLateToPreventExactOwnedStart()
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        ExecutionIdentity launchedIdentity = RecoveryAssessmentFixture.ownedIdentity();
+        backend.execution = new ImmediateExecution(launchedIdentity);
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch launchCommitted = new CountDownLatch(1);
+        CountDownLatch allowBackendStart = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<SyncthingExecution> launch = worker.submit(() ->
+                    runtime.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            null,
+                            () -> {
+                                permit.commitLaunch();
+                                launchCommitted.countDown();
+                                try {
+                                    allowBackendStart.await();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new AssertionError(e);
+                                }
+                            }
+                    )
+            );
+
+            assertTrue("Launch did not reach its commit boundary",
+                    launchCommitted.await(5, TimeUnit.SECONDS));
+            assertEquals("STOP must observe that launch already committed",
+                    LifecycleLaunchPermit.State.LAUNCH_COMMITTED, permit.revoke());
+            allowBackendStart.countDown();
+
+            SyncthingExecution execution = launch.get(5, TimeUnit.SECONDS);
+            assertEquals(1, backend.startCount);
+            assertSame("The started execution must retain identity for exact shutdown",
+                    launchedIdentity, execution.identity());
+
+            List<ExecutionOwnershipManager.Signal> signals = new ArrayList<>();
+            int[] waitCalls = {0};
+            OwnedExecutionShutdown.Outcome shutdown = OwnedExecutionShutdown.stop(
+                    execution.identity(),
+                    () -> null,
+                    new OwnedExecutionShutdown.ExecutionControl() {
+                        @Override
+                        public ExecutionOwnershipManager.Observation observe(
+                                ExecutionIdentity identity
+                        ) {
+                            assertSame(launchedIdentity, identity);
+                            return ExecutionOwnershipManager.Observation.OWNED;
+                        }
+
+                        @Override
+                        public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                                ExecutionIdentity identity,
+                                ExecutionOwnershipManager.Signal signal
+                        ) {
+                            assertSame(launchedIdentity, identity);
+                            signals.add(signal);
+                            return ExecutionOwnershipManager.SignalAttempt.SIGNALED;
+                        }
+                    },
+                    (identity, timeoutMillis, control) -> {
+                        assertSame(launchedIdentity, identity);
+                        if (waitCalls[0]++ == 0) {
+                            assertEquals(OwnedExecutionShutdown.REST_SHUTDOWN_WAIT_MS,
+                                    timeoutMillis);
+                            return false;
+                        }
+                        assertEquals(OwnedExecutionShutdown.SIGINT_WAIT_MS, timeoutMillis);
+                        return true;
+                    }
+            );
+
+            assertEquals(OwnedExecutionShutdown.Outcome.EXITED, shutdown);
+            assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
+                    signals);
+        } finally {
+            allowBackendStart.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    private static void assertStartupCancelledDuringExactRecovery(String cancellationReason)
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ownedExecution());
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch recoveryStarted = new CountDownLatch(1);
+        CountDownLatch allowRecoveryToFinish = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<String> launch = worker.submit(() -> {
+                try {
+                    runtime.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                assertEquals(RecoveryAssessmentFixture.ownedIdentity(), identity);
+                                recoveryStarted.countDown();
+                                allowRecoveryToFinish.await();
+                                backend.events.add("old-owner-exit-proven");
+                                return true;
+                            },
+                            permit::commitLaunch
+                    );
+                    return "launched";
+                } catch (LifecycleLaunchPermit.CancelledException expected) {
+                    return "cancelled";
+                }
+            });
+
+            assertTrue("Recovery did not start for " + cancellationReason,
+                    recoveryStarted.await(5, TimeUnit.SECONDS));
+            // Each service stop boundary revokes this one startup's permit while exact recovery is
+            // still in progress.
+            permit.revoke();
+            allowRecoveryToFinish.countDown();
+
+            assertEquals("cancelled", launch.get(5, TimeUnit.SECONDS));
+            assertEquals(0, backend.startCount);
+            assertTrue(backend.events.contains("old-owner-exit-proven"));
+            assertTrue(backend.events.indexOf("old-owner-exit-proven")
+                    < backend.events.lastIndexOf("recover"));
+        } finally {
+            allowRecoveryToFinish.countDown();
+            worker.shutdownNow();
+        }
     }
 
     @Test
@@ -403,8 +711,6 @@ public class RuntimeSeamTest {
         assertEquals("/configured/folder", backend.folder.path());
         assertEquals(FolderEvent.SYNC_COMPLETE, backend.event);
         assertEquals("sync_complete", FolderEvent.SYNC_COMPLETE.argument());
-        runtime.terminateBundledSyncthing();
-        assertTrue(backend.terminationRequested);
     }
 
     @Test
@@ -413,11 +719,10 @@ public class RuntimeSeamTest {
         binary.deleteOnExit();
         RecordingProcess process = new RecordingProcess("stdout", "stderr", 23);
         RecordingProcessLauncher launcher = new RecordingProcessLauncher(process);
-        boolean[] terminationRequested = new boolean[1];
         AppUidBackend backend = new AppUidBackend(
                 binary,
                 launcher,
-                () -> terminationRequested[0] = true,
+                unownedExecutionManager(),
                 new InMemoryConfigStorage()
         );
         SyncthingEnvironment environment = SyncthingEnvironment.builder()
@@ -441,33 +746,336 @@ public class RuntimeSeamTest {
                 new String[]{binary.getPath(), "device-id"},
                 launcher.argv
         );
-        assertEquals(environment.values(), launcher.environment);
+        assertTrue(launcher.environment.entrySet().containsAll(environment.values().entrySet()));
+        assertFalse(launcher.environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT).isEmpty());
         assertEquals("stdout", new String(execution.stdout().readAllBytes(), StandardCharsets.UTF_8));
         assertEquals("stderr", new String(execution.stderr().readAllBytes(), StandardCharsets.UTF_8));
         assertEquals(23, execution.await());
         execution.destroy();
-        assertTrue(process.destroyed);
+        assertNull(execution.identity());
+        assertFalse(process.destroyed);
+    }
 
-        backend.terminateBundledSyncthing();
-        assertTrue(terminationRequested[0]);
+    @Test
+    public void appUidBackendRecordsTokenAndExactLiveIdentityAfterLaunch() throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        binary.deleteOnExit();
+        ExecutionIdentity[] liveIdentity = new ExecutionIdentity[1];
+        ExecutionIdentity[] durableIdentity = new ExecutionIdentity[1];
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return durableIdentity[0] == null
+                        ? ReadResult.missing()
+                        : ReadResult.valid(durableIdentity[0]);
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) {
+                durableIdentity[0] = identity;
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                if (durableIdentity[0] == null
+                        || !durableIdentity[0].runToken().equals(runToken)) {
+                    return false;
+                }
+                durableIdentity[0] = null;
+                return true;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public InspectionResult inspect(int pid) {
+                return liveIdentity[0] != null && liveIdentity[0].pid() == pid
+                        ? InspectionResult.live(liveIdentity[0])
+                        : InspectionResult.processAbsent();
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return liveIdentity[0] != null
+                        && executablePath.equals(liveIdentity[0].executablePath())
+                        ? Collections.singletonList(liveIdentity[0])
+                        : Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return liveIdentity[0] != null
+                        && executablePath.equals(liveIdentity[0].executablePath())
+                        && runToken.equals(liveIdentity[0].runToken())
+                        ? liveIdentity[0]
+                        : null;
+            }
+        };
+        ExecutionOwnershipManager ownershipManager = new ExecutionOwnershipManager(
+                binary.getAbsolutePath(), records, inspector,
+                (pid, signal) -> {
+                    throw new AssertionError("Launch verification must not signal the child");
+                }
+        );
+        AppUidBackend backend = new AppUidBackend(
+                binary,
+                (argv, environment) -> {
+                    liveIdentity[0] = new ExecutionIdentity(
+                            123,
+                            456,
+                            "boot-a",
+                            binary.getAbsolutePath(),
+                            environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT)
+                    );
+                    return new RecordingProcess("", "", 0);
+                },
+                ownershipManager,
+                new InMemoryConfigStorage()
+        );
+
+        PrivilegeBackend.Execution execution = backend.start(
+                SyncthingCommand.DEVICE_ID,
+                normalModeEnvironment()
+        );
+
+        assertNotNull(execution.identity());
+        assertEquals(36, execution.identity().runToken().length());
+        assertSame(liveIdentity[0], durableIdentity[0]);
+        assertSame(liveIdentity[0], execution.identity());
+        assertEquals(ExecutionOwnershipManager.Classification.OWNED_EXECUTION,
+                ownershipManager.recover().classification());
+    }
+
+    @Test
+    public void appUidBackendDoesNotSignalChildWhenDurableIdentityRecordingFails()
+            throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        binary.deleteOnExit();
+        GatedRecordingProcess process = new GatedRecordingProcess();
+        ExecutionIdentity[] launchedIdentity = new ExecutionIdentity[1];
+        int[] signalCount = new int[1];
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return ReadResult.missing();
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) throws IOException {
+                throw new IOException("simulated durable write failure");
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                return false;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public InspectionResult inspect(int pid) {
+                return launchedIdentity[0] == null
+                        ? InspectionResult.processAbsent()
+                        : InspectionResult.live(launchedIdentity[0]);
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return launchedIdentity[0];
+            }
+        };
+        ExecutionOwnershipManager ownershipManager = new ExecutionOwnershipManager(
+                binary.getAbsolutePath(),
+                records,
+                inspector,
+                (pid, signal) -> {
+                    signalCount[0]++;
+                    return ExecutionOwnershipManager.SignalResult.SIGNALED;
+                }
+        );
+        AppUidBackend backend = new AppUidBackend(
+                binary,
+                (argv, environment) -> {
+                    launchedIdentity[0] = new ExecutionIdentity(
+                            123,
+                            456,
+                            "boot-a",
+                            binary.getAbsolutePath(),
+                            environment.get(ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT)
+                    );
+                    return process;
+                },
+                ownershipManager,
+                new InMemoryConfigStorage()
+        );
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+
+        SyncthingEnvironment environment = normalModeEnvironment();
+        SyncthingExecution execution = runtime.start(
+                SyncthingCommand.DEVICE_ID,
+                environment
+        );
+
+        assertNotNull(launchedIdentity[0]);
+        assertNull(execution.identity());
+        execution.destroy();
+        assertEquals(0, signalCount[0]);
+        assertFalse(process.destroyed);
+
+        CountDownLatch awaitStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> oneShotFailure = new AtomicReference<>();
+        AtomicReference<Integer> oneShotResult = new AtomicReference<>();
+        Thread oneShot = new Thread(() -> {
+            awaitStarted.countDown();
+            try {
+                int exitCode = execution.await();
+                execution.requireIdentityForSuccessfulOneShotResult();
+                oneShotResult.set(exitCode);
+            } catch (Throwable failure) {
+                oneShotFailure.set(failure);
+            }
+        });
+        try {
+            oneShot.start();
+            assertTrue(awaitStarted.await(1, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(process.waitStarted.await(1, java.util.concurrent.TimeUnit.SECONDS));
+            assertThrows(
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment)
+            );
+        } finally {
+            process.exit(0);
+            awaitStarted.countDown();
+            oneShot.join(1_000);
+            if (oneShot.isAlive()) {
+                oneShot.interrupt();
+                oneShot.join(1_000);
+            }
+        }
+        assertFalse(oneShot.isAlive());
+
+        assertNull(oneShotResult.get());
+        assertNotNull(oneShotFailure.get());
+        assertEquals(
+                "ExecutionIdentityUnavailableException",
+                oneShotFailure.get().getClass().getSimpleName()
+        );
+        assertEquals(0, signalCount[0]);
+
+        SyncthingExecution afterExit = runtime.start(
+                SyncthingCommand.RESET_DATABASE,
+                environment
+        );
+        assertEquals(0, afterExit.await());
+    }
+
+    private static ExecutionOwnershipManager unownedExecutionManager() {
+        ExecutionRecordStore records = new ExecutionRecordStore() {
+            @Override
+            public ReadResult read() {
+                return ReadResult.missing();
+            }
+
+            @Override
+            public void write(ExecutionIdentity identity) {
+                throw new AssertionError("The fixture cannot identify a launched process");
+            }
+
+            @Override
+            public boolean deleteIfRunTokenMatches(String runToken) {
+                return false;
+            }
+        };
+        ExecutionInspector inspector = new ExecutionInspector() {
+            @Override
+            public String currentBootId() {
+                return "boot-a";
+            }
+
+            @Override
+            public InspectionResult inspect(int pid) {
+                return InspectionResult.processAbsent();
+            }
+
+            @Override
+            public List<ExecutionIdentity> findBundledCandidates(String executablePath) {
+                return Collections.emptyList();
+            }
+
+            @Override
+            public ExecutionIdentity findLaunchedProcess(String executablePath, String runToken) {
+                return null;
+            }
+        };
+        return new ExecutionOwnershipManager(
+                "/expected/syncthing",
+                records,
+                inspector,
+                (pid, signal) -> {
+                    throw new AssertionError("An unidentified process must never be signaled");
+                }
+        );
     }
 
     private static final class RecordingBackend implements PrivilegeBackend {
         private final ConfigStorage storage = new InMemoryConfigStorage();
+        private final List<String> events = new ArrayList<>();
+        private final Deque<ExecutionOwnershipManager.RecoveryAssessment> recoveryAssessments =
+                new ConcurrentLinkedDeque<>();
         private Execution execution = new ImmediateExecution();
+        private ExecutableNotFoundException launchPrerequisiteFailure;
+        private int recoveryChecks;
         private SyncthingCommand command;
         private SyncthingEnvironment environment;
         private ConfiguredFolderReference folder;
         private FolderEvent event;
         private String[] ignore;
-        private boolean terminationRequested;
+        private int startCount;
+        private ExecutionOwnershipManager.Observation observation =
+                ExecutionOwnershipManager.Observation.UNKNOWN;
+
+        @Override
+        public void validateLaunchPrerequisites() throws ExecutableNotFoundException {
+            if (launchPrerequisiteFailure != null) throw launchPrerequisiteFailure;
+            events.add("validate");
+        }
 
         @Override
         public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
                 throws IOException, ExecutableNotFoundException {
+            startCount++;
+            events.add("start");
             this.command = command;
             this.environment = environment;
             return execution;
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            ExecutionOwnershipManager.RecoveryAssessment assessment = recoveryAssessments.poll();
+            return assessment != null
+                    ? assessment
+                    : ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+
+        @Override
+        public ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
+            return observation;
         }
 
         @Override
@@ -509,13 +1117,19 @@ public class RuntimeSeamTest {
             this.event = event;
         }
 
-        @Override
-        public void terminateBundledSyncthing() {
-            terminationRequested = true;
-        }
     }
 
     private static final class ImmediateExecution implements PrivilegeBackend.Execution {
+        private final ExecutionIdentity identity;
+
+        private ImmediateExecution() {
+            this(null);
+        }
+
+        private ImmediateExecution(ExecutionIdentity identity) {
+            this.identity = identity;
+        }
+
         @Override
         public InputStream stdout() {
             return new ByteArrayInputStream(new byte[0]);
@@ -533,6 +1147,11 @@ public class RuntimeSeamTest {
 
         @Override
         public void destroy() {
+        }
+
+        @Override
+        public ExecutionIdentity identity() {
+            return identity;
         }
     }
 
@@ -641,6 +1260,15 @@ public class RuntimeSeamTest {
             queuedExecutions.addLast(execution);
         }
 
+        @Override
+        public void validateLaunchPrerequisites() {
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+
         int startCount() {
             return startedCommands.size();
         }
@@ -657,10 +1285,6 @@ public class RuntimeSeamTest {
             startedCommands.add(command);
             PrivilegeBackend.Execution delegate = queuedExecutions.removeFirst();
             return new CountedExecution(delegate, activeInvocations);
-        }
-
-        @Override
-        public void terminateBundledSyncthing() {
         }
 
         @Override
@@ -850,6 +1474,53 @@ public class RuntimeSeamTest {
         @Override
         public void save(byte[] contents) {
             this.contents = contents.clone();
+        }
+    }
+
+    private static final class GatedRecordingProcess extends Process {
+        private final InputStream stdout = new ByteArrayInputStream(new byte[0]);
+        private final InputStream stderr = new ByteArrayInputStream(new byte[0]);
+        private final CountDownLatch exitGate = new CountDownLatch(1);
+        private final CountDownLatch waitStarted = new CountDownLatch(1);
+        private volatile int exitCode;
+        private volatile boolean destroyed;
+
+        @Override
+        public OutputStream getOutputStream() {
+            return new ByteArrayOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return stdout;
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return stderr;
+        }
+
+        @Override
+        public int waitFor() throws InterruptedException {
+            waitStarted.countDown();
+            exitGate.await();
+            return exitCode;
+        }
+
+        @Override
+        public int exitValue() {
+            if (exitGate.getCount() != 0) throw new IllegalThreadStateException();
+            return exitCode;
+        }
+
+        @Override
+        public void destroy() {
+            destroyed = true;
+        }
+
+        private void exit(int exitCode) {
+            this.exitCode = exitCode;
+            exitGate.countDown();
         }
     }
 }

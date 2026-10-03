@@ -3,23 +3,29 @@ package com.nutomic.syncthingandroid.runtime;
 import java.io.IOException;
 import java.io.InputStream;
 
-/**
- * Backend mechanics selected by the mode-neutral runtime.
- *
- * <p>Implementations own process transport and identity-specific folder mechanics. They do not
- * own user-visible Syncthing exit policy or service lifecycle decisions.</p>
- */
+/** Backend contract for launching and controlling bundled Syncthing executions. */
 public interface PrivilegeBackend {
+    void validateLaunchPrerequisites() throws IOException, ExecutableNotFoundException;
+
     Execution start(SyncthingCommand command, SyncthingEnvironment environment)
             throws IOException, ExecutableNotFoundException;
 
-    /**
-     * Applies the existing Normal Mode compatibility cleanup for bundled Syncthing processes.
-     *
-     * <p>The selected backend owns how this cleanup is performed. Callers decide when the
-     * cleanup is required as part of service lifecycle transitions.</p>
-     */
-    void terminateBundledSyncthing();
+    ExecutionOwnershipManager.RecoveryAssessment recoverExecutions();
+
+    default ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+            ExecutionIdentity identity,
+            ExecutionOwnershipManager.Signal signal
+    ) {
+        return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
+    }
+
+    default ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
+        return ExecutionOwnershipManager.Observation.UNKNOWN;
+    }
+
+    default boolean clearAfterExit(ExecutionIdentity identity) throws IOException {
+        return false;
+    }
 
     ConfigStorage configStorage();
 
@@ -41,5 +47,24 @@ public interface PrivilegeBackend {
         int await() throws InterruptedException;
 
         void destroy();
+
+        default ExecutionIdentity identity() {
+            return null;
+        }
+
+        /** True only when the concrete launched child had exited before identity capture failed. */
+        default boolean exitedBeforeIdentityCapture() {
+            return false;
+        }
+
+        default ExecutionOwnershipManager.Observation observe() {
+            return ExecutionOwnershipManager.Observation.UNKNOWN;
+        }
+
+        default ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                ExecutionOwnershipManager.Signal signal
+        ) {
+            return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
+        }
     }
 }

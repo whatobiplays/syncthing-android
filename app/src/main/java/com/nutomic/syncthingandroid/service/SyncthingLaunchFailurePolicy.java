@@ -16,4 +16,14 @@ final class SyncthingLaunchFailurePolicy {
         }
         return currentState;
     }
+
+    /** A revoked startup ends stopped because no child process was created. */
+    static SyncthingService.State cancelledStartupState(
+            SyncthingService.State currentState
+    ) {
+        if (currentState == SyncthingService.State.STARTING) {
+            return SyncthingService.State.DISABLED;
+        }
+        return currentState;
+    }
 }

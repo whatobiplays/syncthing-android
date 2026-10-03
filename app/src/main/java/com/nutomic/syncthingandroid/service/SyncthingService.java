@@ -17,6 +17,11 @@ import com.nutomic.syncthingandroid.model.Device;
 import com.nutomic.syncthingandroid.model.Folder;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
+import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
+import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
+import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
+import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
 import com.nutomic.syncthingandroid.util.ConfigXml;
@@ -36,6 +41,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
 
@@ -236,6 +243,49 @@ public class SyncthingService extends Service {
     @Inject
     DefaultSyncthingRuntime mRuntime;
 
+    @Nullable
+    private StartupReadiness mStartupReadiness;
+
+    @Nullable
+    private ExecutionIdentity mOwnedExecution;
+
+    @Nullable
+    private RestApi mRecoveryRestApi;
+
+    @Nullable
+    private RestApi mShutdownRestApi;
+
+    @Nullable
+    private Runnable mAfterShutdown;
+    @Nullable
+    private ActionRestartContinuation mActionRestartContinuation;
+    @Nullable
+    private ActionResetDeltasContinuation mActionResetDeltasContinuation;
+    @Nullable private FileMutationBarrier mFileMutationBarrier;
+    @Nullable private CertificateVerificationStopHandler mCertificateVerificationStopHandler;
+    @Nullable private LifecycleLaunchPermit mStartupLaunchPermit;
+    private final StartingShutdownDeferral mStartingShutdownDeferral =
+            new StartingShutdownDeferral();
+    private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
+    private final PostMutationStartupGate mPostMutationStartupGate =
+            new PostMutationStartupGate();
+    private final DatabaseResetOwnership mDatabaseResetOwnership =
+            new DatabaseResetOwnership();
+
+    private boolean mShutdownInProgress;
+    private boolean mShutdownExitProven;
+    private boolean mShutdownWorkerStarted;
+    private boolean mShutdownRecoveryCheckStarted;
+    private boolean mLastExecutionExitProven;
+    private boolean mDestroying;
+    private boolean mStopAfterDeltaResetWhenNotRequired;
+    private SyncthingCommand mStartupCommand;
+
+    private interface CertificateVerificationStopHandler {
+        void onExplicitStop(boolean crashedNativeStop);
+        void onServiceDestroy();
+    }
+
     /**
      * Object that must be locked upon accessing mCurrentState
      */
@@ -309,10 +359,39 @@ public class SyncthingService extends Service {
         }
 
         if (ACTION_RESTART.equals(intent.getAction()) && mCurrentState == State.ACTIVE) {
-            shutdown(State.INIT);
-            launchStartupTask(SyncthingCommand.SERVE);
+            ActionRestartContinuation restart = new ActionRestartContinuation(() -> {
+                if (mLastDeterminedShouldRun) {
+                    launchStartupTask(SyncthingCommand.SERVE);
+                } else {
+                    onServiceStateChange(State.DISABLED);
+                }
+            });
+            mActionRestartContinuation = restart;
+            shutdown(State.INIT, () -> {
+                if (mActionRestartContinuation == restart) {
+                    mActionRestartContinuation = null;
+                }
+                restart.complete();
+            });
         } else if (ACTION_STOP.equals(intent.getAction())) {
-            if (intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false)) {
+            boolean crashedNativeStop =
+                    intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false);
+            revokeStartupLaunchPermit();
+            mDatabaseResetOwnership.suppressAutomaticStartup();
+            boolean restartContinuationCancelled = false;
+            if (mActionRestartContinuation != null) {
+                restartContinuationCancelled = mActionRestartContinuation.cancel();
+                mActionRestartContinuation = null;
+            }
+            if (!crashedNativeStop) cancelActionResetDeltasContinuation();
+            if (mCertificateVerificationStopHandler != null) {
+                mCertificateVerificationStopHandler.onExplicitStop(crashedNativeStop);
+            }
+            if (mFileMutationBarrier != null) {
+                mFileMutationBarrier.suppressAutomaticStartup();
+            }
+            mPostMutationStartupGate.suppressAutomaticStartup(mShutdownStartIntent);
+            if (crashedNativeStop) {
                 /**
                  * We were requested to stop the service because the syncthing native binary crashed.
                  * Changing mCurrentState prevents the "defer until syncthing is started" routine we normally
@@ -323,41 +402,60 @@ public class SyncthingService extends Service {
                 shutdown(State.DISABLED);
             } else {
                 // Graceful shutdown.
-                if (mCurrentState == State.STARTING ||
-                        mCurrentState == State.ACTIVE) {
-                    shutdown(State.DISABLED);
-                }
+                SyncthingStopPolicy.stopForNormalAction(
+                        mCurrentState, mOwnedExecution != null, restartContinuationCancelled,
+                        () -> shutdown(State.DISABLED)
+                );
             }
         } else if (ACTION_RESET_DATABASE.equals(intent.getAction())) {
-            /**
-             * 1. Stop syncthing native if it's running.
-             * 2. Reset the database, syncthing native will exit after performing the reset.
-             * 3. Relaunch syncthing native if it was previously running.
-             */
-            Log.i(TAG, "Invoking reset of database");
-            requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
-                    () -> mLastDeterminedShouldRun,
-                    () -> launchStartupTask(SyncthingCommand.SERVE)
-            ));
-        } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
-            /**
-             * 1. Stop syncthing native if it's running.
-             * 2. Reset delta index, syncthing native will NOT exit after performing the reset.
-             * 3. If syncthing was previously NOT running:
-             * 3.1  Schedule a shutdown of the native binary after it left State.STARTING (to State.ACTIVE).
-             *      This is the moment, when the reset delta index work was completed and Web UI came up.
-             * 3.2  The shutdown gets deferred until State.ACTIVE was reached and then syncthing native will
-             *      be shutdown synchronously.
-             */
-            Log.i(TAG, "Invoking reset of delta indexes");
-            if (mCurrentState != State.DISABLED) {
-                // Shutdown synchronously.
-                shutdown(State.DISABLED);
+            // Reject conflicts before reserving or starting any reset work.
+            boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                    mFileMutationBarrier != null,
+                    mPostMutationStartupGate.ownsStartup(),
+                    mDatabaseResetOwnership.isReserved(),
+                    mShutdownInProgress,
+                    () -> {
+                        Log.i(TAG, "Invoking reset of database");
+                        requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
+                                () -> mLastDeterminedShouldRun,
+                                () -> launchStartupTask(SyncthingCommand.SERVE)
+                        ));
+                    }
+            );
+            if (!accepted) {
+                Log.w(TAG, "Ignoring external database reset while another lifecycle operation owns admission");
             }
-            launchStartupTask(SyncthingCommand.RESET_DELTAS);
-            if (!mLastDeterminedShouldRun) {
-                // Shutdown if syncthing was not running before the UI action was raised.
-                shutdown(State.DISABLED);
+        } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
+            // Check ownership before setting the delta-reset follow-up state or launching work.
+            boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                    mFileMutationBarrier != null,
+                    mPostMutationStartupGate.ownsStartup(),
+                    mDatabaseResetOwnership.isReserved(),
+                    mShutdownInProgress,
+                    () -> {
+                        Log.i(TAG, "Invoking reset of delta indexes");
+                        mStopAfterDeltaResetWhenNotRequired = true;
+                        ActionResetDeltasContinuation deltaReset =
+                                new ActionResetDeltasContinuation(
+                                        () -> launchStartupTask(SyncthingCommand.RESET_DELTAS),
+                                        () -> mStopAfterDeltaResetWhenNotRequired = false
+                                );
+                        mActionResetDeltasContinuation = deltaReset;
+                        Runnable completeDeltaReset = () -> {
+                            if (mActionResetDeltasContinuation == deltaReset) {
+                                mActionResetDeltasContinuation = null;
+                            }
+                            deltaReset.complete();
+                        };
+                        if (mCurrentState != State.DISABLED || mSyncthingRunnable != null) {
+                            shutdown(State.DISABLED, completeDeltaReset);
+                        } else {
+                            completeDeltaReset.run();
+                        }
+                    }
+            );
+            if (!accepted) {
+                Log.w(TAG, "Ignoring external delta reset while another lifecycle operation owns admission");
             }
         } else if (ACTION_REFRESH_NETWORK_INFO.equals(intent.getAction())) {
             if (mRunConditionMonitor != null) {
@@ -424,6 +522,26 @@ public class SyncthingService extends Service {
 
             // React to the shouldRun condition change.
             if (newShouldRunDecision) {
+                boolean lifecycleBlocksStartup = mStartingShutdownDeferral
+                        .blocksStartup(mShutdownInProgress)
+                        || mFileMutationBarrier != null
+                        || mPostMutationStartupGate.ownsStartup()
+                        || !mDatabaseResetOwnership.canStartLifecycle()
+                        || ((mCurrentState == State.DISABLED || mCurrentState == State.INIT)
+                        && (mOwnedExecution != null
+                        || mSyncthingRunnable != null
+                        || mSyncthingRunnableThread != null));
+                mShutdownStartIntent.onRunConditionChanged(true, lifecycleBlocksStartup);
+                if (lifecycleBlocksStartup) {
+                    if (!mShutdownInProgress && !mStartingShutdownDeferral.isPending()
+                            && mFileMutationBarrier == null
+                            && !mPostMutationStartupGate.ownsStartup()
+                            && mDatabaseResetOwnership.canStartLifecycle()) {
+                        shutdown(State.DISABLED, null, true);
+                    }
+                    return;
+                }
+
                 // Start syncthing.
                 switch (mCurrentState) {
                     case DISABLED:
@@ -438,6 +556,8 @@ public class SyncthingService extends Service {
                         break;
                 }
             } else {
+                mShutdownStartIntent.onRunConditionChanged(false, false);
+                revokeStartupLaunchPermit();
                 // Stop syncthing.
                 if (mCurrentState == State.DISABLED) {
                     return;
@@ -534,10 +654,26 @@ public class SyncthingService extends Service {
         }
     }
 
-    /**
-     * Prepares to launch the syncthing binary.
-     */
-    private void launchStartupTask(SyncthingCommand srCommand) {
+    private static final class OwnershipVerification {
+        private final ExecutionIdentity identity;
+        private final ExecutionOwnershipManager.Observation observation;
+
+        private OwnershipVerification(
+                ExecutionIdentity identity,
+                ExecutionOwnershipManager.Observation observation
+        ) {
+            this.identity = identity;
+            this.observation = observation;
+        }
+    }
+
+    @FunctionalInterface
+    private interface OwnershipVerificationCallback {
+        void onComplete(OwnershipVerification verification);
+    }
+
+    /** Prepares a bounded startup whose deadline includes REST configuration initialization. */
+    private void launchStartupTask(SyncthingCommand command) {
         synchronized (mStateLock) {
             if (mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
                 Log.e(TAG, "launchStartupTask: Wrong state " + mCurrentState + " detected. Cancelling.");
@@ -545,11 +681,24 @@ public class SyncthingService extends Service {
             }
         }
 
+        if (mSyncthingRunnable != null || mSyncthingRunnableThread != null) {
+            Log.e(TAG, "launchStartupTask: Syncthing binary lifecycle violated");
+            return;
+        }
+        if (mFileMutationBarrier != null || mPostMutationStartupGate.ownsStartup()
+                || !mDatabaseResetOwnership.canStartLifecycle()) {
+            Log.d(TAG, "launchStartupTask deferred until stopped-state ownership is released");
+            return;
+        }
+
         mConfig = new ConfigXml(this);
         try {
             mConfig.loadConfig();
         } catch (ConfigXml.OpenConfigException e) {
-            mNotificationHandler.showCrashedNotification(R.string.config_read_failed, "launchStartupTask:OpenConfigException");
+            mNotificationHandler.showCrashedNotification(
+                    R.string.config_read_failed,
+                    "launchStartupTask:OpenConfigException"
+            );
             synchronized (mStateLock) {
                 onServiceStateChange(State.ERROR);
             }
@@ -557,95 +706,418 @@ public class SyncthingService extends Service {
             return;
         }
 
-        // Check if the SyncthingNative's configured webgui port is allocated by another app or process.
         Integer webGuiTcpPort = mConfig.getWebGuiBindPort();
-        Boolean isWebUIPortListening = Util.isTcpPortListening(webGuiTcpPort);
-        if (isWebUIPortListening) {
-            // We shouldn't start SyncthingNative as we would wait forever for life signs on the configured port. (ANR)
-            Log.e(TAG, "launchStartupTask: WebUI tcp port " + Integer.toString(webGuiTcpPort) + " unavailable. Second instance?");
-            mNotificationHandler.showCrashedNotification(R.string.webui_tcp_port_unavailable, Integer.toString(webGuiTcpPort));
-            return;
-        }
 
         onServiceStateChange(State.STARTING);
+        mStartupCommand = command;
+        mLastExecutionExitProven = false;
+        mShutdownExitProven = false;
+        mShutdownWorkerStarted = false;
+        mShutdownRecoveryCheckStarted = false;
+        mRecoveryRestApi = createRecoveryRestApi(mConfig);
+        mStartupReadiness = new StartupReadiness((delayMillis, task) -> {
+            mHandler.postDelayed(task, delayMillis);
+            return () -> mHandler.removeCallbacks(task);
+        }, this::onStartupDeadlineExceeded);
 
-        if (mRestApi == null) {
-            mRestApi = new RestApi(this, mConfig.getWebGuiUrl(), mConfig.getApiKey(),
-                    this::onApiAvailable, () -> onServiceStateChange(mCurrentState));
-            Log.i(TAG, "Web GUI will be available at " + mConfig.getWebGuiUrl());
-        }
-
-        // Check mSyncthingRunnable lifecycle and create singleton.
-        if (mSyncthingRunnable != null || mSyncthingRunnableThread != null) {
-            Log.e(TAG, "onStartupTaskCompleteListener: Syncthing binary lifecycle violated");
-            return;
-        }
-        mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(this, srCommand);
-
-        /**
-         * Check if an old syncthing instance is still running.
-         * This happens after an in-place app upgrade. If so, end it.
-         */
-        mRuntime.terminateBundledSyncthing();
-
-        // Start the syncthing binary in a separate thread.
-        Thread.UncaughtExceptionHandler syncthingRunnableThreadExceptionHandler = new Thread.UncaughtExceptionHandler() {
-                public void uncaughtException(Thread syncthingRunnableThread, Throwable ex) {
-                    if (ex instanceof ExecutionAdmissionException) {
-                        Log.e(TAG, "mSyncthingRunnableThread: Syncthing execution admission rejected", ex);
-                        mHandler.post(() -> handleSyncthingLaunchFailure());
-                        return;
-                    }
-                    Log.e(TAG, "mSyncthingRunnableThread: Uncaught exception [ExecutableNotFoundException]");
-                    mNotificationHandler.showCrashedNotification(R.string.executable_not_found, Constants.FILENAME_SYNCTHING_BINARY);
-                }
+        RestApi recoveryApi = mRecoveryRestApi;
+        LifecycleLaunchPermit startupPermit = new LifecycleLaunchPermit();
+        mStartupLaunchPermit = startupPermit;
+        DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
+                identity -> stopOwnedExecution(identity, recoveryApi);
+        DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck = () -> {
+            if (Util.isTcpPortListening(webGuiTcpPort)) {
+                throw new SyncthingRunnable.GuiPortUnavailableException();
+            }
+            startupPermit.commitLaunch();
         };
-        mSyncthingRunnableThread = new Thread(mSyncthingRunnable);
-        mSyncthingRunnableThread.setUncaughtExceptionHandler(syncthingRunnableThreadExceptionHandler);
-        mSyncthingRunnableThread.start();
+        mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(
+                this,
+                command,
+                recoveryHandler,
+                outcome -> mHandler.post(() -> onLifecycleOutcome(outcome)),
+                portCheck
+        );
 
-        /**
-         * Wait for the web-gui of the native syncthing binary to come online.
-         *
-         * In case the binary is to be stopped, also be aware that another thread could request
-         * to stop the binary in the time while waiting for the GUI to become active. See the comment
-         * for {@link SyncthingService#onDestroy} for details.
-         */
-        if (mPollWebGuiAvailableTask == null) {
-            mPollWebGuiAvailableTask = new PollWebGuiAvailableTask(
-                    this, mConfig.getWebGuiUrl(), mConfig.getApiKey(), result -> {
-                Log.i(TAG, "Web GUI has come online at " + mConfig.getWebGuiUrl());
-                if (mRestApi != null) {
-                    mRestApi.readConfigFromRestApi();
+        Thread.UncaughtExceptionHandler exceptionHandler = (thread, error) -> {
+            Log.e(TAG, "mSyncthingRunnableThread failed", error);
+            mHandler.post(() -> {
+                if (error instanceof ExecutionAdmissionException) {
+                    handleSyncthingLaunchFailure();
+                } else {
+                    handleUnexpectedLaunchFailure(error);
+                }
+            });
+        };
+        mSyncthingRunnableThread = new Thread(mSyncthingRunnable, "Syncthing lifecycle");
+        mSyncthingRunnableThread.setUncaughtExceptionHandler(exceptionHandler);
+        mSyncthingRunnableThread.start();
+    }
+
+    private RestApi createRecoveryRestApi(ConfigXml config) {
+        return new RestApi(this, config.getWebGuiUrl(), config.getApiKey(), () -> { }, () -> { });
+    }
+
+    private RestApi createCurrentRestApi() {
+        RestApi[] reference = new RestApi[1];
+        reference[0] = new RestApi(
+                this,
+                mConfig.getWebGuiUrl(),
+                mConfig.getApiKey(),
+                () -> mHandler.post(() -> onApiAvailable(reference[0])),
+                () -> mHandler.post(() -> {
+                    if (mRestApi == reference[0]) {
+                        onServiceStateChange(mCurrentState);
+                    }
+                })
+        );
+        return reference[0];
+    }
+
+    private boolean stopOwnedExecution(
+            ExecutionIdentity identity,
+            @Nullable RestApi recoveryApi
+    ) throws InterruptedException {
+        OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
+                identity,
+                () -> recoveryApi == null ? null : recoveryApi.prepareShutdown(),
+                mRuntime,
+                OwnedExecutionShutdown.processWaiter()
+        );
+        if (outcome != OwnedExecutionShutdown.Outcome.EXITED) return false;
+        try {
+            mRuntime.clearAfterExit(identity);
+        } catch (IOException e) {
+            Log.e(TAG, "Could not clear the recovered Syncthing execution record", e);
+        }
+        return true;
+    }
+
+    private void verifyOwnershipAsync(
+            ExecutionIdentity identity,
+            OwnershipVerificationCallback callback
+    ) {
+        Thread verificationThread = new Thread(() -> {
+            ExecutionOwnershipManager.Observation observation = mRuntime.observe(identity);
+            if (observation == ExecutionOwnershipManager.Observation.EXITED) {
+                try {
+                    mRuntime.clearAfterExit(identity);
+                } catch (IOException e) {
+                    Log.e(TAG, "Could not clear the exited Syncthing execution record", e);
                 }
             }
-            );
+            OwnershipVerification result = new OwnershipVerification(identity, observation);
+            mHandler.post(() -> callback.onComplete(result));
+        }, "Syncthing ownership verification");
+        verificationThread.setDaemon(true);
+        verificationThread.start();
+    }
+
+    private void onLifecycleOutcome(SyncthingRunnable.LifecycleOutcome outcome) {
+        mStartupLaunchPermit = null;
+        switch (outcome.type()) {
+            case EXECUTION_STARTED:
+                mOwnedExecution = outcome.identity();
+                mLastExecutionExitProven = false;
+                if (mShutdownInProgress || mDestroying || mCurrentState != State.STARTING) {
+                    if (outcome.identity() != null) {
+                        startShutdownWorker(outcome.identity(), mShutdownRestApi);
+                    } else {
+                        mSyncthingRunnableThread.interrupt();
+                    }
+                } else {
+                    verifyOwnershipAsync(outcome.identity(), this::onInitialOwnershipVerified);
+                }
+                break;
+            case IDENTITY_UNAVAILABLE:
+                mOwnedExecution = null;
+                mShutdownStartIntent.clear();
+                failFileMutationBarrier();
+                if (mCurrentState == State.STARTING) {
+                    failStartup("Syncthing started without durable exact ownership evidence");
+                }
+                break;
+            case EXECUTION_EXITED:
+                mLastExecutionExitProven = outcome.exitObserved();
+                if (sameExecution(mOwnedExecution, outcome.identity())) {
+                    mOwnedExecution = null;
+                }
+                if (mCurrentState == State.STARTING) {
+                    failStartup("Syncthing exited before startup completed");
+                }
+                if (mShutdownInProgress && outcome.exitObserved()) {
+                    mShutdownExitProven = true;
+                }
+                clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+                if (mShutdownInProgress && outcome.exitObserved()) checkShutdownRecovery();
+                break;
+            case RECOVERY_BLOCKED:
+                handleRecoveryBlocked(outcome.recoveryAssessment());
+                break;
+            case GUI_PORT_UNAVAILABLE:
+                mShutdownStartIntent.clear();
+                if (mStartupReadiness != null) {
+                    mStartupReadiness.cancel();
+                    mStartupReadiness = null;
+                }
+                mRecoveryRestApi = null;
+                mNotificationHandler.showCrashedNotification(
+                        R.string.webui_tcp_port_unavailable,
+                        Integer.toString(mConfig.getWebGuiBindPort())
+                );
+                synchronized (mStateLock) {
+                    if (mCurrentState == State.STARTING) onServiceStateChange(State.DISABLED);
+                }
+                clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+                break;
+            case LAUNCH_CANCELLED:
+                mLastExecutionExitProven = true;
+                mShutdownExitProven = true;
+                cancelStartupRequests();
+                if (mStartupReadiness != null) {
+                    mStartupReadiness.cancel();
+                    mStartupReadiness = null;
+                }
+                mRecoveryRestApi = null;
+                if (!mShutdownInProgress && mCurrentState == State.STARTING) {
+                    synchronized (mStateLock) {
+                        onServiceStateChange(
+                                SyncthingLaunchFailurePolicy.cancelledStartupState(mCurrentState)
+                        );
+                    }
+                }
+                if (mShutdownInProgress) checkShutdownRecovery();
+                clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+                break;
+            case WORKER_FINISHED:
+                if (outcome.provesNoExecutionExit()) {
+                    if (mCurrentState == State.STARTING && !mDestroying) {
+                        failStartup("Syncthing startup worker finished before creating an execution");
+                    }
+                    if (mShutdownInProgress) {
+                        mShutdownExitProven = true;
+                        mLastExecutionExitProven = true;
+                        checkShutdownRecovery();
+                    }
+                }
+                clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+                break;
+            default:
+                throw new IllegalStateException("Unhandled lifecycle outcome: " + outcome.type());
         }
     }
 
-    /**
-     * Called when {@link RestApi#checkReadConfigFromRestApiCompleted} detects
-     * the RestApi class has been fully initialized.
-     * UI stressing results in mRestApi getting null on simultaneous shutdown, so
-     * we check it for safety.
-     */
-    private void onApiAvailable() {
-        if (mRestApi == null) {
-            Log.e(TAG, "onApiAvailable: Did we stop the binary during startup? mRestApi == null");
+    private void onInitialOwnershipVerified(OwnershipVerification verification) {
+        if (!sameExecution(mOwnedExecution, verification.identity)) return;
+        if (verification.observation != ExecutionOwnershipManager.Observation.OWNED) {
+            if (mCurrentState == State.STARTING) {
+                failStartup("Syncthing ownership could not be verified after launch");
+            } else if (verification.observation == ExecutionOwnershipManager.Observation.EXITED
+                    && mShutdownInProgress) {
+                mShutdownExitProven = true;
+                checkShutdownRecovery();
+            }
             return;
         }
-        synchronized (mStateLock) {
-            if (mCurrentState != State.STARTING) {
-                Log.e(TAG, "onApiAvailable: Wrong state " + mCurrentState + " detected. Cancelling callback.");
-                return;
-            }
-            onServiceStateChange(State.ACTIVE);
+
+        if (mShutdownInProgress || mDestroying || mCurrentState != State.STARTING) {
+            if (!mShutdownInProgress) shutdown(State.DISABLED, null, true);
+            else startShutdownWorker(verification.identity, mShutdownRestApi);
+            return;
         }
 
-        if (mEventProcessor == null) {
-            mEventProcessor = new EventProcessor(SyncthingService.this, mRestApi);
-            mEventProcessor.start();
+        if (mStartupReadiness == null
+                || mStartupReadiness.state() != StartupReadiness.State.PENDING) {
+            if (mCurrentState == State.STARTING) {
+                failStartup("Syncthing ownership verification arrived after startup closed");
+            }
+            return;
         }
+        mStartupReadiness.markOwnershipVerified();
+
+        mRecoveryRestApi = null;
+        mRestApi = createCurrentRestApi();
+        RestApi expectedApi = mRestApi;
+        Log.i(TAG, "Web GUI will be available at " + mConfig.getWebGuiUrl());
+        mPollWebGuiAvailableTask = new PollWebGuiAvailableTask(
+                this,
+                mConfig.getWebGuiUrl(),
+                mConfig.getApiKey(),
+                result -> mHandler.post(() -> onWebGuiAvailable(expectedApi))
+        );
+    }
+
+    private void onWebGuiAvailable(RestApi expectedApi) {
+        if (mRestApi != expectedApi || mCurrentState != State.STARTING
+                || mStartupReadiness == null || mOwnedExecution == null) {
+            return;
+        }
+        ExecutionIdentity identity = mOwnedExecution;
+        verifyOwnershipAsync(identity, verification -> {
+            if (mRestApi != expectedApi || mCurrentState != State.STARTING
+                    || !sameExecution(mOwnedExecution, verification.identity)) {
+                return;
+            }
+            if (verification.observation != ExecutionOwnershipManager.Observation.OWNED) {
+                failStartup("Syncthing ownership was lost before endpoint readiness");
+                return;
+            }
+            mStartupReadiness.markEndpointReady();
+            expectedApi.readConfigFromRestApi();
+        });
+    }
+
+    /** Called after REST version, config, and system-status initialization all complete. */
+    private void onApiAvailable(RestApi expectedApi) {
+        if (expectedApi == null || mRestApi != expectedApi || mCurrentState != State.STARTING
+                || mStartupReadiness == null || mOwnedExecution == null) {
+            return;
+        }
+        ExecutionIdentity identity = mOwnedExecution;
+        verifyOwnershipAsync(identity, verification -> {
+            if (mRestApi != expectedApi || mCurrentState != State.STARTING
+                    || !sameExecution(mOwnedExecution, verification.identity)) {
+                return;
+            }
+            if (verification.observation != ExecutionOwnershipManager.Observation.OWNED) {
+                failStartup("Syncthing ownership was lost after REST configuration initialization");
+                return;
+            }
+            if (!mStartupReadiness.markConfigurationInitialized()) return;
+            mStartupReadiness = null;
+            synchronized (mStateLock) {
+                onServiceStateChange(State.ACTIVE);
+            }
+            if (mEventProcessor == null) {
+                mEventProcessor = new EventProcessor(SyncthingService.this, expectedApi);
+                mEventProcessor.start();
+            }
+            if (mStartupCommand == SyncthingCommand.RESET_DELTAS
+                    && mStopAfterDeltaResetWhenNotRequired) {
+                mStopAfterDeltaResetWhenNotRequired = false;
+                if (!mLastDeterminedShouldRun) shutdown(State.DISABLED);
+            }
+        });
+    }
+
+    private void onStartupDeadlineExceeded() {
+        if (mCurrentState == State.STARTING) {
+            failStartup("Syncthing startup did not complete within 60 seconds");
+        }
+    }
+
+    private void failStartup(String reason) {
+        mShutdownStartIntent.clear();
+        Log.e(TAG, reason);
+        if (mNotificationHandler != null) {
+            mNotificationHandler.showCrashedNotification(R.string.config_read_failed, reason);
+        }
+        if (mStartupReadiness != null) mStartupReadiness.cancel();
+        shutdown(State.ERROR, null, true);
+    }
+
+    private void handleRecoveryBlocked(
+            ExecutionOwnershipManager.RecoveryAssessment assessment
+    ) {
+        mShutdownStartIntent.clear();
+        if (mStartupReadiness != null) mStartupReadiness.cancel();
+        cancelStartupRequests();
+        mRestApi = null;
+        if (assessment != null && assessment.ownedExecution() != null) {
+            mOwnedExecution = assessment.ownedExecution();
+        } else {
+            mRecoveryRestApi = null;
+        }
+        synchronized (mStateLock) {
+            onServiceStateChange(State.ERROR);
+        }
+        if (mNotificationHandler != null) {
+            String evidence = assessment == null
+                    ? "unknown recovery evidence"
+                    : assessment.classification().toString();
+            mNotificationHandler.showCrashedNotification(
+                    R.string.notification_crash_title,
+                    "Syncthing recovery is blocked: " + evidence
+            );
+        }
+        clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+    }
+
+    private void handleUnexpectedLaunchFailure(Throwable error) {
+        mShutdownStartIntent.clear();
+        if (mStartupReadiness != null) mStartupReadiness.cancel();
+        cancelStartupRequests();
+        synchronized (mStateLock) {
+            if (mCurrentState == State.STARTING) onServiceStateChange(State.ERROR);
+        }
+        if (mNotificationHandler != null) {
+            mNotificationHandler.showCrashedNotification(
+                    R.string.executable_not_found,
+                    error.getMessage() == null ? Constants.FILENAME_SYNCTHING_BINARY : error.getMessage()
+            );
+        }
+        clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+    }
+
+    private void cancelStartupRequests() {
+        if (mPollWebGuiAvailableTask != null) {
+            mPollWebGuiAvailableTask.cancelRequestsAndCallback();
+            mPollWebGuiAvailableTask = null;
+        }
+        if (mEventProcessor != null) {
+            mEventProcessor.stop();
+            mEventProcessor = null;
+        }
+    }
+
+    private void startShutdownWorker(ExecutionIdentity identity, @Nullable RestApi restApi) {
+        if (!mShutdownInProgress || mShutdownWorkerStarted || identity == null) return;
+        mShutdownWorkerStarted = true;
+        try {
+            Thread worker = new Thread(() -> {
+                OwnedExecutionShutdown.Outcome outcome;
+                try {
+                    outcome = OwnedExecutionShutdown.stop(
+                            identity,
+                            () -> restApi == null ? null : restApi.prepareShutdown(),
+                            mRuntime,
+                            OwnedExecutionShutdown.processWaiter()
+                    );
+                    if (outcome == OwnedExecutionShutdown.Outcome.EXITED) {
+                        try {
+                            mRuntime.clearAfterExit(identity);
+                        } catch (IOException e) {
+                            Log.e(TAG, "Could not clear the exited Syncthing execution record", e);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    outcome = OwnedExecutionShutdown.Outcome.EXIT_NOT_PROVEN;
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Owned Syncthing shutdown failed", e);
+                    outcome = OwnedExecutionShutdown.Outcome.EXIT_NOT_PROVEN;
+                }
+                OwnedExecutionShutdown.Outcome result = outcome;
+                mHandler.post(() -> onShutdownOutcome(identity, result));
+            }, "Syncthing bounded shutdown");
+            worker.setDaemon(true);
+            worker.start();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not start owned Syncthing shutdown worker", e);
+            onShutdownOutcome(identity, OwnedExecutionShutdown.Outcome.EXIT_NOT_PROVEN);
+        }
+    }
+
+    private static boolean sameExecution(
+            @Nullable ExecutionIdentity first,
+            @Nullable ExecutionIdentity second
+    ) {
+        return first != null && second != null
+                && first.pid() == second.pid()
+                && first.processStartTimeTicks() == second.processStartTimeTicks()
+                && first.bootId().equals(second.bootId())
+                && first.executablePath().equals(second.executablePath())
+                && first.runToken().equals(second.runToken());
     }
 
     /**
@@ -655,6 +1127,7 @@ public class SyncthingService extends Service {
      * uncaught-exception path and does not mutate service state itself.</p>
      */
     private void handleSyncthingLaunchFailure() {
+        mShutdownStartIntent.clear();
         State terminalState;
         synchronized (mStateLock) {
             terminalState = SyncthingLaunchFailurePolicy.terminalState(mCurrentState);
@@ -662,12 +1135,42 @@ public class SyncthingService extends Service {
                 onServiceStateChange(terminalState);
             }
         }
-        // Admission failed before this runnable created an execution. Clear only the failed
-        // lifecycle handles so shutdown does not terminate the already-active invocation that
-        // caused admission to be rejected.
-        mSyncthingRunnable = null;
-        mSyncthingRunnableThread = null;
-        shutdown(terminalState);
+        if (mStartupReadiness != null) {
+            mStartupReadiness.cancel();
+            mStartupReadiness = null;
+        }
+        cancelStartupRequests();
+        // Admission rejection does not transfer ownership of the invocation that blocked launch.
+        clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+    }
+
+    /** Immutable result produced by the database reset worker. */
+    private static final class DatabaseResetOutcome {
+        enum Type { COMPLETED, FAILED }
+
+        private final Type type;
+        @Nullable private final Throwable failure;
+
+        private DatabaseResetOutcome(Type type, @Nullable Throwable failure) {
+            this.type = type;
+            this.failure = failure;
+        }
+
+        static DatabaseResetOutcome completed() {
+            return new DatabaseResetOutcome(Type.COMPLETED, null);
+        }
+
+        static DatabaseResetOutcome failed(Throwable failure) {
+            return new DatabaseResetOutcome(Type.FAILED, failure);
+        }
+
+        boolean succeeded() {
+            return type == Type.COMPLETED;
+        }
+
+        @Nullable Throwable failure() {
+            return failure;
+        }
     }
 
     /**
@@ -676,26 +1179,157 @@ public class SyncthingService extends Service {
      * or terminate the invocation that currently owns runtime admission.
      */
     private void requestResetDatabase(@Nullable Runnable afterReset) {
-        Runnable reset = () -> {
-            try {
-                new SyncthingRunnable(this, SyncthingCommand.RESET_DATABASE).run();
-            } catch (ExecutionAdmissionException e) {
-                Log.e(TAG, "Database reset rejected because another Syncthing invocation is active", e);
-                return;
-            }
-            if (afterReset != null) {
-                afterReset.run();
-            }
-        };
+        requestResetDatabase(
+                afterReset,
+                null,
+                DatabaseResetOwnership.ContinuationPolicy.AUTOMATIC_STARTUP
+        );
+    }
 
-        if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
-                mCurrentState,
-                mSyncthingRunnable != null
-        )) {
-            shutdown(State.DISABLED, reset);
-        } else {
-            reset.run();
+    private void requestResetDatabase(
+            @Nullable Runnable afterReset,
+            @Nullable Runnable onFailure
+    ) {
+        requestResetDatabase(
+                afterReset,
+                onFailure,
+                DatabaseResetOwnership.ContinuationPolicy.REQUIRED_OPERATION
+        );
+    }
+
+    private void requestResetDatabase(
+            @Nullable Runnable afterReset,
+            @Nullable Runnable onFailure,
+            DatabaseResetOwnership.ContinuationPolicy continuationPolicy
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (!mHandler.post(() -> requestResetDatabase(
+                    afterReset, onFailure, continuationPolicy
+            ))) {
+                Log.e(TAG, "Could not schedule database reset ownership on the service thread");
+                dispatchResetFailure(onFailure);
+            }
+            return;
         }
+        if (mDestroying) return;
+
+        DatabaseResetOwnership.Operation operation =
+                mDatabaseResetOwnership.reserve(afterReset, onFailure, continuationPolicy);
+        if (operation == null) {
+            Log.w(TAG, "Database reset rejected because another reset owns lifecycle admission");
+            dispatchResetFailure(onFailure);
+            return;
+        }
+
+        try {
+            RestApi recoveryApi = createRecoveryRestApiFromDisk();
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
+                    identity -> stopOwnedExecution(identity, recoveryApi);
+            Runnable reset = () -> startDatabaseResetWorker(operation, recoveryHandler);
+
+            if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
+                    mCurrentState,
+                    mSyncthingRunnable != null || mSyncthingRunnableThread != null,
+                    mShutdownInProgress
+            )) {
+                shutdown(State.DISABLED, reset);
+            } else {
+                reset.run();
+            }
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not begin database reset", e);
+            completeDatabaseReset(operation, DatabaseResetOutcome.failed(e));
+        }
+    }
+
+    private void startDatabaseResetWorker(
+            DatabaseResetOwnership.Operation operation,
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler
+    ) {
+        Thread resetWorker = new Thread(() -> {
+            DatabaseResetOutcome outcome;
+            try {
+                SyncthingRunnable.forOneShotWithRecovery(
+                        this,
+                        SyncthingCommand.RESET_DATABASE,
+                        recoveryHandler
+                ).run();
+                outcome = DatabaseResetOutcome.completed();
+            } catch (ExecutionAdmissionException e) {
+                Log.e(TAG, "Database reset rejected because another invocation owns admission", e);
+                outcome = DatabaseResetOutcome.failed(e);
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Database reset could not recover an exact execution", e);
+                if (mNotificationHandler != null) {
+                    mHandler.post(() -> mNotificationHandler.showCrashedNotification(
+                            R.string.notification_crash_title,
+                            "Database reset was blocked by Syncthing execution recovery"
+                    ));
+                }
+                outcome = DatabaseResetOutcome.failed(e);
+            }
+            DatabaseResetOutcome completedOutcome = outcome;
+            if (!mHandler.post(() -> completeDatabaseReset(operation, completedOutcome))) {
+                Log.e(TAG, "Database reset outcome could not return to the service thread");
+            }
+        }, "Syncthing database reset");
+        resetWorker.setDaemon(true);
+        try {
+            resetWorker.start();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Database reset worker could not start", e);
+            completeDatabaseReset(operation, DatabaseResetOutcome.failed(e));
+        }
+    }
+
+    private void completeDatabaseReset(
+            DatabaseResetOwnership.Operation operation,
+            DatabaseResetOutcome outcome
+    ) {
+        if (!mDatabaseResetOwnership.complete(operation)) return;
+        if (mDestroying) return;
+
+        if (outcome.succeeded()) {
+            try {
+                operation.runAfterReset();
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Database reset completion failed", e);
+                runResetFailureContinuation(operation);
+            }
+            return;
+        }
+
+        mShutdownStartIntent.clear();
+        Log.e(TAG, "Database reset failed", outcome.failure());
+        runResetFailureContinuation(operation);
+    }
+
+    private void runResetFailureContinuation(DatabaseResetOwnership.Operation operation) {
+        Runnable onFailure = operation.onFailure();
+        if (onFailure != null && !mDestroying) onFailure.run();
+    }
+
+    private void dispatchResetFailure(@Nullable Runnable onFailure) {
+        if (onFailure == null) return;
+        mHandler.post(SyncthingResetPolicy.afterResetUnlessDestroying(
+                () -> mDestroying,
+                onFailure
+        ));
+    }
+
+    @Nullable
+    private RestApi createRecoveryRestApiFromDisk() {
+        ConfigXml config = mConfig;
+        if (config == null) {
+            config = new ConfigXml(this);
+            try {
+                config.loadConfig();
+            } catch (ConfigXml.OpenConfigException e) {
+                Log.w(TAG, "Cannot load REST settings for execution recovery", e);
+                return null;
+            }
+        }
+        return createRecoveryRestApi(config);
     }
 
     @Override
@@ -710,6 +1344,13 @@ public class SyncthingService extends Service {
     @Override
     public void onDestroy() {
         Log.d(TAG, "onDestroy");
+        mDestroying = true;
+        revokeStartupLaunchPermit();
+        CertificateVerificationStopHandler certificateVerification =
+                mCertificateVerificationStopHandler;
+        if (certificateVerification != null) certificateVerification.onServiceDestroy();
+        mPostMutationStartupGate.cancel(mShutdownStartIntent);
+        failFileMutationBarrier();
         if (mRunConditionMonitor != null) {
             /**
              * Shut down the OnShouldRunChangedListener so we won't get interrupted by run
@@ -725,28 +1366,117 @@ public class SyncthingService extends Service {
             // are in State.INIT requiring an immediate shutdown of this service class.
             Log.i(TAG, "Shutting down syncthing binary due to missing storage permission.");
         }
-        shutdown(State.DISABLED);
+        shutdown(State.DISABLED, null, true);
         super.onDestroy();
     }
 
-    /**
-     * Stop SyncthingNative and all helpers like event processor and api handler.
-     * Sets {@link #mCurrentState} to newState.
-     * Performs a synchronous shutdown of the native binary.
-     */
     private void shutdown(State newState) {
         shutdown(newState, null);
     }
 
-    /**
-     * Shuts down the service-owned Syncthing invocation and runs a completion action only after
-     * the runnable has joined and runtime admission has been released.
-     */
     private void shutdown(State newState, @Nullable Runnable afterShutdown) {
-        if (mCurrentState == State.STARTING) {
+        shutdown(newState, afterShutdown, false);
+    }
+
+    /** Runs shutdown orchestration asynchronously; process waits never run on the service thread. */
+    private void shutdown(
+            State newState,
+            @Nullable Runnable afterShutdown,
+            boolean duringStartup
+    ) {
+        shutdown(newState, afterShutdown, duringStartup, false);
+    }
+
+    @FunctionalInterface
+    private interface StoppedFileMutation {
+        void run(Runnable releaseOwnership, boolean automaticStartupAllowed);
+    }
+
+    /** Reserves the shared mutation owner before shutdown and stopped-state file work begin. */
+    private void shutdownForFileMutation(
+            StoppedFileMutation afterMutation,
+            Runnable onRejected,
+            Runnable onShutdownFailure,
+            Runnable onLifecycleConflict
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (!mHandler.post(() -> shutdownForFileMutation(
+                    afterMutation, onRejected, onShutdownFailure, onLifecycleConflict
+            ))) {
+                onShutdownFailure.run();
+            }
+            return;
+        }
+
+        if (FileMutationBarrier.rejectIfShutdownContinuationPending(
+                mShutdownInProgress, mAfterShutdown != null, onLifecycleConflict
+        )) return;
+        if (mPostMutationStartupGate.rejectNewMutation(onRejected)) return;
+        if (mDatabaseResetOwnership.isReserved()) {
+            onRejected.run();
+            return;
+        }
+
+        FileMutationBarrier owner = FileMutationBarrier.reserveAsyncOwner(
+                mFileMutationBarrier,
+                onRejected,
+                onShutdownFailure,
+                onLifecycleConflict
+        );
+        if (owner == null) return;
+        try {
+            beginReservedAsyncMutation(
+                    owner,
+                    () -> mFileMutationBarrier = owner,
+                    () -> {
+                        owner.setAsyncMutation(() -> {
+                            boolean startupSuppressed = owner.clearDeferredStartIfSuppressed(
+                                    mShutdownStartIntent
+                            );
+                            afterMutation.run(
+                                    () -> releaseAsyncFileMutation(owner), !startupSuppressed
+                            );
+                        });
+                        shutdown(State.DISABLED, null);
+                    }
+            );
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not begin shutdown for HTTPS certificate mutation", e);
+            if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
+            owner.stopFailed();
+        }
+    }
+
+    private void releaseAsyncFileMutation(FileMutationBarrier owner) {
+        if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
+    }
+
+    /** Publishes certificate mutation ownership before beginning its asynchronous shutdown. */
+    static void beginReservedAsyncMutation(FileMutationBarrier owner, Runnable publishOwner,
+                                           Runnable beginShutdown) {
+        if (!owner.isAsyncOwner()) throw new IllegalArgumentException("Expected async owner");
+        publishOwner.run();
+        beginShutdown.run();
+    }
+
+    private void shutdown(
+            State newState,
+            @Nullable Runnable afterShutdown,
+            boolean duringStartup,
+            boolean mutationBeforeDeferredCompletion
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mHandler.post(() -> shutdown(
+                    newState, afterShutdown, duringStartup, mutationBeforeDeferredCompletion
+            ));
+            return;
+        }
+        revokeStartupLaunchPermit();
+        if (mCurrentState == State.STARTING && !duringStartup) {
+            mStartingShutdownDeferral.defer();
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
-                shutdown(newState, afterShutdown);
+                shutdown(newState, afterShutdown, false, mutationBeforeDeferredCompletion);
             }, 1000);
             return;
         }
@@ -755,53 +1485,434 @@ public class SyncthingService extends Service {
             onServiceStateChange(newState);
         }
 
-        if (mPollWebGuiAvailableTask != null) {
-            mPollWebGuiAvailableTask.cancelRequestsAndCallback();
-            mPollWebGuiAvailableTask = null;
+        if (mStartupReadiness != null) {
+            mStartupReadiness.cancel();
+            mStartupReadiness = null;
         }
-
-        if (mEventProcessor != null) {
-            mEventProcessor.stop();
-            mEventProcessor = null;
-        }
+        cancelStartupRequests();
 
         if (mNotificationHandler != null) {
             mNotificationHandler.cancelRestartNotification();
         }
 
-        if (mRestApi != null) {
-            if (mSyncthingRunnable != null) {
-                mRestApi.shutdown();
-            }
-            mRestApi = null;
+        RestApi restApi = mRestApi != null ? mRestApi : mRecoveryRestApi;
+        mRestApi = null;
+        mRecoveryRestApi = null;
+
+        if (mShutdownInProgress) {
+            mStartingShutdownDeferral.transferToShutdown();
+            mAfterShutdown = mutationBeforeDeferredCompletion
+                    ? FileMutationBarrier.mutationBeforeDeferredCompletion(
+                            afterShutdown, mAfterShutdown
+                    )
+                    : appendCompletion(mAfterShutdown, afterShutdown);
+            if (mShutdownRestApi == null) mShutdownRestApi = restApi;
+            return;
         }
 
-        if (mSyncthingRunnable != null) {
-            mRuntime.terminateBundledSyncthing();
-            Runnable afterExecutionExit = () -> {
-                Log.d(TAG, "Finished mSyncthingRunnableThread.");
-                mSyncthingRunnableThread = null;
-                mSyncthingRunnable = null;
-                if (afterShutdown != null) {
-                    afterShutdown.run();
-                }
-            };
-            if (mSyncthingRunnableThread != null) {
-                LogV("Waiting for mSyncthingRunnableThread to finish after killProcess(Syncthing) ...");
-                Thread syncthingRunnableThread = mSyncthingRunnableThread;
-                // Lifecycle handles and runtime admission stay owned until the runnable thread
-                // has really terminated, so an interruption only cancels the current join attempt.
-                TerminationWait.awaitTermination(
-                        syncthingRunnableThread::join,
-                        afterExecutionExit,
-                        () -> Log.w(TAG, "mSyncthingRunnableThread InterruptedException")
-                );
-            } else {
-                afterExecutionExit.run();
+        mShutdownInProgress = true;
+        mStartingShutdownDeferral.transferToShutdown();
+        mShutdownExitProven = mLastExecutionExitProven;
+        mShutdownWorkerStarted = false;
+        mShutdownRecoveryCheckStarted = false;
+        mShutdownRestApi = restApi;
+        mAfterShutdown = afterShutdown;
+
+        if (mOwnedExecution != null) {
+            startShutdownWorker(mOwnedExecution, restApi);
+        } else if (mSyncthingRunnableThread != null) {
+            if (duringStartup || mDestroying) mSyncthingRunnableThread.interrupt();
+            if (mShutdownExitProven && !mSyncthingRunnableThread.isAlive()) {
+                checkShutdownRecovery();
             }
-        } else if (afterShutdown != null) {
-            afterShutdown.run();
+        } else {
+            mShutdownExitProven = true;
+            checkShutdownRecovery();
         }
+    }
+
+    /** Revokes a startup worker before a stop request can defer behind its current state. */
+    private void revokeStartupLaunchPermit() {
+        if (mStartupLaunchPermit != null) mStartupLaunchPermit.revoke();
+    }
+
+    private void cancelActionResetDeltasContinuation() {
+        ActionResetDeltasContinuation continuation = mActionResetDeltasContinuation;
+        if (continuation == null) return;
+        continuation.cancel();
+        if (mActionResetDeltasContinuation == continuation) {
+            mActionResetDeltasContinuation = null;
+        }
+    }
+
+    private void onShutdownOutcome(
+            ExecutionIdentity identity,
+            OwnedExecutionShutdown.Outcome outcome
+    ) {
+        if (!mShutdownInProgress) return;
+        mShutdownWorkerStarted = false;
+        if (outcome == OwnedExecutionShutdown.Outcome.EXITED) {
+            mShutdownExitProven = true;
+            mLastExecutionExitProven = true;
+            if (sameExecution(mOwnedExecution, identity)) mOwnedExecution = null;
+            clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+            checkShutdownRecovery();
+            return;
+        }
+
+        Log.e(TAG, "Could not prove the owned Syncthing execution exited: " + outcome);
+        mShutdownStartIntent.clear();
+        mShutdownInProgress = false;
+        mAfterShutdown = null;
+        mShutdownRestApi = null;
+        failFileMutationBarrier();
+        synchronized (mStateLock) {
+            if (mCurrentState != State.ERROR) onServiceStateChange(State.ERROR);
+        }
+        DatabaseResetOwnership.Operation resetOperation =
+                mDatabaseResetOwnership.currentOperation();
+        if (resetOperation != null) {
+            completeDatabaseReset(resetOperation, DatabaseResetOutcome.failed(
+                    new IllegalStateException("Owned execution shutdown could not be proven")
+            ));
+        }
+    }
+
+    /** Reclassifies after exit so no callback can mutate state while another candidate remains. */
+    private void checkShutdownRecovery() {
+        if (!mShutdownInProgress || !mShutdownExitProven || mShutdownRecoveryCheckStarted) return;
+        Thread lifecycleThread = mSyncthingRunnableThread;
+        boolean started = LifecycleShutdownBarrier.runWhenReady(
+                mShutdownExitProven,
+                lifecycleThread,
+                () -> clearWorkerHandlesIfStopped(lifecycleThread),
+                this::startShutdownRecoveryCheck
+        );
+        if (!started) {
+            mHandler.postDelayed(this::checkShutdownRecovery, 25);
+        }
+    }
+
+    private void startShutdownRecoveryCheck() {
+        mShutdownRecoveryCheckStarted = true;
+        RestApi recoveryApi = mShutdownRestApi;
+        try {
+            Thread recoveryCheck = new Thread(() -> {
+                boolean launchPermitted = false;
+                ExecutionOwnershipManager.RecoveryAssessment assessment = null;
+                try {
+                    assessment = mRuntime.recoverExecutions();
+                    if (assessment.classification()
+                            == ExecutionOwnershipManager.Classification.OWNED_EXECUTION) {
+                        ExecutionIdentity identity = assessment.ownedExecution();
+                        OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
+                                identity,
+                                () -> recoveryApi == null ? null : recoveryApi.prepareShutdown(),
+                                mRuntime,
+                                OwnedExecutionShutdown.processWaiter()
+                        );
+                        if (outcome == OwnedExecutionShutdown.Outcome.EXITED) {
+                            try {
+                                mRuntime.clearAfterExit(identity);
+                            } catch (IOException e) {
+                                Log.e(TAG, "Could not clear recovered execution record", e);
+                            }
+                            assessment = mRuntime.recoverExecutions();
+                        }
+                    }
+                    launchPermitted = assessment != null && assessment.mayLaunch();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    Log.w(TAG, "Post-shutdown recovery check was interrupted", e);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not classify executions after shutdown", e);
+                }
+                boolean permitted = launchPermitted;
+                ExecutionOwnershipManager.RecoveryAssessment result = assessment;
+                mHandler.post(() -> onShutdownRecoveryChecked(permitted, result));
+            }, "Syncthing post-shutdown recovery check");
+            recoveryCheck.setDaemon(true);
+            recoveryCheck.start();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not start post-shutdown recovery check", e);
+            mShutdownRecoveryCheckStarted = false;
+            onShutdownRecoveryChecked(false, null);
+        }
+    }
+
+    private void onShutdownRecoveryChecked(
+            boolean launchPermitted,
+            @Nullable ExecutionOwnershipManager.RecoveryAssessment assessment
+    ) {
+        if (!mShutdownInProgress) return;
+        if (!launchPermitted) {
+            mShutdownStartIntent.clear();
+            Log.e(TAG, "Shutdown completed but recovery remains blocked: "
+                    + (assessment == null ? "unknown" : assessment.classification()));
+            mShutdownInProgress = false;
+            mShutdownRecoveryCheckStarted = false;
+            mAfterShutdown = null;
+            mShutdownRestApi = null;
+            failFileMutationBarrier();
+            synchronized (mStateLock) {
+                if (mCurrentState != State.ERROR) onServiceStateChange(State.ERROR);
+            }
+            DatabaseResetOwnership.Operation resetOperation =
+                    mDatabaseResetOwnership.currentOperation();
+            if (resetOperation != null) {
+                completeDatabaseReset(resetOperation, DatabaseResetOutcome.failed(
+                        new IllegalStateException("Execution recovery did not permit replacement")
+                ));
+            }
+            return;
+        }
+
+        Runnable completion = mAfterShutdown;
+        mAfterShutdown = null;
+        mShutdownRestApi = null;
+        mShutdownInProgress = false;
+        mShutdownRecoveryCheckStarted = false;
+        mOwnedExecution = null;
+        if (mDestroying) {
+            failFileMutationBarrier();
+            return;
+        }
+        Log.d(TAG, "Finished the owned Syncthing lifecycle execution.");
+        if (mFileMutationBarrier != null) {
+            FileMutationBarrier barrier = mFileMutationBarrier;
+            // A continuation added while shutdown was pending is opaque and may claim runtime
+            // admission. Fail the mutation before releasing its waiter, then honor that work.
+            if (FileMutationBarrier.rejectMutationForDeferredCompletion(barrier, completion)) {
+                mFileMutationBarrier = null;
+                runShutdownCompletion(completion);
+                return;
+            }
+            if (barrier.isAsyncOwner()) {
+                Runnable asyncCompletion = barrier.completeAsyncOwner();
+                if (asyncCompletion != null) {
+                    try {
+                        runShutdownCompletion(asyncCompletion);
+                    } catch (RuntimeException e) {
+                        Log.e(TAG, "Asynchronous file mutation could not complete", e);
+                        failFileMutationBarrier();
+                    }
+                }
+            } else {
+                barrier.stopCompleted(completion);
+                if (barrier.isAbandoned()) completeAbandonedFileMutation(barrier);
+            }
+            return;
+        }
+        runShutdownCompletion(completion);
+    }
+
+    private void clearWorkerHandlesWhenStopped(@Nullable Thread lifecycleThread) {
+        if (lifecycleThread == null) return;
+        if (lifecycleThread.isAlive()) {
+            mHandler.postDelayed(() -> clearWorkerHandlesWhenStopped(lifecycleThread), 25);
+            return;
+        }
+        clearWorkerHandlesIfStopped(lifecycleThread);
+        if (mShutdownInProgress && mShutdownExitProven) checkShutdownRecovery();
+    }
+
+    private void clearWorkerHandlesIfStopped(@Nullable Thread lifecycleThread) {
+        if (lifecycleThread == null || lifecycleThread.isAlive()) return;
+        if (mSyncthingRunnableThread == lifecycleThread) {
+            mSyncthingRunnableThread = null;
+            mSyncthingRunnable = null;
+        }
+    }
+
+    private void runShutdownCompletion(@Nullable Runnable completion) {
+        boolean executionExitProven = mShutdownExitProven;
+        if (completion != null) {
+            completion.run();
+        }
+        if (mPostMutationStartupGate.consumeDeferredStart(
+                mShutdownStartIntent,
+                mLastDeterminedShouldRun,
+                executionExitProven,
+                true,
+                mCurrentState == State.DISABLED
+                        && mOwnedExecution == null
+                        && mSyncthingRunnable == null
+                        && mSyncthingRunnableThread == null
+                        && mDatabaseResetOwnership.canStartLifecycle(),
+                mDestroying
+        )) {
+            launchStartupTask(SyncthingCommand.SERVE);
+        }
+    }
+
+    private void failFileMutationBarrier() {
+        if (mFileMutationBarrier == null) return;
+        FileMutationBarrier barrier = mFileMutationBarrier;
+        mFileMutationBarrier = null;
+        barrier.stopFailed();
+    }
+
+    @Nullable
+    private static Runnable appendCompletion(
+            @Nullable Runnable first,
+            @Nullable Runnable second
+    ) {
+        if (first == null) return second;
+        if (second == null) return first;
+        return () -> {
+            first.run();
+            second.run();
+        };
+    }
+
+    /** Waits off the service thread before backup/import code touches files used by Syncthing. */
+    private boolean shutdownForFileMutation() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.e(TAG, "File mutation was requested on the service thread");
+            return false;
+        }
+        FileMutationBarrier barrier = new FileMutationBarrier();
+        boolean posted = mHandler.post(() -> {
+            if (mDestroying || mFileMutationBarrier != null) {
+                barrier.stopFailed();
+                return;
+            }
+            if (mPostMutationStartupGate.rejectNewMutation(barrier::stopFailed)) return;
+            if (mDatabaseResetOwnership.isReserved()) {
+                barrier.stopFailed();
+                return;
+            }
+            if (FileMutationBarrier.rejectIfShutdownContinuationPending(
+                    mShutdownInProgress,
+                    mAfterShutdown != null,
+                    barrier::stopFailed
+            )) {
+                Log.w(TAG, "Rejecting file mutation while a shutdown continuation is pending");
+                return;
+            }
+            boolean lifecycleHandlePresent = mSyncthingRunnableThread != null
+                    || mSyncthingRunnable != null;
+            if (FileMutationBarrier.rejectIfNoSafeShutdownPath(
+                    lifecycleHandlePresent,
+                    mOwnedExecution != null,
+                    mLastExecutionExitProven,
+                    barrier::stopFailed
+            )) return;
+            try {
+                mFileMutationBarrier = barrier;
+                if (mRestApi == null && mRecoveryRestApi == null) {
+                    mRecoveryRestApi = createRecoveryRestApiFromDisk();
+                }
+                shutdown(State.DISABLED, null, true);
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Could not begin shutdown for file mutation", e);
+                if (mFileMutationBarrier == barrier) mFileMutationBarrier = null;
+                barrier.stopFailed();
+            }
+        });
+        if (!posted) barrier.stopFailed();
+        boolean safeToMutate = barrier.awaitSafeToMutate();
+        if (!safeToMutate) {
+            mHandler.post(() -> releaseFailedFileMutationWait(barrier));
+        }
+        return safeToMutate;
+    }
+
+    private void releaseFailedFileMutationWait(FileMutationBarrier barrier) {
+        if (mFileMutationBarrier != barrier) return;
+        barrier.abandon();
+        if (mShutdownInProgress) return;
+        completeAbandonedFileMutation(barrier);
+    }
+
+    /** Finishes shutdown for an interrupted file caller without permitting its file writes. */
+    private void completeAbandonedFileMutation(FileMutationBarrier barrier) {
+        if (mFileMutationBarrier != barrier) return;
+        boolean destroying = mDestroying;
+        Runnable deferred = finishAbandonedFileMutation(
+                barrier, mShutdownStartIntent, mLastDeterminedShouldRun, destroying
+        );
+        mFileMutationBarrier = null;
+        if (destroying) return;
+        runShutdownCompletion(deferred);
+    }
+
+    /**
+     * Applies the stopped-state policy for an interrupted file mutation. When this mutation still
+     * permits an automatic start, its Run Conditions start is deferred exactly once; explicit STOP
+     * suppression clears any deferred start instead. Returns the shutdown continuation that must run
+     * after the barrier is released, or {@code null} while the service is being destroyed.
+     */
+    static @Nullable Runnable finishAbandonedFileMutation(
+            FileMutationBarrier barrier,
+            ShutdownStartIntent startIntent,
+            boolean shouldRunNow,
+            boolean destroying
+    ) {
+        if (barrier.shouldAutomaticallyStartAfterMutation(shouldRunNow)) {
+            startIntent.onRunConditionChanged(true, true);
+        }
+        barrier.clearDeferredStartIfSuppressed(startIntent);
+        Runnable deferred = barrier.takeAfterMutation();
+        return destroying ? null : deferred;
+    }
+
+    /** Releases a file-mutation barrier and runs any deferred completion on the service thread. */
+    private void finishFileMutation(
+            @Nullable Runnable afterMutation,
+            boolean evaluateRunConditions
+    ) {
+        finishFileMutation(afterMutation, evaluateRunConditions, false);
+    }
+
+    private void finishFileMutation(
+            @Nullable Runnable afterMutation,
+            boolean evaluateRunConditions,
+            boolean operationOwnsStartup
+    ) {
+        mHandler.post(() -> {
+            FileMutationBarrier barrier = mFileMutationBarrier;
+            if (barrier == null) return;
+            boolean startupSuppressed = barrier.clearDeferredStartIfSuppressed(
+                    mShutdownStartIntent
+            );
+            mFileMutationBarrier = null;
+            if (mDestroying) return;
+
+            if (operationOwnsStartup) {
+                mPostMutationStartupGate.beginOperation(!startupSuppressed);
+            }
+
+            Runnable deferred = barrier.takeAfterMutation();
+            runShutdownCompletion(deferred);
+            if (afterMutation != null) {
+                try {
+                    afterMutation.run();
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Post-mutation lifecycle continuation failed", e);
+                    if (operationOwnsStartup) failImportLifecycle();
+                }
+            }
+            if (deferred == null && afterMutation == null && evaluateRunConditions
+                    && mCurrentState == State.DISABLED
+                    && barrier.shouldAutomaticallyStartAfterMutation(
+                            mLastDeterminedShouldRun
+                    )) {
+                launchStartupTask(SyncthingCommand.SERVE);
+            }
+        });
+    }
+
+    private void completeImportLifecycle() {
+        mPostMutationStartupGate.completeOperation(
+                mShutdownStartIntent,
+                mLastDeterminedShouldRun,
+                () -> launchStartupTask(SyncthingCommand.SERVE)
+        );
+    }
+
+    private void failImportLifecycle() {
+        mPostMutationStartupGate.cancel(mShutdownStartIntent);
     }
 
     public @Nullable
@@ -913,117 +2024,106 @@ public class SyncthingService extends Service {
         Boolean failSuccess = true;
         Log.d(TAG, "exportConfig BEGIN");
 
-        if (mCurrentState != State.DISABLED) {
-            // Shutdown synchronously.
-            shutdown(State.DISABLED);
-        }
+        if (!shutdownForFileMutation()) return false;
+        try {
 
         // Create export dir if non-existant.
-        File targetZip = getBackupZipFile();
-        targetZip.getParentFile().mkdirs();
+            File targetZip = getBackupZipFile();
+            targetZip.getParentFile().mkdirs();
 
-        // Export SharedPreferences.
-        File sharedPreferencesFile = null;
-        FileOutputStream fileOutputStream = null;
-        ObjectOutputStream objectOutputStream = null;
-        try {
-            sharedPreferencesFile = Constants.getSharedPrefsFile(this);
-            fileOutputStream = new FileOutputStream(sharedPreferencesFile);
-            if (!sharedPreferencesFile.exists()) {
-                sharedPreferencesFile.createNewFile();
-            }
-            objectOutputStream = new ObjectOutputStream(fileOutputStream);
-            objectOutputStream.writeObject(mPreferences.getAll());
-            objectOutputStream.flush();
-            fileOutputStream.flush();
-        } catch (IOException e) {
-            Log.e(TAG, "exportConfig: Failed to export SharedPreferences #1", e);
-            failSuccess = false;
-        } finally {
+            // Export SharedPreferences.
+            File sharedPreferencesFile = null;
+            FileOutputStream fileOutputStream = null;
+            ObjectOutputStream objectOutputStream = null;
             try {
-                if (objectOutputStream != null) {
-                    objectOutputStream.close();
+                sharedPreferencesFile = Constants.getSharedPrefsFile(this);
+                fileOutputStream = new FileOutputStream(sharedPreferencesFile);
+                if (!sharedPreferencesFile.exists()) {
+                    sharedPreferencesFile.createNewFile();
                 }
-                if (fileOutputStream != null) {
-                    fileOutputStream.close();
-                }
+                objectOutputStream = new ObjectOutputStream(fileOutputStream);
+                objectOutputStream.writeObject(mPreferences.getAll());
+                objectOutputStream.flush();
+                fileOutputStream.flush();
             } catch (IOException e) {
-                Log.e(TAG, "exportConfig: Failed to export SharedPreferences #2", e);
+                Log.e(TAG, "exportConfig: Failed to export SharedPreferences #1", e);
+                failSuccess = false;
+            } finally {
+                try {
+                    if (objectOutputStream != null) {
+                        objectOutputStream.close();
+                    }
+                    if (fileOutputStream != null) {
+                        fileOutputStream.close();
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "exportConfig: Failed to export SharedPreferences #2", e);
+                }
             }
-        }
 
-        // Make a list of files to backup.
-        List<File> includePaths = Arrays.asList(
-            Constants.getConfigFile(this),
+            // Make a list of files to backup.
+            List<File> includePaths = Arrays.asList(
+                Constants.getConfigFile(this),
 
-            Constants.getPrivateKeyFile(this),
-            Constants.getPublicKeyFile(this),
+                Constants.getPrivateKeyFile(this),
+                Constants.getPublicKeyFile(this),
 
-            Constants.getHttpsCertFile(this),
-            Constants.getHttpsKeyFile(this),
+                Constants.getHttpsCertFile(this),
+                Constants.getHttpsKeyFile(this),
 
-            Constants.getSharedPrefsFile(this),
+                Constants.getSharedPrefsFile(this),
 
-            Constants.getIndexDbFolder(this)
-        );
+                Constants.getIndexDbFolder(this)
+            );
 
-        // If user set one, apply a password and encrypt the zip file.
-        String zipEncryptionPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
+            // If user set one, apply a password and encrypt the zip file.
+            String zipEncryptionPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
 
-        // Compress files to zip file.
-        try {
-            // Delete existing ZIP file to ensure we create a fresh archive instead of appending
-            if (targetZip.exists()) {
-                targetZip.delete();
-            }
+            // Compress files to zip file.
+            try {
+                // Delete existing ZIP file to ensure we create a fresh archive instead of appending
+                if (targetZip.exists()) {
+                    targetZip.delete();
+                }
             
-            ZipParameters parameters = new ZipParameters();
-            parameters.setCompressionMethod(CompressionMethod.DEFLATE);
-            parameters.setCompressionLevel(CompressionLevel.NORMAL);
+                ZipParameters parameters = new ZipParameters();
+                parameters.setCompressionMethod(CompressionMethod.DEFLATE);
+                parameters.setCompressionLevel(CompressionLevel.NORMAL);
 
-            ZipFile zipFile;
-            if (zipEncryptionPassword.isEmpty()) {
-                zipFile = new ZipFile(targetZip);
-                parameters.setEncryptFiles(false);
-            } else {
-                zipFile = new ZipFile(targetZip, zipEncryptionPassword.toCharArray());
-                parameters.setEncryptFiles(true);
-                parameters.setEncryptionMethod(EncryptionMethod.AES);
-                parameters.setAesKeyStrength(AesKeyStrength.KEY_STRENGTH_256);
-            }
+                ZipFile zipFile;
+                if (zipEncryptionPassword.isEmpty()) {
+                    zipFile = new ZipFile(targetZip);
+                    parameters.setEncryptFiles(false);
+                } else {
+                    zipFile = new ZipFile(targetZip, zipEncryptionPassword.toCharArray());
+                    parameters.setEncryptFiles(true);
+                    parameters.setEncryptionMethod(EncryptionMethod.AES);
+                    parameters.setAesKeyStrength(AesKeyStrength.KEY_STRENGTH_256);
+                }
 
-            // Add files.
-            for (File includePath : includePaths) {
-                if (includePath.exists()) {
-                    if (includePath.isFile()) {
-                        zipFile.addFile(includePath, parameters);
-                    } else if (includePath.isDirectory()) {
-                        zipFile.addFolder(includePath, parameters);
+                // Add files.
+                for (File includePath : includePaths) {
+                    if (includePath.exists()) {
+                        if (includePath.isFile()) {
+                            zipFile.addFile(includePath, parameters);
+                        } else if (includePath.isDirectory()) {
+                            zipFile.addFolder(includePath, parameters);
+                        }
                     }
                 }
-            }
 
-            if (sharedPreferencesFile != null && sharedPreferencesFile.exists()) {
-                sharedPreferencesFile.delete();
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "exportConfig: Failed to export config, " + e.getMessage());
-            failSuccess = false;
-        }
-        Log.d(TAG, "exportConfig END");
-
-        // Start syncthing after export if run conditions apply.
-        if (mLastDeterminedShouldRun) {
-            Handler mainLooper = new Handler(Looper.getMainLooper());
-            Runnable launchStartupTaskRunnable = new Runnable() {
-                @Override
-                public void run() {
-                    launchStartupTask(SyncthingCommand.SERVE);
+                if (sharedPreferencesFile != null && sharedPreferencesFile.exists()) {
+                    sharedPreferencesFile.delete();
                 }
-            };
-            mainLooper.post(launchStartupTaskRunnable);
+            } catch (Exception e) {
+                Log.w(TAG, "exportConfig: Failed to export config, " + e.getMessage());
+                failSuccess = false;
+            }
+            Log.d(TAG, "exportConfig END");
+            return failSuccess;
+        } finally {
+            finishFileMutation(null, true);
         }
-        return failSuccess;
     }
 
     /**
@@ -1085,75 +2185,83 @@ public class SyncthingService extends Service {
         // Shutdown SyncthingNative.
         Boolean failSuccess = true;
         Log.d(TAG, "importConfig BEGIN");
-        if (mCurrentState != State.DISABLED) {
-            // Shutdown synchronously.
-            shutdown(State.DISABLED);
-        }
-
-        // Remove database folder if it exists.
-        File databasePath = Constants.getIndexDbFolder(this);
-        if (databasePath.exists()) {
-            Log.d(TAG, "importConfig: Clearing index database");
-            try {
-                FileUtils.deleteDirectoryRecursively(databasePath);
-            } catch (IOException e) {
-                Log.e(TAG, "Failed to delete directory '" + databasePath.getAbsolutePath() + "'" + e);
-            }
-        }
-
-        // Decompress zip file.
-        try {
-            zipFile.extractAll(this.getFilesDir().getAbsolutePath());
-        } catch (ZipException e) {
-            Log.e(TAG, "importConfig: Failed to extract zip, " + e.getMessage());
-            failSuccess = false;
-        }
-
-        // Check if necessary files are present after extraction.
-        List<File> checkPaths = Arrays.asList(
-            Constants.getConfigFile(this),
-
-            Constants.getPrivateKeyFile(this),
-            Constants.getPublicKeyFile(this),
-
-            Constants.getHttpsCertFile(this),
-            Constants.getHttpsKeyFile(this),
-
-            Constants.getSharedPrefsFile(this)
-        );
-        for (final File checkPath : checkPaths) {
-            if (!checkPath.exists()) {
-                Log.e(TAG, "importConfig: Missing file after extraction [" + checkPath.getName() + "]");
-                failSuccess = false;
-            }
-        }
-        
-        // Import shared preferences.
-        File sharedPreferencesFile = Constants.getSharedPrefsFile(this);
-        if (sharedPreferencesFile.exists()) {
-            Log.d(TAG, "importConfig: Importing shared preferences");
-            failSuccess = failSuccess && importConfigSharedPrefs(sharedPreferencesFile);
-            sharedPreferencesFile.delete();
-        }
-
-        Runnable startAfterImport = SyncthingResetPolicy.relaunchAfterReset(
-                () -> mLastDeterminedShouldRun,
-                () -> postServeStartupIfNeeded(true)
-        );
+        if (!shutdownForFileMutation()) return false;
+        Runnable afterImport = null;
         boolean resetRequested = false;
         try {
-            resetRequested = cleanupImportedFolderDatabases(
-                    startAfterImport
-            );
-        } catch (Exception e) {
-            Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e);
-        }
 
-        // Start syncthing after import if run conditions apply.
-        if (!resetRequested) {
-            startAfterImport.run();
+        // Remove database folder if it exists.
+            File databasePath = Constants.getIndexDbFolder(this);
+            if (databasePath.exists()) {
+                Log.d(TAG, "importConfig: Clearing index database");
+                try {
+                    FileUtils.deleteDirectoryRecursively(databasePath);
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to delete directory '" + databasePath.getAbsolutePath() + "'" + e);
+                }
+            }
+
+            // Decompress zip file.
+            try {
+                zipFile.extractAll(this.getFilesDir().getAbsolutePath());
+            } catch (ZipException e) {
+                Log.e(TAG, "importConfig: Failed to extract zip, " + e.getMessage());
+                failSuccess = false;
+            }
+
+            // Check if necessary files are present after extraction.
+            List<File> checkPaths = Arrays.asList(
+                Constants.getConfigFile(this),
+
+                Constants.getPrivateKeyFile(this),
+                Constants.getPublicKeyFile(this),
+
+                Constants.getHttpsCertFile(this),
+                Constants.getHttpsKeyFile(this),
+
+                Constants.getSharedPrefsFile(this)
+            );
+            for (final File checkPath : checkPaths) {
+                if (!checkPath.exists()) {
+                    Log.e(TAG, "importConfig: Missing file after extraction [" + checkPath.getName() + "]");
+                    failSuccess = false;
+                }
+            }
+        
+            // Import shared preferences.
+            File sharedPreferencesFile = Constants.getSharedPrefsFile(this);
+            if (sharedPreferencesFile.exists()) {
+                Log.d(TAG, "importConfig: Importing shared preferences");
+                failSuccess = failSuccess && importConfigSharedPrefs(sharedPreferencesFile);
+                sharedPreferencesFile.delete();
+            }
+
+            try {
+                resetRequested = cleanupImportedFolderDatabases();
+            } catch (Exception e) {
+                Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e);
+            }
+
+            if (resetRequested) {
+                afterImport = () -> requestResetDatabase(
+                        this::completeImportLifecycle,
+                        this::failImportLifecycle
+                );
+            } else {
+                afterImport = this::completeImportLifecycle;
+            }
+            return failSuccess;
+        } finally {
+            finishFileMutation(importCompletionOrFailure(
+                    afterImport, failSuccess, this::failImportLifecycle
+            ), false, true);
         }
-        return failSuccess;
+    }
+
+    /** Failed imports release lifecycle ownership without starting from partial managed state. */
+    static Runnable importCompletionOrFailure(@Nullable Runnable completion, boolean succeeded,
+                                              Runnable failure) {
+        return succeeded && completion != null ? completion : failure;
     }
 
     /**
@@ -1161,6 +2269,12 @@ public class SyncthingService extends Service {
      * a terminal state (e.g. the binary crashed via a path that doesn't transition to ERROR).
      */
     private static final long HTTPS_CERT_VERIFY_TIMEOUT_MS = 30000;
+    private static final String FILE_MUTATION_IN_PROGRESS_MESSAGE =
+            "Another file mutation is already in progress.";
+    private static final String CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE =
+            "Could not safely stop Syncthing before changing its HTTPS certificate.";
+    private static final String CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE =
+            "Cannot change the HTTPS certificate while a Syncthing lifecycle operation is pending.";
 
     /**
      * Replaces the Web GUI HTTPS certificate and key with the supplied PEM bytes, then restarts
@@ -1186,7 +2300,12 @@ public class SyncthingService extends Service {
 
     private void doReplaceHttpsCertificate(byte[] certPem, byte[] keyPem,
                                            OnHttpsCertReplaceResultListener listener) {
-        // shutdown() defers while STARTING; wait it out so our file writes don't race the binary.
+        if (FileMutationBarrier.rejectConcurrentMutation(
+                mFileMutationBarrier,
+                () -> listener.onResult(
+                        HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                )
+        )) return;
         if (mCurrentState == State.STARTING) {
             mHandler.postDelayed(() -> doReplaceHttpsCertificate(certPem, keyPem, listener), 1000);
             return;
@@ -1194,34 +2313,60 @@ public class SyncthingService extends Service {
 
         final File certFile = Constants.getHttpsCertFile(this);
         final File keyFile = Constants.getHttpsKeyFile(this);
+        StoppedFileMutation replaceFiles = (releaseOwnership, automaticStartupAllowed) -> {
+            final boolean certExistedBeforeChange = certFile.exists();
+            final boolean keyExistedBeforeChange = keyFile.exists();
+            final File certBak = backupFile(certFile);
+            final File keyBak = backupFile(keyFile);
 
-        // Stop the binary so it releases the cert/key before we overwrite them.
-        if (mCurrentState != State.DISABLED) {
-            shutdown(State.DISABLED);
-        }
-
-        final File certBak = backupFile(certFile);
-        final File keyBak = backupFile(keyFile);
-
-        try {
-            writeBytesAtomic(certFile, certPem);
-            writeBytesAtomic(keyFile, keyPem);
-            restrictToOwner(keyFile);
-        } catch (IOException e) {
-            Log.e(TAG, "doReplaceHttpsCertificate: Failed to write new cert/key", e);
-            restoreFile(certBak, certFile);
-            restoreFile(keyBak, keyFile);
-            if (mLastDeterminedShouldRun) {
-                launchStartupTask(SyncthingCommand.SERVE);
+            try {
+                writeBytesAtomic(certFile, certPem);
+                writeBytesAtomic(keyFile, keyPem);
+                restrictToOwner(keyFile);
+            } catch (IOException e) {
+                Log.e(TAG, "doReplaceHttpsCertificate: Failed to write new cert/key", e);
+                restoreFile(certBak, certFile);
+                restoreFile(keyBak, keyFile);
+                if (releaseOwnership != null) releaseOwnership.run();
+                if (automaticStartupAllowed && mLastDeterminedShouldRun) {
+                    launchStartupTask(SyncthingCommand.SERVE);
+                }
+                listener.onResult(HttpsCertReplaceResult.FAILED, e.getMessage());
+                return;
             }
-            listener.onResult(HttpsCertReplaceResult.FAILED, e.getMessage());
-            return;
-        }
 
-        applyCertChangeWithVerify(certFile, keyFile, certBak, keyBak, listener);
+            if (releaseOwnership != null) releaseOwnership.run();
+            applyCertChangeWithVerify(
+                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
+                    certExistedBeforeChange, keyExistedBeforeChange
+            );
+        };
+
+        if (hasServiceExecution()) {
+            shutdownForFileMutation(
+                    replaceFiles,
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                    ),
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
+                    ),
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
+                    )
+            );
+        } else {
+            replaceFiles.run(null, true);
+        }
     }
 
     private void doResetHttpsCertificate(OnHttpsCertReplaceResultListener listener) {
+        if (FileMutationBarrier.rejectConcurrentMutation(
+                mFileMutationBarrier,
+                () -> listener.onResult(
+                        HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                )
+        )) return;
         if (mCurrentState == State.STARTING) {
             mHandler.postDelayed(() -> doResetHttpsCertificate(listener), 1000);
             return;
@@ -1230,24 +2375,64 @@ public class SyncthingService extends Service {
         final File certFile = Constants.getHttpsCertFile(this);
         final File keyFile = Constants.getHttpsKeyFile(this);
 
-        if (mCurrentState != State.DISABLED) {
-            shutdown(State.DISABLED);
+        StoppedFileMutation resetFiles = (releaseOwnership, automaticStartupAllowed) -> {
+            final boolean certExistedBeforeChange = certFile.exists();
+            final boolean keyExistedBeforeChange = keyFile.exists();
+            final File certBak = backupFile(certFile);
+            final File keyBak = backupFile(keyFile);
+            // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
+            deleteQuietly(certFile);
+            deleteQuietly(keyFile);
+            if (releaseOwnership != null) releaseOwnership.run();
+            applyCertChangeWithVerify(
+                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
+                    certExistedBeforeChange, keyExistedBeforeChange
+            );
+        };
+
+        if (hasServiceExecution()) {
+            shutdownForFileMutation(
+                    resetFiles,
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                    ),
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
+                    ),
+                    () -> listener.onResult(
+                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
+                    )
+            );
+        } else {
+            resetFiles.run(null, true);
         }
+    }
 
-        final File certBak = backupFile(certFile);
-        final File keyBak = backupFile(keyFile);
-        // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
-        deleteQuietly(certFile);
-        deleteQuietly(keyFile);
-
-        applyCertChangeWithVerify(certFile, keyFile, certBak, keyBak, listener);
+    private boolean hasServiceExecution() {
+        boolean serviceExecution = mShutdownInProgress
+                || mFileMutationBarrier != null
+                || mCurrentState != State.DISABLED
+                || mOwnedExecution != null
+                || mSyncthingRunnable != null
+                || mSyncthingRunnableThread != null;
+        return SyncthingResetPolicy.certificateMutationRequiresShutdown(
+                serviceExecution,
+                mPostMutationStartupGate.ownsStartup(),
+                mDatabaseResetOwnership.isReserved()
+        );
     }
 
     private void applyCertChangeWithVerify(File certFile, File keyFile,
                                            @Nullable File certBak, @Nullable File keyBak,
-                                           OnHttpsCertReplaceResultListener listener) {
-        if (mLastDeterminedShouldRun) {
-            verifyRestartAndRollback(certFile, keyFile, certBak, keyBak, listener);
+                                           OnHttpsCertReplaceResultListener listener,
+                                           boolean automaticStartupAllowed,
+                                           boolean certExistedBeforeChange,
+                                           boolean keyExistedBeforeChange) {
+        if (automaticStartupAllowed && mLastDeterminedShouldRun) {
+            verifyRestartAndRollback(
+                    certFile, keyFile, certBak, keyBak, listener,
+                    certExistedBeforeChange, keyExistedBeforeChange
+            );
         } else {
             // Not currently meant to run; the new files will take effect on next start.
             deleteQuietly(certBak);
@@ -1257,79 +2442,175 @@ public class SyncthingService extends Service {
     }
 
     /**
-     * Restarts the binary and watches the service state: success on reaching ACTIVE, failure on
-     * ERROR / an abnormal STARTING&rarr;DISABLED transition (crashed binary) / a watchdog timeout.
-     * On failure the backed-up cert/key are restored and a known-good instance is brought back up.
+     * Restarts the binary to verify the new certificate. Reaching ACTIVE succeeds; a genuine
+     * startup failure, an abnormal STARTING&rarr;DISABLED transition, or a watchdog timeout restores
+     * the backed-up cert/key. An explicit stop before success keeps the new files and reports
+     * {@link HttpsCertReplaceResult#SUCCESS_PENDING_START}; a stop during failure recovery also
+     * suppresses its automatic relaunch.
      */
     private void verifyRestartAndRollback(File certFile, File keyFile,
                                           @Nullable File certBak, @Nullable File keyBak,
-                                          OnHttpsCertReplaceResultListener listener) {
-        final boolean[] resolved = {false};
-        final boolean[] sawStarting = {false};
+                                          OnHttpsCertReplaceResultListener listener,
+                                          boolean certExistedBeforeChange,
+                                          boolean keyExistedBeforeChange) {
+        final CertificateVerificationState verification = new CertificateVerificationState();
+        verification.beginVerification();
         final OnServiceStateChangeListener[] verifyListener = new OnServiceStateChangeListener[1];
         final Runnable[] watchdog = new Runnable[1];
+        final CertificateVerificationStopHandler[] stopHandler =
+                new CertificateVerificationStopHandler[1];
+
+        final Runnable clearStopHandler = () -> {
+            if (mCertificateVerificationStopHandler == stopHandler[0]) {
+                mCertificateVerificationStopHandler = null;
+            }
+        };
 
         final Runnable finishSuccess = () -> {
+            clearStopHandler.run();
             deleteQuietly(certBak);
             deleteQuietly(keyBak);
             listener.onResult(HttpsCertReplaceResult.SUCCESS, null);
         };
+        final Runnable finishPendingStart = () -> {
+            verification.completePendingStart(
+                    () -> {
+                        deleteQuietly(certBak);
+                        deleteQuietly(keyBak);
+                    },
+                    () -> {
+                        clearStopHandler.run();
+                        listener.onResult(HttpsCertReplaceResult.SUCCESS_PENDING_START, null);
+                    }
+            );
+        };
         final Runnable finishFailure = () -> {
-            restoreFile(certBak, certFile);
-            restoreFile(keyBak, keyFile);
-            // Bring the previous, known-good certificate back online.
-            if (mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
-                shutdown(State.INIT);
+            Runnable restoreAndRelaunch = verification.completeFailureRecovery(
+                    () -> {
+                        restoreFile(certBak, certFile);
+                        restoreFile(keyBak, keyFile);
+                    },
+                    () -> mLastDeterminedShouldRun,
+                    () -> launchStartupTask(SyncthingCommand.SERVE),
+                    () -> onServiceStateChange(State.DISABLED),
+                    () -> {
+                        clearStopHandler.run();
+                        listener.onResult(HttpsCertReplaceResult.FAILED,
+                                "Syncthing did not come online with the new certificate.");
+                    }
+            );
+            if (hasServiceExecution()) {
+                shutdown(State.INIT, restoreAndRelaunch, true);
+            } else {
+                restoreAndRelaunch.run();
             }
-            launchStartupTask(SyncthingCommand.SERVE);
-            listener.onResult(HttpsCertReplaceResult.FAILED,
-                    "Syncthing did not come online with the new certificate.");
         };
 
         watchdog[0] = () -> {
-            if (resolved[0]) {
-                return;
-            }
-            resolved[0] = true;
-            unregisterOnServiceStateChangeListener(verifyListener[0]);
-            if (mCurrentState == State.ACTIVE) {
-                finishSuccess.run();
-            } else {
-                finishFailure.run();
-            }
+            CertificateVerificationState.Outcome outcome =
+                    verification.onVerificationResult(mCurrentState == State.ACTIVE);
+            scheduleCertificateVerificationResolution(
+                    outcome, verifyListener[0], watchdog[0], finishSuccess,
+                    finishPendingStart, finishFailure
+            );
         };
 
         verifyListener[0] = (state) -> {
-            if (resolved[0]) {
-                return;
-            }
             if (state == State.STARTING) {
-                sawStarting[0] = true;
+                verification.onStarting();
                 return;
             }
             final boolean success = (state == State.ACTIVE);
-            final boolean failure = (state == State.ERROR) || (sawStarting[0] && state == State.DISABLED);
+            final boolean failure = (state == State.ERROR)
+                    || (verification.sawStarting() && state == State.DISABLED);
             if (!success && !failure) {
                 return;
             }
-            resolved[0] = true;
-            mHandler.removeCallbacks(watchdog[0]);
-            // Defer unregister + lifecycle work out of onServiceStateChange's listener iteration.
-            mHandler.post(() -> {
-                unregisterOnServiceStateChangeListener(verifyListener[0]);
-                if (success) {
-                    finishSuccess.run();
-                } else {
-                    finishFailure.run();
-                }
-            });
+            CertificateVerificationState.Outcome outcome =
+                    verification.onVerificationResult(success);
+            scheduleCertificateVerificationResolution(
+                    outcome, verifyListener[0], watchdog[0], finishSuccess,
+                    finishPendingStart, finishFailure
+            );
         };
+
+        stopHandler[0] = new CertificateVerificationStopHandler() {
+            @Override
+            public void onExplicitStop(boolean crashedNativeStop) {
+                boolean verificationAlreadyActive = mCurrentState == State.ACTIVE;
+                boolean preserveFailureResolution = crashedNativeStop
+                        || mCurrentState == State.ERROR
+                        || (verification.sawStarting() && mCurrentState == State.DISABLED);
+                CertificateVerificationState.Outcome outcome = verification.onExplicitStop(
+                        verificationAlreadyActive, preserveFailureResolution
+                );
+                scheduleCertificateVerificationResolution(
+                        outcome, verifyListener[0], watchdog[0], finishSuccess,
+                        finishPendingStart, finishFailure
+                );
+            }
+
+            @Override
+            public void onServiceDestroy() {
+                try {
+                    mHandler.removeCallbacks(watchdog[0]);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not cancel certificate verification watchdog", e);
+                }
+                try {
+                    unregisterOnServiceStateChangeListener(verifyListener[0]);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not remove certificate verification listener", e);
+                }
+                try {
+                    verification.resolveForDestruction(
+                            () -> {
+                                restoreOriginalFileOrRemoveNew(
+                                        certBak, certFile, certExistedBeforeChange
+                                );
+                                restoreOriginalFileOrRemoveNew(
+                                        keyBak, keyFile, keyExistedBeforeChange
+                                );
+                            },
+                            () -> listener.onResult(
+                                    HttpsCertReplaceResult.FAILED,
+                                    "Service was destroyed before certificate verification completed."
+                            )
+                    );
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Could not resolve certificate verification during destruction", e);
+                } finally {
+                    clearStopHandler.run();
+                }
+            }
+        };
+        mCertificateVerificationStopHandler = stopHandler[0];
 
         // registerOnServiceStateChangeListener replays the current state (DISABLED) synchronously;
         // that is ignored because sawStarting is still false.
         registerOnServiceStateChangeListener(verifyListener[0]);
         mHandler.postDelayed(watchdog[0], HTTPS_CERT_VERIFY_TIMEOUT_MS);
         launchStartupTask(SyncthingCommand.SERVE);
+    }
+
+    private void scheduleCertificateVerificationResolution(
+            CertificateVerificationState.Outcome outcome,
+            OnServiceStateChangeListener verifyListener,
+            Runnable watchdog,
+            Runnable finishSuccess,
+            Runnable finishPendingStart,
+            Runnable finishFailure) {
+        if (outcome == CertificateVerificationState.Outcome.IGNORED) {
+            return;
+        }
+        mHandler.removeCallbacks(watchdog);
+        // Defer unregister + lifecycle work out of onServiceStateChange's listener iteration.
+        mHandler.post(() -> {
+            unregisterOnServiceStateChangeListener(verifyListener);
+            CertificateVerificationState.dispatch(
+                    outcome, finishSuccess, finishPendingStart, finishFailure
+            );
+        });
     }
 
     @Nullable
@@ -1353,6 +2634,19 @@ public class SyncthingService extends Service {
         deleteQuietly(target);
         if (!bak.renameTo(target)) {
             Log.w(TAG, "restoreFile: Failed to restore " + target.getName());
+        }
+    }
+
+    /** Restores a prior file when backed up, or removes a new file that had no prior version. */
+    private void restoreOriginalFileOrRemoveNew(
+            @Nullable File backup,
+            File target,
+            boolean existedBeforeChange
+    ) {
+        if (backup != null && backup.exists()) {
+            restoreFile(backup, target);
+        } else if (!existedBeforeChange) {
+            deleteQuietly(target);
         }
     }
 
@@ -1384,13 +2678,7 @@ public class SyncthingService extends Service {
         file.setExecutable(false, false);
     }
 
-    private void postServeStartupIfNeeded(boolean shouldRun) {
-        if (shouldRun) {
-            new Handler(Looper.getMainLooper()).post(() -> launchStartupTask(SyncthingCommand.SERVE));
-        }
-    }
-
-    private boolean cleanupImportedFolderDatabases(Runnable afterReset) {
+    private boolean cleanupImportedFolderDatabases() {
         ConfigXml configXml = new ConfigXml(this);
         try {
             configXml.loadConfig();
@@ -1423,7 +2711,6 @@ public class SyncthingService extends Service {
 
             if (folderPathMissing || markerMissing) {
                 Log.i(TAG, "importConfig: Folder path or marker missing for folder id \"" + folder.id + "\". Resetting Syncthing database.");
-                requestResetDatabase(afterReset);
                 return true;
             }
         }

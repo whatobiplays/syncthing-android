@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -29,7 +30,7 @@ public final class AppUidBackend implements PrivilegeBackend {
     private final Context context;
     private final File binary;
     private final AppUidProcessLauncher processLauncher;
-    private final AppUidSyncthingTerminator syncthingTerminator;
+    private final ExecutionOwnershipManager ownershipManager;
     private final ConfigStorage configStorage;
 
     public AppUidBackend(Context context) {
@@ -37,7 +38,16 @@ public final class AppUidBackend implements PrivilegeBackend {
         this.context = applicationContext;
         this.binary = Constants.getSyncthingBinary(applicationContext);
         this.processLauncher = AppUidBackend::startWithProcessBuilder;
-        this.syncthingTerminator = () -> Util.killProcess(Constants.FILENAME_SYNCTHING_BINARY);
+        File record = new File(
+                new File(applicationContext.getNoBackupFilesDir(), "normal-syncthing"),
+                "execution-record-v1.bin"
+        );
+        this.ownershipManager = new ExecutionOwnershipManager(
+                binary.getAbsolutePath(),
+                new FileExecutionRecordStore(record),
+                new ProcExecutionInspector(),
+                new AndroidProcessSignalTransport()
+        );
         this.configStorage = new AppUidConfigStorage(applicationContext);
     }
 
@@ -47,32 +57,74 @@ public final class AppUidBackend implements PrivilegeBackend {
     AppUidBackend(
             File binary,
             AppUidProcessLauncher processLauncher,
-            AppUidSyncthingTerminator syncthingTerminator,
+            ExecutionOwnershipManager ownershipManager,
             ConfigStorage configStorage
     ) {
         this.context = null;
         this.binary = Objects.requireNonNull(binary);
         this.processLauncher = Objects.requireNonNull(processLauncher);
-        this.syncthingTerminator = Objects.requireNonNull(syncthingTerminator);
+        this.ownershipManager = Objects.requireNonNull(ownershipManager);
         this.configStorage = Objects.requireNonNull(configStorage);
+    }
+
+    @Override
+    public void validateLaunchPrerequisites() throws ExecutableNotFoundException {
+        if (!binary.exists()) throw new ExecutableNotFoundException(binary.getPath());
     }
 
     @Override
     public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
             throws IOException, ExecutableNotFoundException {
         String binaryPath = binary.getPath();
-        if (!binary.exists()) {
-            throw new ExecutableNotFoundException(binaryPath);
+        validateLaunchPrerequisites();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = ownershipManager.recover();
+        if (!recovery.mayLaunch()) {
+            throw new ExecutionRecoveryException(recovery);
         }
 
+        String runToken = java.util.UUID.randomUUID().toString();
+        Map<String, String> processEnvironment = new HashMap<>(environment.values());
+        processEnvironment.put(
+                ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT,
+                runToken
+        );
+        Process process = processLauncher.start(command.argv(binaryPath), processEnvironment);
+        ExecutionIdentity identity = null;
+        try {
+            identity = ownershipManager.recordLaunchedProcess(runToken);
+        } catch (IOException | RuntimeException e) {
+            if (context != null) {
+                Log.e(TAG, "Could not durably record the launched Syncthing process", e);
+            }
+        }
+        boolean exitedBeforeIdentityCapture = identity == null && hasExited(process);
         return new ProcessExecution(
-                processLauncher.start(command.argv(binaryPath), environment.values())
+                process, identity, exitedBeforeIdentityCapture, ownershipManager
         );
     }
 
     @Override
-    public void terminateBundledSyncthing() {
-        syncthingTerminator.terminate();
+    public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+        return ownershipManager.recover();
+    }
+
+    @Override
+    public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+            ExecutionIdentity identity,
+            ExecutionOwnershipManager.Signal signal
+    ) {
+        return ownershipManager.signalIfOwned(identity, signal);
+    }
+
+    @Override
+    public ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
+        return ownershipManager.observe(identity);
+    }
+
+    @Override
+    public boolean clearAfterExit(ExecutionIdentity identity) throws IOException {
+        return ownershipManager.clearAfterExit(identity);
     }
 
     @Override
@@ -155,9 +207,20 @@ public final class AppUidBackend implements PrivilegeBackend {
 
     private static final class ProcessExecution implements Execution {
         private final Process process;
+        private final ExecutionIdentity identity;
+        private final boolean exitedBeforeIdentityCapture;
+        private final ExecutionOwnershipManager ownershipManager;
 
-        private ProcessExecution(Process process) {
+        private ProcessExecution(
+                Process process,
+                ExecutionIdentity identity,
+                boolean exitedBeforeIdentityCapture,
+                ExecutionOwnershipManager ownershipManager
+        ) {
             this.process = process;
+            this.identity = identity;
+            this.exitedBeforeIdentityCapture = exitedBeforeIdentityCapture;
+            this.ownershipManager = ownershipManager;
         }
 
         @Override
@@ -172,12 +235,56 @@ public final class AppUidBackend implements PrivilegeBackend {
 
         @Override
         public int await() throws InterruptedException {
-            return process.waitFor();
+            int exitCode = process.waitFor();
+            if (identity != null) {
+                try {
+                    ownershipManager.clearAfterExit(identity);
+                } catch (IOException e) {
+                    Log.e(TAG, "Could not clear the exited Syncthing identity record", e);
+                }
+            }
+            return exitCode;
         }
 
         @Override
         public void destroy() {
-            process.destroy();
+            signalIfOwned(ExecutionOwnershipManager.Signal.SIGKILL);
+        }
+
+        @Override
+        public ExecutionIdentity identity() {
+            return identity;
+        }
+
+        @Override
+        public boolean exitedBeforeIdentityCapture() {
+            return exitedBeforeIdentityCapture;
+        }
+
+        @Override
+        public ExecutionOwnershipManager.Observation observe() {
+            if (identity == null) return ExecutionOwnershipManager.Observation.NOT_OWNED;
+            return ownershipManager.observe(identity);
+        }
+
+        @Override
+        public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                ExecutionOwnershipManager.Signal signal
+        ) {
+            if (identity == null) return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
+            return ownershipManager.signalIfOwned(identity, signal);
+        }
+    }
+
+    /** Uses Process.exitValue, available on the full minSdk range, as concrete exit evidence. */
+    private static boolean hasExited(Process process) {
+        try {
+            process.exitValue();
+            return true;
+        } catch (IllegalThreadStateException stillRunning) {
+            return false;
+        } catch (RuntimeException uncertain) {
+            return false;
         }
     }
 
@@ -195,10 +302,4 @@ public final class AppUidBackend implements PrivilegeBackend {
 @FunctionalInterface
 interface AppUidProcessLauncher {
     Process start(String[] argv, Map<String, String> environment) throws IOException;
-}
-
-/** Package-private seam for the existing Syncthing-specific process cleanup. */
-@FunctionalInterface
-interface AppUidSyncthingTerminator {
-    void terminate();
 }

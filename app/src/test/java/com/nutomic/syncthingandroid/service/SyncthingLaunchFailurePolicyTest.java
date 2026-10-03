@@ -20,4 +20,14 @@ public class SyncthingLaunchFailurePolicyTest {
                 SyncthingLaunchFailurePolicy.terminalState(SyncthingService.State.DISABLED)
         );
     }
+
+    @Test
+    public void intentionalStartupCancellationSettlesStartingServiceAsDisabled() {
+        assertEquals(
+                SyncthingService.State.DISABLED,
+                SyncthingLaunchFailurePolicy.cancelledStartupState(
+                        SyncthingService.State.STARTING
+                )
+        );
+    }
 }
