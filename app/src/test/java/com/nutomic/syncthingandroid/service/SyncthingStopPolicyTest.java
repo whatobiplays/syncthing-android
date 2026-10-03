@@ -100,7 +100,11 @@ public class SyncthingStopPolicyTest {
         assertTrue(events.contains("verify-exact-owner"));
         assertTrue(events.contains("signal:SIGINT"));
         assertFalse(events.contains("signal:SIGKILL"));
-        assertTrue(events.contains("bounded-wait:10000"));
-        assertTrue(events.contains("bounded-wait:5000"));
+        assertTrue(events.contains(
+                "bounded-wait:" + OwnedExecutionShutdown.REST_SHUTDOWN_WAIT_MS
+        ));
+        assertTrue(events.contains(
+                "bounded-wait:" + OwnedExecutionShutdown.SIGINT_WAIT_MS
+        ));
     }
 }

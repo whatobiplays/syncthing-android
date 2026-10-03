@@ -146,17 +146,14 @@ public class SyncthingResetPolicyTest {
         AtomicInteger deltaResets = new AtomicInteger();
         boolean[] stopAfterDeltaReset = {false};
         boolean shutdownInProgress = true;
-        boolean continuationPending = false;
 
         // Shutdown retains replacement authorization even after handles and continuations clear.
-        assertFalse(continuationPending);
-        boolean shutdownOwnerArgument = shutdownInProgress;
         assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
-                false, false, false, shutdownOwnerArgument,
+                false, false, false, shutdownInProgress,
                 databaseResets::incrementAndGet
         ));
         assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
-                false, false, false, shutdownOwnerArgument,
+                false, false, false, shutdownInProgress,
                 () -> {
                     stopAfterDeltaReset[0] = true;
                     deltaResets.incrementAndGet();

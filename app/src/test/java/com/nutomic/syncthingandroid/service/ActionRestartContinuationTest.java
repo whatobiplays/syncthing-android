@@ -24,7 +24,6 @@ public class ActionRestartContinuationTest {
         // ACTION_RESTART moves the service to INIT and leaves its continuation pending.
         serviceState.set(SyncthingService.State.INIT);
 
-        assertEquals(SyncthingService.State.INIT, serviceState.get());
         assertTrue(restart.cancel()); // ACTION_STOP while the old owned process is stopping.
         assertTrue(SyncthingStopPolicy.stopForNormalAction(
                 serviceState.get(), false, true, () -> {
