@@ -1,8 +1,8 @@
 package com.nutomic.syncthingandroid.service;
 
 /**
- * Defines the small amount of reset coordination needed by the service while a service-owned
- * Syncthing invocation may still be active.
+ * Defines the small amount of reset coordination needed while a Syncthing lifecycle or
+ * stopped-state mutation owns admission.
  */
 final class SyncthingResetPolicy {
 
@@ -31,7 +31,17 @@ final class SyncthingResetPolicy {
             SyncthingService.State state,
             boolean serviceRunnablePresent
     ) {
-        return state != SyncthingService.State.DISABLED || serviceRunnablePresent;
+        return shouldWaitForShutdownComplete(state, serviceRunnablePresent, false);
+    }
+
+    static boolean shouldWaitForShutdownComplete(
+            SyncthingService.State state,
+            boolean serviceRunnablePresent,
+            boolean shutdownInProgress
+    ) {
+        return shutdownInProgress
+                || state != SyncthingService.State.DISABLED
+                || serviceRunnablePresent;
     }
 
     /** Runs an external reset action only when no stopped-state mutation owns lifecycle admission. */
@@ -40,9 +50,40 @@ final class SyncthingResetPolicy {
             boolean postMutationOwnsStartup,
             Runnable resetAction
     ) {
-        if (fileMutationOwnsStoppedState || postMutationOwnsStartup) return false;
+        return runExternalResetIfUnowned(
+                fileMutationOwnsStoppedState,
+                postMutationOwnsStartup,
+                false,
+                false,
+                resetAction
+        );
+    }
+
+    /** Runs an external reset only when no mutation, reset, or queued continuation owns state. */
+    static boolean runExternalResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState,
+            boolean shutdownContinuationPending,
+            Runnable resetAction
+    ) {
+        if (fileMutationOwnsStoppedState || postMutationOwnsStartup
+                || databaseResetOwnsStoppedState || shutdownContinuationPending) {
+            return false;
+        }
         resetAction.run();
         return true;
+    }
+
+    /** Forces certificate mutations through stopped-state admission while lifecycle work owns it. */
+    static boolean certificateMutationRequiresShutdown(
+            boolean serviceExecutionPresent,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState
+    ) {
+        return serviceExecutionPresent
+                || postMutationOwnsStartup
+                || databaseResetOwnsStoppedState;
     }
 
     /**

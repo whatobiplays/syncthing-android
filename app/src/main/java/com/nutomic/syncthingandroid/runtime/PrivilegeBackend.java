@@ -52,6 +52,11 @@ public interface PrivilegeBackend {
             return null;
         }
 
+        /** True only when the concrete launched child had exited before identity capture failed. */
+        default boolean exitedBeforeIdentityCapture() {
+            return false;
+        }
+
         default ExecutionOwnershipManager.Observation observe() {
             return ExecutionOwnershipManager.Observation.UNKNOWN;
         }

@@ -116,9 +116,10 @@ public final class DefaultSyncthingRuntime
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
-            LifecycleLaunchCheck launchCheck
+        LifecycleLaunchCheck launchCheck
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
+            OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
             backend.validateLaunchPrerequisites();
             ExecutionOwnershipManager.RecoveryAssessment recovery =
                     backend.recoverExecutions();

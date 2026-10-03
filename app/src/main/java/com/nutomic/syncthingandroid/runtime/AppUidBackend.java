@@ -98,7 +98,10 @@ public final class AppUidBackend implements PrivilegeBackend {
                 Log.e(TAG, "Could not durably record the launched Syncthing process", e);
             }
         }
-        return new ProcessExecution(process, identity, ownershipManager);
+        boolean exitedBeforeIdentityCapture = identity == null && hasExited(process);
+        return new ProcessExecution(
+                process, identity, exitedBeforeIdentityCapture, ownershipManager
+        );
     }
 
     @Override
@@ -205,15 +208,18 @@ public final class AppUidBackend implements PrivilegeBackend {
     private static final class ProcessExecution implements Execution {
         private final Process process;
         private final ExecutionIdentity identity;
+        private final boolean exitedBeforeIdentityCapture;
         private final ExecutionOwnershipManager ownershipManager;
 
         private ProcessExecution(
                 Process process,
                 ExecutionIdentity identity,
+                boolean exitedBeforeIdentityCapture,
                 ExecutionOwnershipManager ownershipManager
         ) {
             this.process = process;
             this.identity = identity;
+            this.exitedBeforeIdentityCapture = exitedBeforeIdentityCapture;
             this.ownershipManager = ownershipManager;
         }
 
@@ -251,6 +257,11 @@ public final class AppUidBackend implements PrivilegeBackend {
         }
 
         @Override
+        public boolean exitedBeforeIdentityCapture() {
+            return exitedBeforeIdentityCapture;
+        }
+
+        @Override
         public ExecutionOwnershipManager.Observation observe() {
             if (identity == null) return ExecutionOwnershipManager.Observation.NOT_OWNED;
             return ownershipManager.observe(identity);
@@ -262,6 +273,18 @@ public final class AppUidBackend implements PrivilegeBackend {
         ) {
             if (identity == null) return ExecutionOwnershipManager.SignalAttempt.NOT_OWNED;
             return ownershipManager.signalIfOwned(identity, signal);
+        }
+    }
+
+    /** Uses Process.exitValue, available on the full minSdk range, as concrete exit evidence. */
+    private static boolean hasExited(Process process) {
+        try {
+            process.exitValue();
+            return true;
+        } catch (IllegalThreadStateException stillRunning) {
+            return false;
+        } catch (RuntimeException uncertain) {
+            return false;
         }
     }
 

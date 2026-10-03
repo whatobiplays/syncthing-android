@@ -1,6 +1,7 @@
 package com.nutomic.syncthingandroid.runtime;
 
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Applies the bounded shutdown policy to one durably owned Syncthing execution.
@@ -13,13 +14,19 @@ public final class OwnedExecutionShutdown {
     public static final long REST_SHUTDOWN_WAIT_MS = 10_000;
     public static final long SIGINT_WAIT_MS = 5_000;
     public static final long SIGKILL_WAIT_MS = 5_000;
+    public static final long REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS = 5_000;
     private static final long OBSERVATION_INTERVAL_MS = 100;
+    // Handles retain only terminal state and a weak request reference; an undrained request must
+    // block replacement launches without extending the lifetime of Volley or Android objects.
+    private static final CopyOnWriteArrayList<RestShutdownRequest> UNQUIESCED_REQUESTS =
+            new CopyOnWriteArrayList<>();
 
     public enum Outcome {
         EXITED,
         OWNERSHIP_LOST,
         SIGNAL_FAILED,
-        EXIT_NOT_PROVEN
+        EXIT_NOT_PROVEN,
+        REST_SHUTDOWN_NOT_QUIESCENT
     }
 
     /** Reports live ownership and sends a signal only after an immediate exact verification. */
@@ -45,10 +52,48 @@ public final class OwnedExecutionShutdown {
     /** Sends the normal REST shutdown request when one is available. */
     @FunctionalInterface
     public interface RestShutdown {
-        void request();
+        RestShutdownRequest request();
+    }
+
+    /** A single recovery shutdown request that can be canceled and observed to terminal state. */
+    public interface RestShutdownRequest {
+        void cancel();
+
+        boolean awaitTerminal(long timeoutMillis) throws InterruptedException;
     }
 
     private OwnedExecutionShutdown() { }
+
+    /**
+     * Reports whether an earlier recovery shutdown request may still be delivered.
+     *
+     * <p>Requests that could not be drained remain registered until their terminal event is
+     * observed. Runtime launch admission checks this before starting any bundled command.</p>
+     */
+    public static boolean hasUnquiescedRestShutdownRequests() {
+        for (RestShutdownRequest request : UNQUIESCED_REQUESTS) {
+            try {
+                if (request.awaitTerminal(0)) {
+                    UNQUIESCED_REQUESTS.remove(request);
+                } else {
+                    return true;
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return true;
+            } catch (RuntimeException uncertain) {
+                return true;
+            }
+        }
+        return !UNQUIESCED_REQUESTS.isEmpty();
+    }
+
+    /** Fails closed before any bundled command can launch behind an undrained request. */
+    public static void requireNoUnquiescedRestShutdownRequests() {
+        if (hasUnquiescedRestShutdownRequests()) {
+            throw new RecoveryShutdownRequestPendingException();
+        }
+    }
 
     /**
      * Requests graceful exit, then escalates through SIGINT and SIGKILL if necessary.
@@ -74,23 +119,115 @@ public final class OwnedExecutionShutdown {
         Outcome ownership = currentOwnership(identity, control);
         if (ownership != null) return ownership;
 
+        RestShutdownRequest request = null;
         try {
-            restShutdown.request();
+            request = restShutdown.request();
         } catch (RuntimeException ignored) {
-            // A failed REST request still receives its bounded observation window.
+            // A failed request still receives the bounded signal escalation.
         }
-        Outcome afterRest = waitThenCheck(identity, REST_SHUTDOWN_WAIT_MS, control, waiter);
-        if (afterRest != null) return afterRest;
+        Outcome result;
+        try {
+            Outcome afterRest = waitThenCheck(identity, REST_SHUTDOWN_WAIT_MS, control, waiter);
+            if (afterRest != null) {
+                result = afterRest;
+            } else {
+                Outcome sigint = signalAndWait(
+                        identity,
+                        ExecutionOwnershipManager.Signal.SIGINT,
+                        SIGINT_WAIT_MS,
+                        control,
+                        waiter
+                );
+                if (sigint != null && sigint != Outcome.SIGNAL_FAILED) {
+                    result = sigint;
+                } else {
+                    Outcome sigkill = signalAndWait(
+                            identity,
+                            ExecutionOwnershipManager.Signal.SIGKILL,
+                            SIGKILL_WAIT_MS,
+                            control,
+                            waiter
+                    );
+                    result = sigkill == null ? Outcome.EXIT_NOT_PROVEN : sigkill;
+                }
+            }
+        } catch (InterruptedException interrupted) {
+            if (!cancelAndDrainAfterInterruption(request)) {
+                retainUnquiescedRequest(request);
+                return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
+            }
+            throw interrupted;
+        }
+        return quiesceShutdownRequest(request, result);
+    }
 
-        Outcome sigint = signalAndWait(
-                identity, ExecutionOwnershipManager.Signal.SIGINT, SIGINT_WAIT_MS, control, waiter
-        );
-        if (sigint != null && sigint != Outcome.SIGNAL_FAILED) return sigint;
+    private static Outcome quiesceShutdownRequest(
+            RestShutdownRequest request,
+            Outcome result
+    ) throws InterruptedException {
+        if (request == null) return result;
+        try {
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return result;
+        } catch (InterruptedException interrupted) {
+            if (!cancelAndDrainAfterInterruption(request)) {
+                return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
+            }
+            throw interrupted;
+        } catch (RuntimeException uncertain) {
+            return cancelAndDrainAfterFailure(request, result);
+        }
 
-        Outcome sigkill = signalAndWait(
-                identity, ExecutionOwnershipManager.Signal.SIGKILL, SIGKILL_WAIT_MS, control, waiter
-        );
-        return sigkill == null ? Outcome.EXIT_NOT_PROVEN : sigkill;
+        return cancelAndDrainAfterFailure(request, result);
+    }
+
+    private static Outcome cancelAndDrainAfterFailure(
+            RestShutdownRequest request,
+            Outcome result
+    ) {
+        try {
+            request.cancel();
+        } catch (RuntimeException ignored) {
+            // Terminal observation below remains the authority for future launch safety.
+        }
+        try {
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return result;
+            retainUnquiescedRequest(request);
+            return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            retainUnquiescedRequest(request);
+            return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
+        } catch (RuntimeException uncertain) {
+            try {
+                request.cancel();
+            } catch (RuntimeException ignored) {
+                // Keep the request registered when cancellation cannot be confirmed.
+            }
+            retainUnquiescedRequest(request);
+            return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
+        }
+    }
+
+    private static boolean cancelAndDrainAfterInterruption(RestShutdownRequest request) {
+        if (request == null) return true;
+        try {
+            request.cancel();
+        } catch (RuntimeException ignored) {
+            // A terminal observation is still required before forgetting this request.
+        }
+        try {
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return true;
+        } catch (InterruptedException interruptedAgain) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException uncertain) {
+            // The request remains unsafe to forget when terminal state cannot be observed.
+        }
+        retainUnquiescedRequest(request);
+        return false;
+    }
+
+    private static void retainUnquiescedRequest(RestShutdownRequest request) {
+        if (request != null) UNQUIESCED_REQUESTS.addIfAbsent(request);
     }
 
     /** Uses Android's process observer and a monotonic clock for bounded production waits. */

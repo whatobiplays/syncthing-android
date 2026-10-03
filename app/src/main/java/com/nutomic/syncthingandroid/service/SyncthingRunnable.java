@@ -491,7 +491,7 @@ public class SyncthingRunnable implements Runnable {
             OwnedExecutionShutdown.Waiter waiter
     ) throws InterruptedException {
         if (identity == null) return null;
-        return OwnedExecutionShutdown.stop(identity, () -> { }, control, waiter);
+        return OwnedExecutionShutdown.stop(identity, () -> null, control, waiter);
     }
 
     private void publishLifecycleOutcome(LifecycleOutcome outcome) {

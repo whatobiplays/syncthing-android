@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -22,7 +23,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 waiter
         );
@@ -43,7 +44,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 waiter
         );
@@ -61,7 +62,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 waiter
         );
@@ -73,6 +74,75 @@ public class OwnedExecutionShutdownTest {
     }
 
     @Test
+    public void shutdownRequestIsCanceledAndDrainedBeforeReplacementLaunch() throws Exception {
+        List<String> events = new ArrayList<>();
+        RecordingControl control = new RecordingControl();
+        RecordingShutdownRequest request = new RecordingShutdownRequest(events);
+
+        OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
+                IDENTITY,
+                () -> {
+                    events.add("rest-request-issued");
+                    return request;
+                },
+                control,
+                (identity, timeout, ignored) -> {
+                    events.add("old-execution-exited-before-retry");
+                    control.observation = ExecutionOwnershipManager.Observation.EXITED;
+                    return true;
+                }
+        );
+
+        assertEquals(OwnedExecutionShutdown.Outcome.EXITED, result);
+        OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
+        events.add("replacement-launched");
+        assertFalse(request.canRetryAgainstReplacement());
+        assertEquals(0, request.replacementAttempts);
+        assertEquals(Arrays.asList(
+                "rest-request-issued",
+                "old-execution-exited-before-retry",
+                "shutdown-request-await:5000",
+                "shutdown-request-canceled",
+                "shutdown-request-await:5000",
+                "shutdown-request-terminal",
+                "replacement-launched"
+        ), events);
+    }
+
+    @Test
+    public void nonQuiescentShutdownRequestPreventsReplacementAuthorization()
+            throws Exception {
+        RecordingControl control = new RecordingControl();
+        RecordingShutdownRequest request = new RecordingShutdownRequest(new ArrayList<>());
+        request.neverTerminal = true;
+
+        OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
+                IDENTITY,
+                () -> request,
+                control,
+                (identity, timeout, ignored) -> true
+        );
+
+        assertEquals(
+                OwnedExecutionShutdown.Outcome.REST_SHUTDOWN_NOT_QUIESCENT,
+                result
+        );
+        assertTrue(OwnedExecutionShutdown.hasUnquiescedRestShutdownRequests());
+        assertThrows(
+                RecoveryShutdownRequestPendingException.class,
+                () -> {
+                    OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
+                    request.canRetryAgainstReplacement();
+                }
+        );
+        assertEquals(0, request.replacementAttempts);
+
+        request.neverTerminal = false;
+        assertFalse(OwnedExecutionShutdown.hasUnquiescedRestShutdownRequests());
+        OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
+    }
+
+    @Test
     public void nonOwnedExecutionNeverReceivesRestOrProcessSignals() throws Exception {
         RecordingControl control = new RecordingControl();
         control.observation = ExecutionOwnershipManager.Observation.NOT_OWNED;
@@ -80,7 +150,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 waiter
         );
@@ -99,7 +169,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 waiter
         );
@@ -120,7 +190,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 (identity, timeout, ignored) -> {
                     waits.add(timeout);
@@ -141,7 +211,7 @@ public class OwnedExecutionShutdownTest {
         RecordingWaiter waiter = new RecordingWaiter(control, -1);
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
-                IDENTITY, () -> control.events.add("rest"), control, waiter
+                IDENTITY, () -> { control.events.add("rest"); return null; }, control, waiter
         );
 
         assertEquals(OwnedExecutionShutdown.Outcome.SIGNAL_FAILED, result);
@@ -175,7 +245,7 @@ public class OwnedExecutionShutdownTest {
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
                 IDENTITY,
-                () -> control.events.add("rest"),
+                () -> { control.events.add("rest"); return null; },
                 control,
                 new RecordingWaiter(control, -1)
         );
@@ -195,7 +265,7 @@ public class OwnedExecutionShutdownTest {
         };
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
-                IDENTITY, () -> control.events.add("rest"), control, waiter
+                IDENTITY, () -> { control.events.add("rest"); return null; }, control, waiter
         );
 
         assertEquals(OwnedExecutionShutdown.Outcome.OWNERSHIP_LOST, result);
@@ -243,7 +313,10 @@ public class OwnedExecutionShutdownTest {
         };
 
         OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
-                IDENTITY, () -> events.add("rest"), control, waiter
+                IDENTITY, () -> {
+                    events.add("rest");
+                    return null;
+                }, control, waiter
         );
 
         assertEquals(OwnedExecutionShutdown.Outcome.EXITED, result);
@@ -311,6 +384,45 @@ public class OwnedExecutionShutdownTest {
                 return true;
             }
             return false;
+        }
+    }
+
+    private static final class RecordingShutdownRequest
+            implements OwnedExecutionShutdown.RestShutdownRequest {
+        private final List<String> events;
+        private boolean cancelled;
+        private boolean terminal;
+        private boolean neverTerminal;
+        private int awaitCount;
+        private int replacementAttempts;
+
+        private RecordingShutdownRequest(List<String> events) {
+            this.events = events;
+        }
+
+        @Override
+        public void cancel() {
+            cancelled = true;
+            events.add("shutdown-request-canceled");
+        }
+
+        @Override
+        public boolean awaitTerminal(long timeoutMillis) {
+            events.add("shutdown-request-await:" + timeoutMillis);
+            awaitCount++;
+            if (neverTerminal) return false;
+            if (cancelled || awaitCount > 1) {
+                terminal = true;
+                events.add("shutdown-request-terminal");
+                return true;
+            }
+            return false;
+        }
+
+        private boolean canRetryAgainstReplacement() {
+            if (terminal) return false;
+            replacementAttempts++;
+            return true;
         }
     }
 }

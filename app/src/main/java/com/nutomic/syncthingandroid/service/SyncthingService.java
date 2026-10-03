@@ -261,6 +261,8 @@ public class SyncthingService extends Service {
     private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
     private final PostMutationStartupGate mPostMutationStartupGate =
             new PostMutationStartupGate();
+    private final DatabaseResetOwnership mDatabaseResetOwnership =
+            new DatabaseResetOwnership();
 
     private boolean mShutdownInProgress;
     private boolean mShutdownExitProven;
@@ -376,16 +378,18 @@ public class SyncthingService extends Service {
                 shutdown(State.DISABLED);
             } else {
                 // Graceful shutdown.
-                if (mCurrentState == State.STARTING ||
-                        mCurrentState == State.ACTIVE) {
-                    shutdown(State.DISABLED);
-                }
+                SyncthingStopPolicy.stopForNormalAction(
+                        mCurrentState, mOwnedExecution != null,
+                        () -> shutdown(State.DISABLED)
+                );
             }
         } else if (ACTION_RESET_DATABASE.equals(intent.getAction())) {
-            // External resets cannot overlap a stopped-state file mutation or import handoff.
+            // Reject conflicts before reserving or starting any reset work.
             boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
                     mFileMutationBarrier != null,
                     mPostMutationStartupGate.ownsStartup(),
+                    mDatabaseResetOwnership.isReserved(),
+                    mShutdownInProgress && mAfterShutdown != null,
                     () -> {
                         Log.i(TAG, "Invoking reset of database");
                         requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
@@ -395,13 +399,15 @@ public class SyncthingService extends Service {
                     }
             );
             if (!accepted) {
-                Log.w(TAG, "Ignoring external database reset while a file mutation owns lifecycle admission");
+                Log.w(TAG, "Ignoring external database reset while another lifecycle operation owns admission");
             }
         } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
             // Check ownership before setting the delta-reset follow-up state or launching work.
             boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
                     mFileMutationBarrier != null,
                     mPostMutationStartupGate.ownsStartup(),
+                    mDatabaseResetOwnership.isReserved(),
+                    mShutdownInProgress && mAfterShutdown != null,
                     () -> {
                         Log.i(TAG, "Invoking reset of delta indexes");
                         mStopAfterDeltaResetWhenNotRequired = true;
@@ -414,7 +420,7 @@ public class SyncthingService extends Service {
                     }
             );
             if (!accepted) {
-                Log.w(TAG, "Ignoring external delta reset while a file mutation owns lifecycle admission");
+                Log.w(TAG, "Ignoring external delta reset while another lifecycle operation owns admission");
             }
         } else if (ACTION_REFRESH_NETWORK_INFO.equals(intent.getAction())) {
             if (mRunConditionMonitor != null) {
@@ -484,6 +490,7 @@ public class SyncthingService extends Service {
                 boolean lifecycleBlocksStartup = mShutdownInProgress
                         || mFileMutationBarrier != null
                         || mPostMutationStartupGate.ownsStartup()
+                        || !mDatabaseResetOwnership.canStartLifecycle()
                         || ((mCurrentState == State.DISABLED || mCurrentState == State.INIT)
                         && (mOwnedExecution != null
                         || mSyncthingRunnable != null
@@ -492,7 +499,8 @@ public class SyncthingService extends Service {
                 if (lifecycleBlocksStartup) {
                     if (!mShutdownInProgress
                             && mFileMutationBarrier == null
-                            && !mPostMutationStartupGate.ownsStartup()) {
+                            && !mPostMutationStartupGate.ownsStartup()
+                            && mDatabaseResetOwnership.canStartLifecycle()) {
                         shutdown(State.DISABLED, null, true);
                     }
                     return;
@@ -640,8 +648,9 @@ public class SyncthingService extends Service {
             Log.e(TAG, "launchStartupTask: Syncthing binary lifecycle violated");
             return;
         }
-        if (mFileMutationBarrier != null || mPostMutationStartupGate.ownsStartup()) {
-            Log.d(TAG, "launchStartupTask deferred until the stopped-state file mutation completes");
+        if (mFileMutationBarrier != null || mPostMutationStartupGate.ownsStartup()
+                || !mDatabaseResetOwnership.canStartLifecycle()) {
+            Log.d(TAG, "launchStartupTask deferred until stopped-state ownership is released");
             return;
         }
 
@@ -731,9 +740,7 @@ public class SyncthingService extends Service {
     ) throws InterruptedException {
         OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
                 identity,
-                () -> {
-                    if (recoveryApi != null) recoveryApi.shutdown();
-                },
+                () -> recoveryApi == null ? null : recoveryApi.shutdown(),
                 mRuntime,
                 OwnedExecutionShutdown.processWaiter()
         );
@@ -1012,9 +1019,7 @@ public class SyncthingService extends Service {
                 try {
                     outcome = OwnedExecutionShutdown.stop(
                             identity,
-                            () -> {
-                                if (restApi != null) restApi.shutdown();
-                            },
+                            () -> restApi == null ? null : restApi.shutdown(),
                             mRuntime,
                             OwnedExecutionShutdown.processWaiter()
                     );
@@ -1079,6 +1084,35 @@ public class SyncthingService extends Service {
         clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
     }
 
+    /** Immutable result produced by the database reset worker. */
+    private static final class DatabaseResetOutcome {
+        enum Type { COMPLETED, FAILED }
+
+        private final Type type;
+        @Nullable private final Throwable failure;
+
+        private DatabaseResetOutcome(Type type, @Nullable Throwable failure) {
+            this.type = type;
+            this.failure = failure;
+        }
+
+        static DatabaseResetOutcome completed() {
+            return new DatabaseResetOutcome(Type.COMPLETED, null);
+        }
+
+        static DatabaseResetOutcome failed(Throwable failure) {
+            return new DatabaseResetOutcome(Type.FAILED, failure);
+        }
+
+        boolean succeeded() {
+            return type == Type.COMPLETED;
+        }
+
+        @Nullable Throwable failure() {
+            return failure;
+        }
+    }
+
     /**
      * Requests the existing database reset operation after any service-owned Syncthing execution
      * has been shut down. Admission rejection is handled here so one-shot failures cannot detach
@@ -1092,59 +1126,112 @@ public class SyncthingService extends Service {
             @Nullable Runnable afterReset,
             @Nullable Runnable onFailure
     ) {
-        RestApi recoveryApi = createRecoveryRestApiFromDisk();
-        DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
-                identity -> stopOwnedExecution(identity, recoveryApi);
-        Runnable reset = () -> {
-            Thread resetWorker = new Thread(() -> {
-                try {
-                    SyncthingRunnable.forOneShotWithRecovery(
-                            this,
-                            SyncthingCommand.RESET_DATABASE,
-                            recoveryHandler
-                    ).run();
-                    if (afterReset != null) {
-                        mHandler.post(SyncthingResetPolicy.afterResetUnlessDestroying(
-                                () -> mDestroying,
-                                afterReset
-                        ));
-                    }
-                } catch (ExecutionAdmissionException e) {
-                    Log.e(TAG, "Database reset rejected because another invocation owns admission", e);
-                    dispatchResetFailure(onFailure);
-                } catch (RuntimeException e) {
-                    Log.e(TAG, "Database reset could not recover an exact execution", e);
-                    if (mNotificationHandler != null) {
-                        mHandler.post(() -> mNotificationHandler.showCrashedNotification(
-                                R.string.notification_crash_title,
-                                "Database reset was blocked by Syncthing execution recovery"
-                        ));
-                    }
-                    dispatchResetFailure(onFailure);
-                }
-            }, "Syncthing database reset");
-            resetWorker.setDaemon(true);
-            try {
-                resetWorker.start();
-            } catch (RuntimeException e) {
-                Log.e(TAG, "Database reset worker could not start", e);
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (!mHandler.post(() -> requestResetDatabase(afterReset, onFailure))) {
+                Log.e(TAG, "Could not schedule database reset ownership on the service thread");
                 dispatchResetFailure(onFailure);
             }
-        };
-
-        if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
-                mCurrentState,
-                mSyncthingRunnable != null
-        )) {
-            try {
-                shutdown(State.DISABLED, reset);
-            } catch (RuntimeException e) {
-                Log.e(TAG, "Could not begin shutdown for database reset", e);
-                dispatchResetFailure(onFailure);
-            }
-        } else {
-            reset.run();
+            return;
         }
+        if (mDestroying) return;
+
+        DatabaseResetOwnership.Operation operation =
+                mDatabaseResetOwnership.reserve(afterReset, onFailure);
+        if (operation == null) {
+            Log.w(TAG, "Database reset rejected because another reset owns lifecycle admission");
+            dispatchResetFailure(onFailure);
+            return;
+        }
+
+        try {
+            RestApi recoveryApi = createRecoveryRestApiFromDisk();
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
+                    identity -> stopOwnedExecution(identity, recoveryApi);
+            Runnable reset = () -> startDatabaseResetWorker(operation, recoveryHandler);
+
+            if (SyncthingResetPolicy.shouldWaitForShutdownComplete(
+                    mCurrentState,
+                    mSyncthingRunnable != null || mSyncthingRunnableThread != null,
+                    mShutdownInProgress
+            )) {
+                shutdown(State.DISABLED, reset);
+            } else {
+                reset.run();
+            }
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not begin database reset", e);
+            completeDatabaseReset(operation, DatabaseResetOutcome.failed(e));
+        }
+    }
+
+    private void startDatabaseResetWorker(
+            DatabaseResetOwnership.Operation operation,
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler
+    ) {
+        Thread resetWorker = new Thread(() -> {
+            DatabaseResetOutcome outcome;
+            try {
+                SyncthingRunnable.forOneShotWithRecovery(
+                        this,
+                        SyncthingCommand.RESET_DATABASE,
+                        recoveryHandler
+                ).run();
+                outcome = DatabaseResetOutcome.completed();
+            } catch (ExecutionAdmissionException e) {
+                Log.e(TAG, "Database reset rejected because another invocation owns admission", e);
+                outcome = DatabaseResetOutcome.failed(e);
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Database reset could not recover an exact execution", e);
+                if (mNotificationHandler != null) {
+                    mHandler.post(() -> mNotificationHandler.showCrashedNotification(
+                            R.string.notification_crash_title,
+                            "Database reset was blocked by Syncthing execution recovery"
+                    ));
+                }
+                outcome = DatabaseResetOutcome.failed(e);
+            }
+            DatabaseResetOutcome completedOutcome = outcome;
+            if (!mHandler.post(() -> completeDatabaseReset(operation, completedOutcome))) {
+                Log.e(TAG, "Database reset outcome could not return to the service thread");
+            }
+        }, "Syncthing database reset");
+        resetWorker.setDaemon(true);
+        try {
+            resetWorker.start();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Database reset worker could not start", e);
+            completeDatabaseReset(operation, DatabaseResetOutcome.failed(e));
+        }
+    }
+
+    private void completeDatabaseReset(
+            DatabaseResetOwnership.Operation operation,
+            DatabaseResetOutcome outcome
+    ) {
+        if (!mDatabaseResetOwnership.complete(operation)) return;
+        if (mDestroying) return;
+
+        if (outcome.succeeded()) {
+            Runnable afterReset = operation.afterReset();
+            if (afterReset != null) {
+                try {
+                    afterReset.run();
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "Database reset completion failed", e);
+                    runResetFailureContinuation(operation);
+                }
+            }
+            return;
+        }
+
+        mShutdownStartIntent.clear();
+        Log.e(TAG, "Database reset failed", outcome.failure());
+        runResetFailureContinuation(operation);
+    }
+
+    private void runResetFailureContinuation(DatabaseResetOwnership.Operation operation) {
+        Runnable onFailure = operation.onFailure();
+        if (onFailure != null && !mDestroying) onFailure.run();
     }
 
     private void dispatchResetFailure(@Nullable Runnable onFailure) {
@@ -1246,6 +1333,10 @@ public class SyncthingService extends Service {
                 mShutdownInProgress, mAfterShutdown != null, onLifecycleConflict
         )) return;
         if (mPostMutationStartupGate.rejectNewMutation(onRejected)) return;
+        if (mDatabaseResetOwnership.isReserved()) {
+            onRejected.run();
+            return;
+        }
 
         FileMutationBarrier owner = FileMutationBarrier.reserveAsyncOwner(
                 mFileMutationBarrier,
@@ -1381,6 +1472,13 @@ public class SyncthingService extends Service {
         synchronized (mStateLock) {
             if (mCurrentState != State.ERROR) onServiceStateChange(State.ERROR);
         }
+        DatabaseResetOwnership.Operation resetOperation =
+                mDatabaseResetOwnership.currentOperation();
+        if (resetOperation != null) {
+            completeDatabaseReset(resetOperation, DatabaseResetOutcome.failed(
+                    new IllegalStateException("Owned execution shutdown could not be proven")
+            ));
+        }
     }
 
     /** Reclassifies after exit so no callback can mutate state while another candidate remains. */
@@ -1412,9 +1510,7 @@ public class SyncthingService extends Service {
                         ExecutionIdentity identity = assessment.ownedExecution();
                         OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
                                 identity,
-                                () -> {
-                                    if (recoveryApi != null) recoveryApi.shutdown();
-                                },
+                                () -> recoveryApi == null ? null : recoveryApi.shutdown(),
                                 mRuntime,
                                 OwnedExecutionShutdown.processWaiter()
                         );
@@ -1463,6 +1559,13 @@ public class SyncthingService extends Service {
             failFileMutationBarrier();
             synchronized (mStateLock) {
                 if (mCurrentState != State.ERROR) onServiceStateChange(State.ERROR);
+            }
+            DatabaseResetOwnership.Operation resetOperation =
+                    mDatabaseResetOwnership.currentOperation();
+            if (resetOperation != null) {
+                completeDatabaseReset(resetOperation, DatabaseResetOutcome.failed(
+                        new IllegalStateException("Execution recovery did not permit replacement")
+                ));
             }
             return;
         }
@@ -1537,7 +1640,8 @@ public class SyncthingService extends Service {
                 mCurrentState == State.DISABLED
                         && mOwnedExecution == null
                         && mSyncthingRunnable == null
-                        && mSyncthingRunnableThread == null,
+                        && mSyncthingRunnableThread == null
+                        && mDatabaseResetOwnership.canStartLifecycle(),
                 mDestroying
         )) {
             launchStartupTask(SyncthingCommand.SERVE);
@@ -1577,6 +1681,10 @@ public class SyncthingService extends Service {
                 return;
             }
             if (mPostMutationStartupGate.rejectNewMutation(barrier::stopFailed)) return;
+            if (mDatabaseResetOwnership.isReserved()) {
+                barrier.stopFailed();
+                return;
+            }
             if (FileMutationBarrier.rejectIfShutdownContinuationPending(
                     mShutdownInProgress,
                     mAfterShutdown != null,
@@ -2198,12 +2306,17 @@ public class SyncthingService extends Service {
     }
 
     private boolean hasServiceExecution() {
-        return mShutdownInProgress
+        boolean serviceExecution = mShutdownInProgress
                 || mFileMutationBarrier != null
                 || mCurrentState != State.DISABLED
                 || mOwnedExecution != null
                 || mSyncthingRunnable != null
                 || mSyncthingRunnableThread != null;
+        return SyncthingResetPolicy.certificateMutationRequiresShutdown(
+                serviceExecution,
+                mPostMutationStartupGate.ownsStartup(),
+                mDatabaseResetOwnership.isReserved()
+        );
     }
 
     private void applyCertChangeWithVerify(File certFile, File keyFile,

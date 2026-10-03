@@ -48,7 +48,9 @@ public final class SyncthingExecution {
         if (!exitObserved.get()) {
             throw new IllegalStateException("One-shot ownership can be checked only after exit");
         }
-        if (execution.identity() == null) throw new ExecutionIdentityUnavailableException();
+        if (execution.identity() == null && !execution.exitedBeforeIdentityCapture()) {
+            throw new ExecutionIdentityUnavailableException();
+        }
     }
 
     public void destroy() {
