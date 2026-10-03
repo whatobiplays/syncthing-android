@@ -59,16 +59,16 @@ final class SyncthingResetPolicy {
         );
     }
 
-    /** Runs an external reset only when no mutation, reset, or queued continuation owns state. */
+    /** Runs an external reset only when no mutation, reset, or active shutdown owns state. */
     static boolean runExternalResetIfUnowned(
             boolean fileMutationOwnsStoppedState,
             boolean postMutationOwnsStartup,
             boolean databaseResetOwnsStoppedState,
-            boolean shutdownContinuationPending,
+            boolean shutdownInProgress,
             Runnable resetAction
     ) {
         if (fileMutationOwnsStoppedState || postMutationOwnsStartup
-                || databaseResetOwnsStoppedState || shutdownContinuationPending) {
+                || databaseResetOwnsStoppedState || shutdownInProgress) {
             return false;
         }
         resetAction.run();

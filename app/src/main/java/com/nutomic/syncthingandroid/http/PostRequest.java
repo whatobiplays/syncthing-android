@@ -30,7 +30,7 @@ public class PostRequest extends ApiRequest {
         connect(Request.Method.POST, uri, postBody, listener, null);
     }
 
-    /** Creates a one-attempt shutdown request with a handle for cancellation and draining. */
+    /** Prepares a one-attempt shutdown request without making it deliverable. */
     public static OwnedExecutionShutdown.RestShutdownRequest singleAttemptShutdown(
             Context context, URL url, String apiKey
     ) {

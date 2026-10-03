@@ -23,4 +23,21 @@ final class SyncthingStopPolicy {
         shutdown.run();
         return true;
     }
+
+    /**
+     * Also joins the active shutdown when STOP has just canceled its ACTION_RESTART continuation.
+     * INIT remains non-stoppable for every other service transition.
+     */
+    static boolean stopForNormalAction(
+            SyncthingService.State state,
+            boolean exactRetainedOwner,
+            boolean restartContinuationCancelled,
+            Runnable shutdown
+    ) {
+        if (restartContinuationCancelled) {
+            shutdown.run();
+            return true;
+        }
+        return stopForNormalAction(state, exactRetainedOwner, shutdown);
+    }
 }

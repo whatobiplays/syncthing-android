@@ -141,14 +141,31 @@ public class SyncthingResetPolicyTest {
     }
 
     @Test
-    public void shutdownWithoutContinuationAllowsExternalReset() {
-        AtomicInteger resets = new AtomicInteger();
+    public void shutdownRecoveryWithoutContinuationRejectsExternalDatabaseAndDeltaResets() {
+        AtomicInteger databaseResets = new AtomicInteger();
+        AtomicInteger deltaResets = new AtomicInteger();
+        boolean[] stopAfterDeltaReset = {false};
+        boolean shutdownInProgress = true;
+        boolean continuationPending = false;
 
-        assertTrue(SyncthingResetPolicy.runExternalResetIfUnowned(
-                false, false, false, false, resets::incrementAndGet
+        // Shutdown retains replacement authorization even after handles and continuations clear.
+        assertFalse(continuationPending);
+        boolean shutdownOwnerArgument = shutdownInProgress;
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, shutdownOwnerArgument,
+                databaseResets::incrementAndGet
+        ));
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, shutdownOwnerArgument,
+                () -> {
+                    stopAfterDeltaReset[0] = true;
+                    deltaResets.incrementAndGet();
+                }
         ));
 
-        assertEquals(1, resets.get());
+        assertEquals(0, databaseResets.get());
+        assertEquals(0, deltaResets.get());
+        assertFalse(stopAfterDeltaReset[0]);
     }
 
     @Test
@@ -163,14 +180,7 @@ public class SyncthingResetPolicyTest {
     }
 
     @Test
-    public void certificateReplaceUsesStoppedAdmissionDuringImportReset() {
-        assertTrue(SyncthingResetPolicy.certificateMutationRequiresShutdown(
-                false, true, true
-        ));
-    }
-
-    @Test
-    public void certificateResetUsesStoppedAdmissionDuringImportReset() {
+    public void certificateMutationUsesStoppedAdmissionDuringImportReset() {
         assertTrue(SyncthingResetPolicy.certificateMutationRequiresShutdown(
                 false, true, true
         ));

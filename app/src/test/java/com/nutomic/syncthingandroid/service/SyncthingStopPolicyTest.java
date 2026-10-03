@@ -40,11 +40,10 @@ public class SyncthingStopPolicyTest {
     }
 
     @Test
-    public void normalStopRetriesExactErrorOwnerWithoutLaunchingReplacement() throws Exception {
+    public void normalStopRetriesExactErrorOwnerWithBoundedEscalation() throws Exception {
         List<String> events = new ArrayList<>();
         AtomicInteger observations = new AtomicInteger();
         AtomicInteger signals = new AtomicInteger();
-        AtomicInteger serveLaunches = new AtomicInteger();
         AtomicInteger shutdownCalls = new AtomicInteger();
         OwnedExecutionShutdown.Outcome[] shutdownOutcome = {null};
 
@@ -97,7 +96,11 @@ public class SyncthingStopPolicyTest {
         assertEquals(1, shutdownCalls.get());
         assertEquals(OwnedExecutionShutdown.Outcome.EXITED, shutdownOutcome[0]);
         assertEquals(1, signals.get());
-        assertTrue(observations.get() >= 2);
-        assertEquals(0, serveLaunches.get());
+        assertEquals(3, observations.get());
+        assertTrue(events.contains("verify-exact-owner"));
+        assertTrue(events.contains("signal:SIGINT"));
+        assertFalse(events.contains("signal:SIGKILL"));
+        assertTrue(events.contains("bounded-wait:10000"));
+        assertTrue(events.contains("bounded-wait:5000"));
     }
 }

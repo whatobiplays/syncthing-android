@@ -613,10 +613,10 @@ public class RestApi {
     }
 
     /**
-     * Posts shutdown request.
-     * This will cause SyncthingNative to exit and not restart.
+     * Prepares the recovery shutdown request. The caller registers its admission lease before
+     * sending the returned request.
      */
-    public OwnedExecutionShutdown.RestShutdownRequest shutdown() {
+    public OwnedExecutionShutdown.RestShutdownRequest prepareShutdown() {
         hasShutdown = true;
         executorService.shutdownNow();
         Util.killProcess("find");

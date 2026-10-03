@@ -1,7 +1,9 @@
 package com.nutomic.syncthingandroid.runtime;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Applies the bounded shutdown policy to one durably owned Syncthing execution.
@@ -16,10 +18,11 @@ public final class OwnedExecutionShutdown {
     public static final long SIGKILL_WAIT_MS = 5_000;
     public static final long REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS = 5_000;
     private static final long OBSERVATION_INTERVAL_MS = 100;
-    // Handles retain only terminal state and a weak request reference; an undrained request must
-    // block replacement launches without extending the lifetime of Volley or Android objects.
-    private static final CopyOnWriteArrayList<RestShutdownRequest> UNQUIESCED_REQUESTS =
-            new CopyOnWriteArrayList<>();
+    // A request lease and the start of a process creation are mutually exclusive. The monitor is
+    // held only while changing this coordinator state, never while the backend starts a process.
+    private static final Object COORDINATOR_MONITOR = new Object();
+    private static final List<RequestLease> PENDING_REQUESTS = new ArrayList<>();
+    private static boolean processStartInProgress;
 
     public enum Outcome {
         EXITED,
@@ -49,20 +52,101 @@ public final class OwnedExecutionShutdown {
         ) throws InterruptedException;
     }
 
-    /** Sends the normal REST shutdown request when one is available. */
+    /** Prepares the REST shutdown request without making it deliverable. */
     @FunctionalInterface
     public interface RestShutdown {
-        RestShutdownRequest request();
+        /** Prepares a request without making it deliverable. */
+        RestShutdownRequest prepare();
     }
 
-    /** A single recovery shutdown request that can be canceled and observed to terminal state. */
+    /** A prepared recovery request that is registered before it can become deliverable. */
     public interface RestShutdownRequest {
+        /** Registers the shutdown owner to be notified when delivery becomes terminal. */
+        void setTerminalListener(Runnable listener);
+
+        /**
+         * Enqueues the request. A false result guarantees that it was never deliverable; a thrown
+         * exception leaves delivery uncertain and therefore keeps replacement admission blocked.
+         */
+        boolean send();
+
         void cancel();
 
         boolean awaitTerminal(long timeoutMillis) throws InterruptedException;
     }
 
     private OwnedExecutionShutdown() { }
+
+    /** Permit held only across backend process creation, coordinated with request registration. */
+    public static final class LaunchPermit implements AutoCloseable {
+        private boolean released;
+
+        private LaunchPermit() { }
+
+        @Override
+        public void close() {
+            synchronized (COORDINATOR_MONITOR) {
+                if (released) return;
+                released = true;
+                processStartInProgress = false;
+                COORDINATOR_MONITOR.notifyAll();
+            }
+        }
+    }
+
+    /** Tracks one prepared request without invoking transport code while holding the coordinator. */
+    private static final class RequestLease {
+        private final RestShutdownRequest request;
+        private final AtomicBoolean terminal = new AtomicBoolean();
+
+        private RequestLease(RestShutdownRequest request) {
+            this.request = request;
+        }
+
+        private boolean isTerminal() {
+            return terminal.get();
+        }
+
+        private void observeTerminal() {
+            if (terminal.compareAndSet(false, true)) releaseRequestLease(this);
+        }
+    }
+
+    /**
+     * Reserves the process-creation boundary against a recovery request becoming deliverable.
+     * Lifecycle launches wait for existing request leases; one-shots fail closed instead.
+     */
+    public static LaunchPermit acquireLaunchPermit(boolean waitForPendingRequests)
+            throws InterruptedException {
+        while (true) {
+            hasUnquiescedRestShutdownRequests();
+            synchronized (COORDINATOR_MONITOR) {
+                removeObservedTerminalLeasesLocked();
+                boolean pending = !PENDING_REQUESTS.isEmpty();
+                if (!pending && !processStartInProgress) {
+                    processStartInProgress = true;
+                    return new LaunchPermit();
+                }
+                if (!waitForPendingRequests) {
+                    if (pending) throw new RecoveryShutdownRequestPendingException();
+                    throw new ExecutionAdmissionException();
+                }
+                COORDINATOR_MONITOR.wait();
+            }
+        }
+    }
+
+    /** Waits for older shutdown requests before a lifecycle start inspects process ownership. */
+    public static void awaitNoUnquiescedRestShutdownRequests() throws InterruptedException {
+        while (true) {
+            if (!hasUnquiescedRestShutdownRequests()) return;
+            synchronized (COORDINATOR_MONITOR) {
+                removeObservedTerminalLeasesLocked();
+                if (PENDING_REQUESTS.isEmpty()) continue;
+                COORDINATOR_MONITOR.wait();
+            }
+        }
+    }
 
     /**
      * Reports whether an earlier recovery shutdown request may still be delivered.
@@ -71,21 +155,48 @@ public final class OwnedExecutionShutdown {
      * observed. Runtime launch admission checks this before starting any bundled command.</p>
      */
     public static boolean hasUnquiescedRestShutdownRequests() {
-        for (RestShutdownRequest request : UNQUIESCED_REQUESTS) {
+        List<RequestLease> snapshot;
+        synchronized (COORDINATOR_MONITOR) {
+            snapshot = new ArrayList<>(PENDING_REQUESTS);
+        }
+        for (RequestLease lease : snapshot) {
             try {
-                if (request.awaitTerminal(0)) {
-                    UNQUIESCED_REQUESTS.remove(request);
-                } else {
-                    return true;
-                }
+                if (lease.request.awaitTerminal(0)) lease.observeTerminal();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                return true;
+                break;
             } catch (RuntimeException uncertain) {
-                return true;
+                // An unobservable request remains registered until its terminal callback arrives.
             }
         }
-        return !UNQUIESCED_REQUESTS.isEmpty();
+        synchronized (COORDINATOR_MONITOR) {
+            removeObservedTerminalLeasesLocked();
+            return !PENDING_REQUESTS.isEmpty();
+        }
+    }
+
+    private static void removeObservedTerminalLeasesLocked() {
+        boolean removed = PENDING_REQUESTS.removeIf(RequestLease::isTerminal);
+        if (removed) COORDINATOR_MONITOR.notifyAll();
+    }
+
+    private static void releaseRequestLease(RequestLease lease) {
+        synchronized (COORDINATOR_MONITOR) {
+            PENDING_REQUESTS.remove(lease);
+            COORDINATOR_MONITOR.notifyAll();
+        }
+    }
+
+    private static boolean registerPendingRequest(RequestLease lease) {
+        synchronized (COORDINATOR_MONITOR) {
+            removeObservedTerminalLeasesLocked();
+            if (processStartInProgress || !PENDING_REQUESTS.isEmpty() || lease.isTerminal()) {
+                return false;
+            }
+            PENDING_REQUESTS.add(lease);
+            COORDINATOR_MONITOR.notifyAll();
+            return true;
+        }
     }
 
     /** Fails closed before any bundled command can launch behind an undrained request. */
@@ -120,10 +231,43 @@ public final class OwnedExecutionShutdown {
         if (ownership != null) return ownership;
 
         RestShutdownRequest request = null;
+        RequestLease requestLease = null;
+        boolean requestRegistered = false;
         try {
-            request = restShutdown.request();
+            request = restShutdown.prepare();
         } catch (RuntimeException ignored) {
             // A failed request still receives the bounded signal escalation.
+        }
+        if (request != null) {
+            try {
+                requestLease = new RequestLease(request);
+                RequestLease preparedLease = requestLease;
+                request.setTerminalListener(preparedLease::observeTerminal);
+                if (registerPendingRequest(requestLease)) {
+                    requestRegistered = true;
+                    try {
+                        if (!request.send()) {
+                            requestLease.observeTerminal();
+                            request = null;
+                            requestLease = null;
+                            requestRegistered = false;
+                        }
+                    } catch (RuntimeException | Error uncertainDelivery) {
+                        // Keep the lease: Volley may have accepted the request before failing.
+                        // Continue bounded exact-owner shutdown; only terminal observation can
+                        // release replacement launch after uncertain delivery.
+                    }
+                } else {
+                    // A process start owns the short launch boundary, or the prepared request is
+                    // already terminal. In either case it was never made deliverable.
+                    request = null;
+                    requestLease = null;
+                }
+            } catch (RuntimeException notDeliverable) {
+                // Listener setup happens before registration and queue admission.
+                request = null;
+                requestLease = null;
+            }
         }
         Outcome result;
         try {
@@ -152,36 +296,44 @@ public final class OwnedExecutionShutdown {
                 }
             }
         } catch (InterruptedException interrupted) {
-            if (!cancelAndDrainAfterInterruption(request)) {
-                retainUnquiescedRequest(request);
+            if (!cancelAndDrainAfterInterruption(request, requestLease)) {
                 return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
             }
             throw interrupted;
         }
-        return quiesceShutdownRequest(request, result);
+        Outcome terminalResult = quiesceShutdownRequest(request, requestLease, result);
+        if (requestRegistered && terminalResult != Outcome.REST_SHUTDOWN_NOT_QUIESCENT) {
+            requestLease.observeTerminal();
+        }
+        return terminalResult;
     }
 
     private static Outcome quiesceShutdownRequest(
             RestShutdownRequest request,
+            RequestLease lease,
             Outcome result
     ) throws InterruptedException {
         if (request == null) return result;
         try {
-            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return result;
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) {
+                lease.observeTerminal();
+                return result;
+            }
         } catch (InterruptedException interrupted) {
-            if (!cancelAndDrainAfterInterruption(request)) {
+            if (!cancelAndDrainAfterInterruption(request, lease)) {
                 return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
             }
             throw interrupted;
         } catch (RuntimeException uncertain) {
-            return cancelAndDrainAfterFailure(request, result);
+            return cancelAndDrainAfterFailure(request, lease, result);
         }
 
-        return cancelAndDrainAfterFailure(request, result);
+        return cancelAndDrainAfterFailure(request, lease, result);
     }
 
     private static Outcome cancelAndDrainAfterFailure(
             RestShutdownRequest request,
+            RequestLease lease,
             Outcome result
     ) {
         try {
@@ -190,12 +342,13 @@ public final class OwnedExecutionShutdown {
             // Terminal observation below remains the authority for future launch safety.
         }
         try {
-            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return result;
-            retainUnquiescedRequest(request);
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) {
+                lease.observeTerminal();
+                return result;
+            }
             return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            retainUnquiescedRequest(request);
             return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
         } catch (RuntimeException uncertain) {
             try {
@@ -203,12 +356,14 @@ public final class OwnedExecutionShutdown {
             } catch (RuntimeException ignored) {
                 // Keep the request registered when cancellation cannot be confirmed.
             }
-            retainUnquiescedRequest(request);
             return Outcome.REST_SHUTDOWN_NOT_QUIESCENT;
         }
     }
 
-    private static boolean cancelAndDrainAfterInterruption(RestShutdownRequest request) {
+    private static boolean cancelAndDrainAfterInterruption(
+            RestShutdownRequest request,
+            RequestLease lease
+    ) {
         if (request == null) return true;
         try {
             request.cancel();
@@ -216,18 +371,16 @@ public final class OwnedExecutionShutdown {
             // A terminal observation is still required before forgetting this request.
         }
         try {
-            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) return true;
+            if (request.awaitTerminal(REST_SHUTDOWN_REQUEST_DRAIN_WAIT_MS)) {
+                lease.observeTerminal();
+                return true;
+            }
         } catch (InterruptedException interruptedAgain) {
             Thread.currentThread().interrupt();
         } catch (RuntimeException uncertain) {
             // The request remains unsafe to forget when terminal state cannot be observed.
         }
-        retainUnquiescedRequest(request);
         return false;
-    }
-
-    private static void retainUnquiescedRequest(RestShutdownRequest request) {
-        if (request != null) UNQUIESCED_REQUESTS.addIfAbsent(request);
     }
 
     /** Uses Android's process observer and a monotonic clock for bounded production waits. */

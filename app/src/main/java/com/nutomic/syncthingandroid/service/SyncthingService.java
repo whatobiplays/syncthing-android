@@ -256,6 +256,8 @@ public class SyncthingService extends Service {
 
     @Nullable
     private Runnable mAfterShutdown;
+    @Nullable
+    private ActionRestartContinuation mActionRestartContinuation;
     @Nullable private FileMutationBarrier mFileMutationBarrier;
     @Nullable private CertificateVerificationStopHandler mCertificateVerificationStopHandler;
     private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
@@ -350,16 +352,28 @@ public class SyncthingService extends Service {
         }
 
         if (ACTION_RESTART.equals(intent.getAction()) && mCurrentState == State.ACTIVE) {
-            shutdown(State.INIT, () -> {
+            ActionRestartContinuation restart = new ActionRestartContinuation(() -> {
                 if (mLastDeterminedShouldRun) {
                     launchStartupTask(SyncthingCommand.SERVE);
                 } else {
                     onServiceStateChange(State.DISABLED);
                 }
             });
+            mActionRestartContinuation = restart;
+            shutdown(State.INIT, () -> {
+                if (mActionRestartContinuation == restart) {
+                    mActionRestartContinuation = null;
+                }
+                restart.complete();
+            });
         } else if (ACTION_STOP.equals(intent.getAction())) {
             boolean crashedNativeStop =
                     intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false);
+            boolean restartContinuationCancelled = false;
+            if (mActionRestartContinuation != null) {
+                restartContinuationCancelled = mActionRestartContinuation.cancel();
+                mActionRestartContinuation = null;
+            }
             if (mCertificateVerificationStopHandler != null) {
                 mCertificateVerificationStopHandler.onExplicitStop(crashedNativeStop);
             }
@@ -379,7 +393,7 @@ public class SyncthingService extends Service {
             } else {
                 // Graceful shutdown.
                 SyncthingStopPolicy.stopForNormalAction(
-                        mCurrentState, mOwnedExecution != null,
+                        mCurrentState, mOwnedExecution != null, restartContinuationCancelled,
                         () -> shutdown(State.DISABLED)
                 );
             }
@@ -389,7 +403,7 @@ public class SyncthingService extends Service {
                     mFileMutationBarrier != null,
                     mPostMutationStartupGate.ownsStartup(),
                     mDatabaseResetOwnership.isReserved(),
-                    mShutdownInProgress && mAfterShutdown != null,
+                    mShutdownInProgress,
                     () -> {
                         Log.i(TAG, "Invoking reset of database");
                         requestResetDatabase(SyncthingResetPolicy.relaunchAfterReset(
@@ -407,7 +421,7 @@ public class SyncthingService extends Service {
                     mFileMutationBarrier != null,
                     mPostMutationStartupGate.ownsStartup(),
                     mDatabaseResetOwnership.isReserved(),
-                    mShutdownInProgress && mAfterShutdown != null,
+                    mShutdownInProgress,
                     () -> {
                         Log.i(TAG, "Invoking reset of delta indexes");
                         mStopAfterDeltaResetWhenNotRequired = true;
@@ -740,7 +754,7 @@ public class SyncthingService extends Service {
     ) throws InterruptedException {
         OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
                 identity,
-                () -> recoveryApi == null ? null : recoveryApi.shutdown(),
+                () -> recoveryApi == null ? null : recoveryApi.prepareShutdown(),
                 mRuntime,
                 OwnedExecutionShutdown.processWaiter()
         );
@@ -1019,7 +1033,7 @@ public class SyncthingService extends Service {
                 try {
                     outcome = OwnedExecutionShutdown.stop(
                             identity,
-                            () -> restApi == null ? null : restApi.shutdown(),
+                            () -> restApi == null ? null : restApi.prepareShutdown(),
                             mRuntime,
                             OwnedExecutionShutdown.processWaiter()
                     );
@@ -1510,7 +1524,7 @@ public class SyncthingService extends Service {
                         ExecutionIdentity identity = assessment.ownedExecution();
                         OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
                                 identity,
-                                () -> recoveryApi == null ? null : recoveryApi.shutdown(),
+                                () -> recoveryApi == null ? null : recoveryApi.prepareShutdown(),
                                 mRuntime,
                                 OwnedExecutionShutdown.processWaiter()
                         );

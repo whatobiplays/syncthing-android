@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -142,6 +143,94 @@ public class RuntimeSeamTest {
         first.await();
         SyncthingExecution second = runtime.start(SyncthingCommand.DEVICE_ID, environment);
         second.await();
+    }
+
+    @Test
+    public void recoveryShutdownLeaseBlocksReplacementUntilRequestIsTerminal() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        GatedExecution oldProcess = new GatedExecution();
+        backend.execution = oldProcess;
+        backend.observation = ExecutionOwnershipManager.Observation.OWNED;
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        SyncthingExecution oldExecution = runtime.start(
+                SyncthingCommand.SERVE,
+                normalModeEnvironment()
+        );
+        List<String> events = new ArrayList<>();
+        AtomicBoolean requestTerminal = new AtomicBoolean();
+        AtomicInteger terminalWaits = new AtomicInteger();
+        Runnable[] terminalListener = {null};
+        OwnedExecutionShutdown.RestShutdownRequest preparedRequest =
+                new OwnedExecutionShutdown.RestShutdownRequest() {
+                    @Override
+                    public void setTerminalListener(Runnable listener) {
+                        terminalListener[0] = listener;
+                    }
+
+                    @Override
+                    public boolean send() {
+                        assertTrue(OwnedExecutionShutdown.hasUnquiescedRestShutdownRequests());
+                        events.add("blocked-before-request-delivery");
+                        return true;
+                    }
+
+                    @Override
+                    public void cancel() {
+                        events.add("request-canceled");
+                    }
+
+                    @Override
+                    public boolean awaitTerminal(long timeoutMillis) {
+                        if (timeoutMillis == 0) return requestTerminal.get();
+                        if (terminalWaits.incrementAndGet() == 1) {
+                            assertThrows(
+                                    RecoveryShutdownRequestPendingException.class,
+                                    () -> runtime.start(
+                                            SyncthingCommand.DEVICE_ID,
+                                            normalModeEnvironment()
+                                    )
+                            );
+                            assertEquals(1, backend.startCount);
+                            events.add("replacement-rejected-before-terminal");
+                            return false;
+                        }
+                        requestTerminal.set(true);
+                        if (terminalListener[0] != null) terminalListener[0].run();
+                        events.add("request-terminal");
+                        return true;
+                    }
+                };
+
+        OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
+                new ExecutionIdentity(
+                        41, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", "run-a"
+                ),
+                () -> preparedRequest,
+                runtime,
+                (identity, timeout, ignored) -> {
+                    oldProcess.exit(0);
+                    assertEquals(0, oldExecution.await());
+                    events.add("old-admission-released");
+                    return true;
+                }
+        );
+
+        assertEquals(OwnedExecutionShutdown.Outcome.EXITED, outcome);
+        assertTrue(requestTerminal.get());
+        backend.execution = new ImmediateExecution();
+        SyncthingExecution replacement = runtime.start(
+                SyncthingCommand.DEVICE_ID,
+                normalModeEnvironment()
+        );
+        assertEquals(0, replacement.await());
+        assertEquals(2, backend.startCount);
+        assertEquals(Arrays.asList(
+                "blocked-before-request-delivery",
+                "old-admission-released",
+                "replacement-rejected-before-terminal",
+                "request-canceled",
+                "request-terminal"
+        ), events);
     }
 
     @Test
@@ -770,6 +859,9 @@ public class RuntimeSeamTest {
         private ConfiguredFolderReference folder;
         private FolderEvent event;
         private String[] ignore;
+        private int startCount;
+        private ExecutionOwnershipManager.Observation observation =
+                ExecutionOwnershipManager.Observation.UNKNOWN;
 
         @Override
         public void validateLaunchPrerequisites() throws ExecutableNotFoundException {
@@ -780,6 +872,7 @@ public class RuntimeSeamTest {
         @Override
         public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
                 throws IOException, ExecutableNotFoundException {
+            startCount++;
             events.add("start");
             this.command = command;
             this.environment = environment;
@@ -791,6 +884,11 @@ public class RuntimeSeamTest {
             events.add("recover");
             recoveryChecks++;
             return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+
+        @Override
+        public ExecutionOwnershipManager.Observation observe(ExecutionIdentity identity) {
+            return observation;
         }
 
         @Override

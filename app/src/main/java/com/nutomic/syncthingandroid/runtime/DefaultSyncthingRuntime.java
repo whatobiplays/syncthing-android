@@ -49,7 +49,7 @@ public final class DefaultSyncthingRuntime
     ) throws IOException, ExecutableNotFoundException {
         admission.acquireOneShot();
         try {
-            return launch(command, environment, recoveryHandler, null);
+            return launch(command, environment, recoveryHandler, null, false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("One-shot execution recovery was interrupted", e);
@@ -91,7 +91,7 @@ public final class DefaultSyncthingRuntime
             LifecycleLaunchCheck launchCheck
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         admission.awaitServiceLifecycleAdmission();
-        return launch(command, environment, recoveryHandler, launchCheck);
+        return launch(command, environment, recoveryHandler, launchCheck, true);
     }
 
     /**
@@ -116,10 +116,15 @@ public final class DefaultSyncthingRuntime
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
-        LifecycleLaunchCheck launchCheck
+            LifecycleLaunchCheck launchCheck,
+            boolean serviceLifecycle
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
-            OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
+            if (serviceLifecycle) {
+                OwnedExecutionShutdown.awaitNoUnquiescedRestShutdownRequests();
+            } else {
+                OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
+            }
             backend.validateLaunchPrerequisites();
             ExecutionOwnershipManager.RecoveryAssessment recovery =
                     backend.recoverExecutions();
@@ -134,8 +139,11 @@ public final class DefaultSyncthingRuntime
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
             if (launchCheck != null) launchCheck.check();
-            PrivilegeBackend.Execution execution = backend.start(command, environment);
-            return new SyncthingExecution(execution, admission::release);
+            try (OwnedExecutionShutdown.LaunchPermit ignored =
+                         OwnedExecutionShutdown.acquireLaunchPermit(serviceLifecycle)) {
+                PrivilegeBackend.Execution execution = backend.start(command, environment);
+                return new SyncthingExecution(execution, admission::release);
+            }
         } catch (IOException | ExecutableNotFoundException | InterruptedException
                  | RuntimeException e) {
             admission.release();
