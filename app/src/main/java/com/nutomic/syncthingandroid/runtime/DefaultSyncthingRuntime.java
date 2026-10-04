@@ -81,10 +81,7 @@ public final class DefaultSyncthingRuntime
         }
     }
 
-    /**
-     * Starts a one-shot after invoking its cancellation check inside the coordinated process-start
-     * boundary, immediately before the backend may create a child.
-     */
+    /** Starts an ordinary one-shot with a final callback immediately before process creation. */
     public SyncthingExecution startOneShot(
             SyncthingCommand command,
             SyncthingEnvironment environment,
@@ -92,9 +89,29 @@ public final class DefaultSyncthingRuntime
             Runnable beforeProcessCreation
     ) throws IOException, ExecutableNotFoundException {
         Runnable launchCheck = Objects.requireNonNull(beforeProcessCreation);
+        return startOneShotWithLifecycleCheck(
+                command, environment, recoveryHandler, launchCheck::run
+        );
+    }
+
+    /**
+     * Starts a cancellable service-owned one-shot with separate cancellation observation and final
+     * process-creation checks.
+     *
+     * <p>The cancellation check runs after final recovery classification and before a recovery
+     * failure is reported. The final check runs only when recovery permits launch and remains the
+     * process-creation commit boundary.</p>
+     */
+    public SyncthingExecution startOneShotWithLifecycleCheck(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleLaunchCheck launchCheck
+    ) throws IOException, ExecutableNotFoundException {
+        LifecycleLaunchCheck checkedLaunch = Objects.requireNonNull(launchCheck);
         admission.acquireOneShot();
         try {
-            return launch(command, environment, recoveryHandler, launchCheck::run, false);
+            return launch(command, environment, recoveryHandler, checkedLaunch, false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("One-shot execution recovery was interrupted", e);

@@ -1259,11 +1259,23 @@ public class SyncthingService extends Service {
         Thread resetWorker = new Thread(() -> {
             DatabaseResetOutcome outcome;
             try {
-                SyncthingRunnable.forOneShotWithRecovery(
+                DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck =
+                        new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                            @Override
+                            public void checkCancellation() {
+                                operation.checkNotRevoked();
+                            }
+
+                            @Override
+                            public void check() {
+                                operation.commitLaunch();
+                            }
+                        };
+                SyncthingRunnable.forOneShotWithLifecycleCheck(
                         this,
                         SyncthingCommand.RESET_DATABASE,
                         recoveryHandler,
-                        operation::commitLaunch
+                        launchCheck
                 ).run();
                 outcome = DatabaseResetOutcome.completed();
             } catch (LifecycleLaunchPermit.CancelledException cancelledBeforeCreation) {

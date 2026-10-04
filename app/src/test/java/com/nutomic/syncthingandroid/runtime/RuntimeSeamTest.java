@@ -541,6 +541,104 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void revokedResetOneShotWinsOverCompetingExecutionFoundUnderPermit()
+            throws Exception {
+        AtomicBoolean processPresent = new AtomicBoolean();
+        ExecutionIdentity competingIdentity = RecoveryAssessmentFixture.ownedIdentity();
+        RacingRecoveryBackend runtimeABackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        RacingRecoveryBackend runtimeBBackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        CountDownLatch initialRecoveryComplete = new CountDownLatch(1);
+        CountDownLatch allowPermitAcquisition = new CountDownLatch(1);
+        LifecycleLaunchPermit resetPermit = new LifecycleLaunchPermit();
+        DefaultSyncthingRuntime.LifecycleLaunchCheck resetLaunchCheck =
+                new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                    @Override
+                    public void checkCancellation() {
+                        resetPermit.checkNotRevoked();
+                    }
+
+                    @Override
+                    public void check() {
+                        resetPermit.commitLaunch();
+                    }
+                };
+        DefaultSyncthingRuntime runtimeA = new DefaultSyncthingRuntime(
+                runtimeABackend,
+                waitForPendingRequests -> {
+                    initialRecoveryComplete.countDown();
+                    awaitLatch(allowPermitAcquisition);
+                    return OwnedExecutionShutdown.acquireLaunchPermit(waitForPendingRequests);
+                }
+        );
+        DefaultSyncthingRuntime runtimeB = new DefaultSyncthingRuntime(runtimeBBackend);
+        AtomicInteger shutdownHandlerCalls = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<RuntimeException> resetA = worker.submit(() -> {
+                try {
+                    SyncthingExecution unexpected = runtimeA.startOneShotWithLifecycleCheck(
+                            SyncthingCommand.RESET_DATABASE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                shutdownHandlerCalls.incrementAndGet();
+                                return true;
+                            },
+                            resetLaunchCheck
+                    );
+                    unexpected.await();
+                    return null;
+                } catch (RuntimeException outcome) {
+                    return outcome;
+                }
+            });
+
+            assertTrue("Reset A did not finish its initial launchable classification",
+                    initialRecoveryComplete.await(5, TimeUnit.SECONDS));
+            assertEquals(1, runtimeABackend.recoveryChecks);
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, resetPermit.revoke());
+
+            SyncthingExecution competingExecution = runtimeB.startServiceLifecycle(
+                    SyncthingCommand.SERVE,
+                    normalModeEnvironment()
+            );
+            assertEquals(1, runtimeBBackend.startCount);
+            assertTrue(processPresent.get());
+
+            allowPermitAcquisition.countDown();
+            RuntimeException outcome = resetA.get(5, TimeUnit.SECONDS);
+
+            assertTrue("Reset cancellation must precede competing-owner recovery failure: "
+                            + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException);
+            assertFalse(outcome instanceof ExecutionRecoveryException);
+            assertEquals(0, runtimeABackend.startCount);
+            assertEquals(0, shutdownHandlerCalls.get());
+            assertEquals(2, runtimeABackend.recoveryChecks);
+
+            assertEquals(0, competingExecution.await());
+            processPresent.set(false);
+            SyncthingExecution retry = runtimeA.startOneShot(
+                    SyncthingCommand.RESET_DATABASE,
+                    normalModeEnvironment(),
+                    null,
+                    () -> { }
+            );
+            assertEquals(0, retry.await());
+            assertEquals(1, runtimeABackend.startCount);
+        } finally {
+            allowPermitAcquisition.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
     public void launchPrerequisiteFailureHappensBeforeRecoveryCanStopAnOwner() {
         RecordingBackend backend = new RecordingBackend();
         backend.launchPrerequisiteFailure = new ExecutableNotFoundException("missing binary");

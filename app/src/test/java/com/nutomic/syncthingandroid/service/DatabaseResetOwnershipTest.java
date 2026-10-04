@@ -144,8 +144,11 @@ public class DatabaseResetOwnershipTest {
                 onFailure::incrementAndGet
         );
 
+        operation.checkNotRevoked();
+        assertTrue(ownership.isReserved());
         assertTrue(ownership.cancelBeforeLaunch(operation));
         assertFalse(ownership.isReserved());
+        assertThrows(LifecycleLaunchPermit.CancelledException.class, operation::checkNotRevoked);
         assertThrows(LifecycleLaunchPermit.CancelledException.class, operation::commitLaunch);
         assertFalse(ownership.complete(operation));
         assertEquals(0, afterReset.get());

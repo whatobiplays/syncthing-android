@@ -41,6 +41,11 @@ final class DatabaseResetOwnership {
             launchPermit.commitLaunch();
         }
 
+        /** Reads reset cancellation without committing the process launch. */
+        void checkNotRevoked() {
+            launchPermit.checkNotRevoked();
+        }
+
         private boolean cancelBeforeLaunch() {
             return launchPermit.revoke() == LifecycleLaunchPermit.State.REVOKED;
         }
