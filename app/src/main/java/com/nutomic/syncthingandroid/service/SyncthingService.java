@@ -726,12 +726,21 @@ public class SyncthingService extends Service {
         mStartupLaunchPermit = startupPermit;
         DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
                 identity -> stopOwnedExecution(identity, recoveryApi);
-        DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck = () -> {
-            if (Util.isTcpPortListening(webGuiTcpPort)) {
-                throw new SyncthingRunnable.GuiPortUnavailableException();
-            }
-            startupPermit.commitLaunch();
-        };
+        DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck =
+                new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                    @Override
+                    public void commitRecoveryBlocked() {
+                        startupPermit.commitRecoveryBlocked();
+                    }
+
+                    @Override
+                    public void check() {
+                        if (Util.isTcpPortListening(webGuiTcpPort)) {
+                            throw new SyncthingRunnable.GuiPortUnavailableException();
+                        }
+                        startupPermit.commitLaunch();
+                    }
+                };
         mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(
                 this,
                 command,
@@ -1250,11 +1259,23 @@ public class SyncthingService extends Service {
         Thread resetWorker = new Thread(() -> {
             DatabaseResetOutcome outcome;
             try {
-                SyncthingRunnable.forOneShotWithRecovery(
+                DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck =
+                        new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                            @Override
+                            public void commitRecoveryBlocked() {
+                                operation.commitRecoveryBlocked();
+                            }
+
+                            @Override
+                            public void check() {
+                                operation.commitLaunch();
+                            }
+                        };
+                SyncthingRunnable.forOneShotWithLifecycleCheck(
                         this,
                         SyncthingCommand.RESET_DATABASE,
                         recoveryHandler,
-                        operation::commitLaunch
+                        launchCheck
                 ).run();
                 outcome = DatabaseResetOutcome.completed();
             } catch (LifecycleLaunchPermit.CancelledException cancelledBeforeCreation) {

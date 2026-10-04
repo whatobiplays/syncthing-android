@@ -242,6 +242,24 @@ public class SyncthingRunnable implements Runnable {
         );
     }
 
+    /** Creates a one-shot with separate service cancellation and final launch checks. */
+    static SyncthingRunnable forOneShotWithLifecycleCheck(
+            Context context,
+            SyncthingCommand command,
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler,
+            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
+    ) {
+        return new SyncthingRunnable(
+                context,
+                command,
+                false,
+                recoveryHandler,
+                null,
+                Objects.requireNonNull(launchCheck),
+                null
+        );
+    }
+
     /**
      * Creates the service-owned lifecycle runnable.
      *
@@ -513,6 +531,11 @@ public class SyncthingRunnable implements Runnable {
             throws IOException, ExecutableNotFoundException, InterruptedException {
         if (mWaitForAdmission) {
             return mRuntime.startServiceLifecycle(
+                    mCommand, targetEnv, mRecoveryHandler, mLifecycleLaunchCheck
+            );
+        }
+        if (mLifecycleLaunchCheck != null) {
+            return mRuntime.startOneShotWithLifecycleCheck(
                     mCommand, targetEnv, mRecoveryHandler, mLifecycleLaunchCheck
             );
         }

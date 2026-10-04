@@ -41,6 +41,11 @@ final class DatabaseResetOwnership {
             launchPermit.commitLaunch();
         }
 
+        /** Atomically settles blocked reset recovery against destruction cancellation. */
+        void commitRecoveryBlocked() {
+            launchPermit.commitRecoveryBlocked();
+        }
+
         private boolean cancelBeforeLaunch() {
             return launchPermit.revoke() == LifecycleLaunchPermit.State.REVOKED;
         }

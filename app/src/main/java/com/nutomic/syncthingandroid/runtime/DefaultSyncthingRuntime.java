@@ -19,15 +19,40 @@ public final class DefaultSyncthingRuntime
 
     @FunctionalInterface
     public interface LifecycleLaunchCheck {
-        /** Runs after prior ownership recovery and immediately before a lifecycle launch. */
+        /**
+         * Atomically settles a final non-launchable recovery result against service cancellation.
+         *
+         * <p>Implementations without a service-owned cancellation source need no action. This
+         * callback must only settle the launch decision; it must not reconcile or signal an
+         * execution while the process-start reservation is held.</p>
+         */
+        default void commitRecoveryBlocked() {}
+
+        /** Runs prospective launch checks and commits process creation at the final boundary. */
         void check();
+    }
+
+    /** Acquires the process-start reservation used immediately before backend process creation. */
+    @FunctionalInterface
+    interface LaunchPermitAcquirer {
+        OwnedExecutionShutdown.LaunchPermit acquire(boolean waitForPendingRequests)
+                throws InterruptedException;
     }
 
     private final PrivilegeBackend backend;
     private final AdmissionGate admission = new AdmissionGate();
+    private final LaunchPermitAcquirer launchPermitAcquirer;
 
     public DefaultSyncthingRuntime(PrivilegeBackend backend) {
+        this(backend, OwnedExecutionShutdown::acquireLaunchPermit);
+    }
+
+    DefaultSyncthingRuntime(
+            PrivilegeBackend backend,
+            LaunchPermitAcquirer launchPermitAcquirer
+    ) {
         this.backend = Objects.requireNonNull(backend);
+        this.launchPermitAcquirer = Objects.requireNonNull(launchPermitAcquirer);
     }
 
     /**
@@ -56,10 +81,7 @@ public final class DefaultSyncthingRuntime
         }
     }
 
-    /**
-     * Starts a one-shot after invoking its cancellation check inside the coordinated process-start
-     * boundary, immediately before the backend may create a child.
-     */
+    /** Starts an ordinary one-shot with a final callback immediately before process creation. */
     public SyncthingExecution startOneShot(
             SyncthingCommand command,
             SyncthingEnvironment environment,
@@ -67,9 +89,29 @@ public final class DefaultSyncthingRuntime
             Runnable beforeProcessCreation
     ) throws IOException, ExecutableNotFoundException {
         Runnable launchCheck = Objects.requireNonNull(beforeProcessCreation);
+        return startOneShotWithLifecycleCheck(
+                command, environment, recoveryHandler, launchCheck::run
+        );
+    }
+
+    /**
+     * Starts a cancellable service-owned one-shot with separate cancellation observation and final
+     * process-creation checks.
+     *
+     * <p>The cancellation check runs after final recovery classification and before a recovery
+     * failure is reported. The final check runs only when recovery permits launch and remains the
+     * process-creation commit boundary.</p>
+     */
+    public SyncthingExecution startOneShotWithLifecycleCheck(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleLaunchCheck launchCheck
+    ) throws IOException, ExecutableNotFoundException {
+        LifecycleLaunchCheck checkedLaunch = Objects.requireNonNull(launchCheck);
         admission.acquireOneShot();
         try {
-            return launch(command, environment, recoveryHandler, launchCheck, false);
+            return launch(command, environment, recoveryHandler, checkedLaunch, false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("One-shot execution recovery was interrupted", e);
@@ -115,7 +157,7 @@ public final class DefaultSyncthingRuntime
                 command,
                 environment,
                 recoveryHandler,
-                launchCheck == null ? null : launchCheck::check,
+                launchCheck,
                 true
         );
     }
@@ -142,7 +184,7 @@ public final class DefaultSyncthingRuntime
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
-            Runnable launchCheck,
+            LifecycleLaunchCheck launchCheck,
             boolean serviceLifecycle
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
@@ -166,8 +208,17 @@ public final class DefaultSyncthingRuntime
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
             try (OwnedExecutionShutdown.LaunchPermit ignored =
-                         OwnedExecutionShutdown.acquireLaunchPermit(serviceLifecycle)) {
-                if (launchCheck != null) launchCheck.run();
+                         launchPermitAcquirer.acquire(serviceLifecycle)) {
+                // The initial recovery above may be stale if another runtime starts a process
+                // before this launch reservation is acquired. Reclassify under the reservation,
+                // where only a launchable result may proceed; do not stop or reconcile here.
+                ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
+                        backend.recoverExecutions();
+                if (!finalRecovery.mayLaunch()) {
+                    if (launchCheck != null) launchCheck.commitRecoveryBlocked();
+                    throw new ExecutionRecoveryException(finalRecovery);
+                }
+                if (launchCheck != null) launchCheck.check();
                 PrivilegeBackend.Execution execution = backend.start(command, environment);
                 return new SyncthingExecution(execution, admission::release);
             }
