@@ -304,7 +304,7 @@ public class RuntimeSeamTest {
             assertTrue(recoveryRequested.await(5, TimeUnit.SECONDS));
             assertThrows(TimeoutException.class, () -> recovery.get(5, TimeUnit.SECONDS));
             assertEquals("The pending process creation must not be classified as absent",
-                    1, backend.recoveryChecks);
+                    2, backend.recoveryChecks);
 
             backend.allowProcessCreation.countDown();
             SyncthingExecution execution = launch.get(5, TimeUnit.SECONDS);
@@ -359,6 +359,90 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void stalePrePermitRecoveryCannotAuthorizeLaunchAfterCompetingExecutionStarts()
+            throws Exception {
+        AtomicBoolean processPresent = new AtomicBoolean();
+        ExecutionIdentity competingIdentity = RecoveryAssessmentFixture.ownedIdentity();
+        RacingRecoveryBackend runtimeABackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        RacingRecoveryBackend runtimeBBackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        CountDownLatch initialRecoveryComplete = new CountDownLatch(1);
+        CountDownLatch allowPermitAcquisition = new CountDownLatch(1);
+        DefaultSyncthingRuntime runtimeA = new DefaultSyncthingRuntime(
+                runtimeABackend,
+                waitForPendingRequests -> {
+                    initialRecoveryComplete.countDown();
+                    awaitLatch(allowPermitAcquisition);
+                    return OwnedExecutionShutdown.acquireLaunchPermit(waitForPendingRequests);
+                }
+        );
+        DefaultSyncthingRuntime runtimeB = new DefaultSyncthingRuntime(runtimeBBackend);
+        AtomicInteger shutdownHandlerCalls = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<ExecutionRecoveryException> launchA = worker.submit(() -> {
+                try {
+                    SyncthingExecution unexpected = runtimeA.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                shutdownHandlerCalls.incrementAndGet();
+                                return true;
+                            },
+                            null
+                    );
+                    unexpected.await();
+                    return null;
+                } catch (ExecutionRecoveryException blocked) {
+                    return blocked;
+                }
+            });
+
+            assertTrue("Runtime A did not finish its initial launchable classification",
+                    initialRecoveryComplete.await(5, TimeUnit.SECONDS));
+            assertEquals(1, runtimeABackend.recoveryChecks);
+
+            SyncthingExecution competingExecution = runtimeB.startServiceLifecycle(
+                    SyncthingCommand.SERVE,
+                    normalModeEnvironment()
+            );
+            assertEquals(1, runtimeBBackend.startCount);
+            assertTrue(processPresent.get());
+
+            allowPermitAcquisition.countDown();
+            ExecutionRecoveryException blocked = launchA.get(5, TimeUnit.SECONDS);
+
+            assertNotNull("The stale initial assessment must not authorize a replacement", blocked);
+            assertEquals(
+                    ExecutionOwnershipManager.Classification.OWNED_EXECUTION,
+                    blocked.assessment().classification()
+            );
+            assertEquals(0, runtimeABackend.startCount);
+            assertEquals(0, shutdownHandlerCalls.get());
+            assertEquals(2, runtimeABackend.recoveryChecks);
+
+            assertEquals(0, competingExecution.await());
+            processPresent.set(false);
+
+            SyncthingExecution retry = runtimeA.startServiceLifecycle(
+                    SyncthingCommand.SERVE,
+                    normalModeEnvironment()
+            );
+            assertEquals(0, retry.await());
+            assertEquals(1, runtimeABackend.startCount);
+        } finally {
+            allowPermitAcquisition.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
     public void launchPrerequisiteFailureHappensBeforeRecoveryCanStopAnOwner() {
         RecordingBackend backend = new RecordingBackend();
         backend.launchPrerequisiteFailure = new ExecutableNotFoundException("missing binary");
@@ -388,7 +472,9 @@ public class RuntimeSeamTest {
         );
         execution.await();
 
-        assertEquals(Arrays.asList("validate", "recover", "port-check", "start"),
+        assertEquals(Arrays.asList(
+                        "validate", "recover", "recover", "port-check", "start"
+                ),
                 backend.events);
     }
 
@@ -431,6 +517,7 @@ public class RuntimeSeamTest {
                 "validate",
                 "recover",
                 "old-owner-exit-proven",
+                "recover",
                 "recover",
                 "cancel-before-launch-commit"
         ), backend.events);
@@ -1277,6 +1364,36 @@ public class RuntimeSeamTest {
 
         private void markExited() {
             processExited = true;
+        }
+    }
+
+    private static final class RacingRecoveryBackend extends RecordingBackend {
+        private final AtomicBoolean processPresent;
+        private final ExecutionIdentity identity;
+
+        private RacingRecoveryBackend(
+                AtomicBoolean processPresent,
+                ExecutionIdentity identity
+        ) {
+            this.processPresent = processPresent;
+            this.identity = identity;
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            return processPresent.get()
+                    ? RecoveryAssessmentFixture.ownedExecution()
+                    : ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+
+        @Override
+        public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
+                throws IOException, ExecutableNotFoundException {
+            processPresent.set(true);
+            execution = new ImmediateExecution(identity);
+            return super.start(command, environment);
         }
     }
 

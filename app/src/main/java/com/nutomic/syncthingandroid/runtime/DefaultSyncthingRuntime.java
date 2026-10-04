@@ -23,11 +23,27 @@ public final class DefaultSyncthingRuntime
         void check();
     }
 
+    /** Acquires the process-start reservation used immediately before backend process creation. */
+    @FunctionalInterface
+    interface LaunchPermitAcquirer {
+        OwnedExecutionShutdown.LaunchPermit acquire(boolean waitForPendingRequests)
+                throws InterruptedException;
+    }
+
     private final PrivilegeBackend backend;
     private final AdmissionGate admission = new AdmissionGate();
+    private final LaunchPermitAcquirer launchPermitAcquirer;
 
     public DefaultSyncthingRuntime(PrivilegeBackend backend) {
+        this(backend, OwnedExecutionShutdown::acquireLaunchPermit);
+    }
+
+    DefaultSyncthingRuntime(
+            PrivilegeBackend backend,
+            LaunchPermitAcquirer launchPermitAcquirer
+    ) {
         this.backend = Objects.requireNonNull(backend);
+        this.launchPermitAcquirer = Objects.requireNonNull(launchPermitAcquirer);
     }
 
     /**
@@ -166,7 +182,15 @@ public final class DefaultSyncthingRuntime
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
             try (OwnedExecutionShutdown.LaunchPermit ignored =
-                         OwnedExecutionShutdown.acquireLaunchPermit(serviceLifecycle)) {
+                         launchPermitAcquirer.acquire(serviceLifecycle)) {
+                // The initial recovery above may be stale if another runtime starts a process
+                // before this launch reservation is acquired. Reclassify under the reservation,
+                // where only a launchable result may proceed; do not stop or reconcile here.
+                ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
+                        backend.recoverExecutions();
+                if (!finalRecovery.mayLaunch()) {
+                    throw new ExecutionRecoveryException(finalRecovery);
+                }
                 if (launchCheck != null) launchCheck.run();
                 PrivilegeBackend.Execution execution = backend.start(command, environment);
                 return new SyncthingExecution(execution, admission::release);
