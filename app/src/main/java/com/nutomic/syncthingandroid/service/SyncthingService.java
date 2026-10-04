@@ -726,12 +726,21 @@ public class SyncthingService extends Service {
         mStartupLaunchPermit = startupPermit;
         DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler =
                 identity -> stopOwnedExecution(identity, recoveryApi);
-        DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck = () -> {
-            if (Util.isTcpPortListening(webGuiTcpPort)) {
-                throw new SyncthingRunnable.GuiPortUnavailableException();
-            }
-            startupPermit.commitLaunch();
-        };
+        DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck =
+                new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                    @Override
+                    public void checkCancellation() {
+                        startupPermit.checkNotRevoked();
+                    }
+
+                    @Override
+                    public void check() {
+                        if (Util.isTcpPortListening(webGuiTcpPort)) {
+                            throw new SyncthingRunnable.GuiPortUnavailableException();
+                        }
+                        startupPermit.commitLaunch();
+                    }
+                };
         mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(
                 this,
                 command,

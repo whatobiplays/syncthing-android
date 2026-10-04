@@ -25,6 +25,11 @@ public final class LifecycleLaunchPermit {
         return mState.get();
     }
 
+    /** Throws the expected cancellation outcome when revocation already won the launch race. */
+    public void checkNotRevoked() {
+        if (mState.get() == State.REVOKED) throw new CancelledException();
+    }
+
     /** Atomically commits the launch immediately before process creation. */
     public void commitLaunch() {
         if (mState.compareAndSet(State.OPEN, State.LAUNCH_COMMITTED)) return;

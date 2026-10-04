@@ -19,7 +19,16 @@ public final class DefaultSyncthingRuntime
 
     @FunctionalInterface
     public interface LifecycleLaunchCheck {
-        /** Runs after prior ownership recovery and immediately before a lifecycle launch. */
+        /**
+         * Observes whether the service has revoked this launch without committing process
+         * creation. Lifecycle implementations use this before a final recovery failure is
+         * reported, so an already-cancelled launch keeps its expected cancellation outcome.
+         *
+         * <p>Checks without a service-owned cancellation source need no action.</p>
+         */
+        default void checkCancellation() {}
+
+        /** Runs prospective launch checks and commits process creation at the final boundary. */
         void check();
     }
 
@@ -85,7 +94,7 @@ public final class DefaultSyncthingRuntime
         Runnable launchCheck = Objects.requireNonNull(beforeProcessCreation);
         admission.acquireOneShot();
         try {
-            return launch(command, environment, recoveryHandler, launchCheck, false);
+            return launch(command, environment, recoveryHandler, launchCheck::run, false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("One-shot execution recovery was interrupted", e);
@@ -131,7 +140,7 @@ public final class DefaultSyncthingRuntime
                 command,
                 environment,
                 recoveryHandler,
-                launchCheck == null ? null : launchCheck::check,
+                launchCheck,
                 true
         );
     }
@@ -158,7 +167,7 @@ public final class DefaultSyncthingRuntime
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
-            Runnable launchCheck,
+            LifecycleLaunchCheck launchCheck,
             boolean serviceLifecycle
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
@@ -188,10 +197,11 @@ public final class DefaultSyncthingRuntime
                 // where only a launchable result may proceed; do not stop or reconcile here.
                 ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
                         backend.recoverExecutions();
+                if (launchCheck != null) launchCheck.checkCancellation();
                 if (!finalRecovery.mayLaunch()) {
                     throw new ExecutionRecoveryException(finalRecovery);
                 }
-                if (launchCheck != null) launchCheck.run();
+                if (launchCheck != null) launchCheck.check();
                 PrivilegeBackend.Execution execution = backend.start(command, environment);
                 return new SyncthingExecution(execution, admission::release);
             }

@@ -443,6 +443,104 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void revokedLifecycleLaunchWinsOverCompetingExecutionFoundUnderPermit()
+            throws Exception {
+        AtomicBoolean processPresent = new AtomicBoolean();
+        ExecutionIdentity competingIdentity = RecoveryAssessmentFixture.ownedIdentity();
+        RacingRecoveryBackend runtimeABackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        RacingRecoveryBackend runtimeBBackend = new RacingRecoveryBackend(
+                processPresent,
+                competingIdentity
+        );
+        CountDownLatch initialRecoveryComplete = new CountDownLatch(1);
+        CountDownLatch allowPermitAcquisition = new CountDownLatch(1);
+        LifecycleLaunchPermit startupPermit = new LifecycleLaunchPermit();
+        AtomicInteger finalLaunchChecks = new AtomicInteger();
+        DefaultSyncthingRuntime.LifecycleLaunchCheck lifecycleLaunchCheck =
+                new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                    @Override
+                    public void checkCancellation() {
+                        startupPermit.checkNotRevoked();
+                    }
+
+                    @Override
+                    public void check() {
+                        finalLaunchChecks.incrementAndGet();
+                        startupPermit.commitLaunch();
+                    }
+                };
+        DefaultSyncthingRuntime runtimeA = new DefaultSyncthingRuntime(
+                runtimeABackend,
+                waitForPendingRequests -> {
+                    initialRecoveryComplete.countDown();
+                    awaitLatch(allowPermitAcquisition);
+                    return OwnedExecutionShutdown.acquireLaunchPermit(waitForPendingRequests);
+                }
+        );
+        DefaultSyncthingRuntime runtimeB = new DefaultSyncthingRuntime(runtimeBBackend);
+        AtomicInteger shutdownHandlerCalls = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<RuntimeException> launchA = worker.submit(() -> {
+                try {
+                    SyncthingExecution unexpected = runtimeA.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                shutdownHandlerCalls.incrementAndGet();
+                                return true;
+                            },
+                            lifecycleLaunchCheck
+                    );
+                    unexpected.await();
+                    return null;
+                } catch (RuntimeException outcome) {
+                    return outcome;
+                }
+            });
+
+            assertTrue("Runtime A did not finish its initial launchable classification",
+                    initialRecoveryComplete.await(5, TimeUnit.SECONDS));
+            assertEquals(1, runtimeABackend.recoveryChecks);
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, startupPermit.revoke());
+
+            SyncthingExecution competingExecution = runtimeB.startServiceLifecycle(
+                    SyncthingCommand.SERVE,
+                    normalModeEnvironment()
+            );
+            assertEquals(1, runtimeBBackend.startCount);
+            assertTrue(processPresent.get());
+
+            allowPermitAcquisition.countDown();
+            RuntimeException outcome = launchA.get(5, TimeUnit.SECONDS);
+
+            assertTrue("Revocation must take precedence over final competing-owner evidence: "
+                            + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException);
+            assertEquals(0, runtimeABackend.startCount);
+            assertEquals(0, shutdownHandlerCalls.get());
+            assertEquals(0, finalLaunchChecks.get());
+            assertEquals(2, runtimeABackend.recoveryChecks);
+
+            assertEquals(0, competingExecution.await());
+            processPresent.set(false);
+            SyncthingExecution retry = runtimeA.startServiceLifecycle(
+                    SyncthingCommand.SERVE,
+                    normalModeEnvironment()
+            );
+            assertEquals(0, retry.await());
+            assertEquals(1, runtimeABackend.startCount);
+        } finally {
+            allowPermitAcquisition.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
     public void launchPrerequisiteFailureHappensBeforeRecoveryCanStopAnOwner() {
         RecordingBackend backend = new RecordingBackend();
         backend.launchPrerequisiteFailure = new ExecutableNotFoundException("missing binary");
@@ -463,17 +561,31 @@ public class RuntimeSeamTest {
             throws Exception {
         RecordingBackend backend = new RecordingBackend();
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
 
         SyncthingExecution execution = runtime.startServiceLifecycle(
                 SyncthingCommand.SERVE,
                 normalModeEnvironment(),
                 null,
-                () -> backend.events.add("port-check")
+                new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                    @Override
+                    public void checkCancellation() {
+                        backend.events.add("cancellation-check");
+                        permit.checkNotRevoked();
+                    }
+
+                    @Override
+                    public void check() {
+                        backend.events.add("port-check");
+                        permit.commitLaunch();
+                    }
+                }
         );
         execution.await();
 
         assertEquals(Arrays.asList(
-                        "validate", "recover", "recover", "port-check", "start"
+                        "validate", "recover", "recover", "cancellation-check",
+                        "port-check", "start"
                 ),
                 backend.events);
     }
