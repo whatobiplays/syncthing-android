@@ -729,8 +729,8 @@ public class SyncthingService extends Service {
         DefaultSyncthingRuntime.LifecycleLaunchCheck portCheck =
                 new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
                     @Override
-                    public void checkCancellation() {
-                        startupPermit.checkNotRevoked();
+                    public void commitRecoveryBlocked() {
+                        startupPermit.commitRecoveryBlocked();
                     }
 
                     @Override
@@ -1262,8 +1262,8 @@ public class SyncthingService extends Service {
                 DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck =
                         new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
                             @Override
-                            public void checkCancellation() {
-                                operation.checkNotRevoked();
+                            public void commitRecoveryBlocked() {
+                                operation.commitRecoveryBlocked();
                             }
 
                             @Override

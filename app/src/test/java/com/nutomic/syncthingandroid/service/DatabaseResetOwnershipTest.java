@@ -144,11 +144,13 @@ public class DatabaseResetOwnershipTest {
                 onFailure::incrementAndGet
         );
 
-        operation.checkNotRevoked();
         assertTrue(ownership.isReserved());
         assertTrue(ownership.cancelBeforeLaunch(operation));
         assertFalse(ownership.isReserved());
-        assertThrows(LifecycleLaunchPermit.CancelledException.class, operation::checkNotRevoked);
+        assertThrows(
+                LifecycleLaunchPermit.CancelledException.class,
+                operation::commitRecoveryBlocked
+        );
         assertThrows(LifecycleLaunchPermit.CancelledException.class, operation::commitLaunch);
         assertFalse(ownership.complete(operation));
         assertEquals(0, afterReset.get());
@@ -158,6 +160,28 @@ public class DatabaseResetOwnershipTest {
         assertFalse(ownership.cancelBeforeLaunch(operation));
         assertTrue(ownership.isReserved());
         assertTrue(ownership.complete(newer));
+    }
+
+    @Test
+    public void recoveryBlockedResetSettlementCannotBeRewrittenByDestruction() {
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        AtomicInteger afterReset = new AtomicInteger();
+        AtomicInteger onFailure = new AtomicInteger();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(
+                afterReset::incrementAndGet,
+                onFailure::incrementAndGet
+        );
+
+        operation.commitRecoveryBlocked();
+
+        assertTrue(ownership.isReserved());
+        assertFalse(ownership.cancelBeforeLaunch(operation));
+        assertTrue(ownership.isReserved());
+        assertThrows(IllegalStateException.class, operation::commitLaunch);
+        assertTrue(ownership.complete(operation));
+        assertFalse(ownership.isReserved());
+        assertEquals(0, afterReset.get());
+        assertEquals(0, onFailure.get());
     }
 
     @Test

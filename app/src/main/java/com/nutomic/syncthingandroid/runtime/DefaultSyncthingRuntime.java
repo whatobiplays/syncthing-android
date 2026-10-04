@@ -20,13 +20,13 @@ public final class DefaultSyncthingRuntime
     @FunctionalInterface
     public interface LifecycleLaunchCheck {
         /**
-         * Observes whether the service has revoked this launch without committing process
-         * creation. Lifecycle implementations use this before a final recovery failure is
-         * reported, so an already-cancelled launch keeps its expected cancellation outcome.
+         * Atomically settles a final non-launchable recovery result against service cancellation.
          *
-         * <p>Checks without a service-owned cancellation source need no action.</p>
+         * <p>Implementations without a service-owned cancellation source need no action. This
+         * callback must only settle the launch decision; it must not reconcile or signal an
+         * execution while the process-start reservation is held.</p>
          */
-        default void checkCancellation() {}
+        default void commitRecoveryBlocked() {}
 
         /** Runs prospective launch checks and commits process creation at the final boundary. */
         void check();
@@ -214,8 +214,8 @@ public final class DefaultSyncthingRuntime
                 // where only a launchable result may proceed; do not stop or reconcile here.
                 ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
                         backend.recoverExecutions();
-                if (launchCheck != null) launchCheck.checkCancellation();
                 if (!finalRecovery.mayLaunch()) {
+                    if (launchCheck != null) launchCheck.commitRecoveryBlocked();
                     throw new ExecutionRecoveryException(finalRecovery);
                 }
                 if (launchCheck != null) launchCheck.check();

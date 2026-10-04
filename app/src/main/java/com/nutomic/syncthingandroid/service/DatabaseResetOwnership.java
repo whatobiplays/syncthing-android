@@ -41,9 +41,9 @@ final class DatabaseResetOwnership {
             launchPermit.commitLaunch();
         }
 
-        /** Reads reset cancellation without committing the process launch. */
-        void checkNotRevoked() {
-            launchPermit.checkNotRevoked();
+        /** Atomically settles blocked reset recovery against destruction cancellation. */
+        void commitRecoveryBlocked() {
+            launchPermit.commitRecoveryBlocked();
         }
 
         private boolean cancelBeforeLaunch() {

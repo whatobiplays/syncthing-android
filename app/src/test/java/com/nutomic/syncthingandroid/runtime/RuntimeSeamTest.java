@@ -462,8 +462,8 @@ public class RuntimeSeamTest {
         DefaultSyncthingRuntime.LifecycleLaunchCheck lifecycleLaunchCheck =
                 new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
                     @Override
-                    public void checkCancellation() {
-                        startupPermit.checkNotRevoked();
+                    public void commitRecoveryBlocked() {
+                        startupPermit.commitRecoveryBlocked();
                     }
 
                     @Override
@@ -559,8 +559,8 @@ public class RuntimeSeamTest {
         DefaultSyncthingRuntime.LifecycleLaunchCheck resetLaunchCheck =
                 new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
                     @Override
-                    public void checkCancellation() {
-                        resetPermit.checkNotRevoked();
+                    public void commitRecoveryBlocked() {
+                        resetPermit.commitRecoveryBlocked();
                     }
 
                     @Override
@@ -655,7 +655,7 @@ public class RuntimeSeamTest {
     }
 
     @Test
-    public void lifecycleLaunchCheckRunsAfterRecoveryAndBeforeReplacementStart()
+    public void launchCommitRunsAfterRecoveryAndBeforeReplacementStart()
             throws Exception {
         RecordingBackend backend = new RecordingBackend();
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
@@ -667,12 +667,6 @@ public class RuntimeSeamTest {
                 null,
                 new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
                     @Override
-                    public void checkCancellation() {
-                        backend.events.add("cancellation-check");
-                        permit.checkNotRevoked();
-                    }
-
-                    @Override
                     public void check() {
                         backend.events.add("port-check");
                         permit.commitLaunch();
@@ -682,8 +676,7 @@ public class RuntimeSeamTest {
         execution.await();
 
         assertEquals(Arrays.asList(
-                        "validate", "recover", "recover", "cancellation-check",
-                        "port-check", "start"
+                        "validate", "recover", "recover", "port-check", "start"
                 ),
                 backend.events);
     }
@@ -731,6 +724,115 @@ public class RuntimeSeamTest {
                 "recover",
                 "cancel-before-launch-commit"
         ), backend.events);
+    }
+
+    @Test
+    public void cancellationWinsFinalRecoveryBlockedSettlement() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ambiguousMissingRecord());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch settlementStarted = new CountDownLatch(1);
+        CountDownLatch allowSettlement = new CountDownLatch(1);
+        AtomicInteger shutdownHandlerCalls = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<RuntimeException> launch = worker.submit(() -> {
+                try {
+                    runtime.startServiceLifecycle(
+                            SyncthingCommand.SERVE,
+                            normalModeEnvironment(),
+                            identity -> {
+                                shutdownHandlerCalls.incrementAndGet();
+                                return true;
+                            },
+                            new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                                @Override
+                                public void commitRecoveryBlocked() {
+                                    assertEquals(2, backend.recoveryChecks);
+                                    settlementStarted.countDown();
+                                    awaitLatch(allowSettlement);
+                                    permit.commitRecoveryBlocked();
+                                }
+
+                                @Override
+                                public void check() {
+                                    throw new AssertionError(
+                                            "A blocked recovery cannot launch"
+                                    );
+                                }
+                            }
+                    );
+                    return null;
+                } catch (RuntimeException outcome) {
+                    return outcome;
+                }
+            });
+
+            assertTrue("Final recovery did not reach blocked settlement",
+                    settlementStarted.await(5, TimeUnit.SECONDS));
+            assertEquals("STOP wins while the permit is still open",
+                    LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+            allowSettlement.countDown();
+
+            RuntimeException outcome = launch.get(5, TimeUnit.SECONDS);
+            assertTrue("Cancellation must win recovery failure settlement: " + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException);
+            assertFalse(outcome instanceof ExecutionRecoveryException);
+            assertEquals(0, backend.startCount);
+            assertEquals(0, shutdownHandlerCalls.get());
+            assertEquals(2, backend.recoveryChecks);
+        } finally {
+            allowSettlement.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
+    public void recoveryBlockedSettlementWinsAgainstLaterCancellation() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        backend.recoveryAssessments.add(ExecutionOwnershipManager.RecoveryAssessment.noCandidate());
+        backend.recoveryAssessments.add(RecoveryAssessmentFixture.ambiguousMissingRecord());
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        AtomicInteger shutdownHandlerCalls = new AtomicInteger();
+
+        ExecutionRecoveryException blocked = assertThrows(
+                ExecutionRecoveryException.class,
+                () -> runtime.startServiceLifecycle(
+                        SyncthingCommand.SERVE,
+                        normalModeEnvironment(),
+                        identity -> {
+                            shutdownHandlerCalls.incrementAndGet();
+                            return true;
+                        },
+                        new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+                            @Override
+                            public void commitRecoveryBlocked() {
+                                assertEquals(2, backend.recoveryChecks);
+                                permit.commitRecoveryBlocked();
+                                assertEquals("A later STOP cannot rewrite the settled outcome",
+                                        LifecycleLaunchPermit.State.RECOVERY_BLOCKED,
+                                        permit.revoke());
+                            }
+
+                            @Override
+                            public void check() {
+                                throw new AssertionError(
+                                        "A blocked recovery cannot launch"
+                                );
+                            }
+                        }
+                )
+        );
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                blocked.assessment().classification());
+        assertEquals(0, backend.startCount);
+        assertEquals(0, shutdownHandlerCalls.get());
+        assertEquals(2, backend.recoveryChecks);
     }
 
     @Test
