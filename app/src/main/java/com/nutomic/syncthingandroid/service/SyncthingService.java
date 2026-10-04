@@ -427,11 +427,12 @@ public class SyncthingService extends Service {
             }
         } else if (ACTION_RESET_DELTAS.equals(intent.getAction())) {
             // Check ownership before setting the delta-reset follow-up state or launching work.
-            boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+            boolean accepted = SyncthingResetPolicy.runExternalDeltaResetIfUnowned(
                     mFileMutationBarrier != null,
                     mPostMutationStartupGate.ownsStartup(),
                     mDatabaseResetOwnership.isReserved(),
                     mShutdownInProgress,
+                    mActionResetDeltasContinuation != null,
                     () -> {
                         Log.i(TAG, "Invoking reset of delta indexes");
                         mStopAfterDeltaResetWhenNotRequired = true;

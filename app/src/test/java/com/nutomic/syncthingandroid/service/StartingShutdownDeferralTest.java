@@ -49,7 +49,7 @@ public class StartingShutdownDeferralTest {
         startIntent.onRunConditionChanged(false, shutdown.blocksStartup(false));
         shutdown.transferToShutdown();
 
-        assertFalse(startIntent.consumeIfRequired(false, true, true, true, false));
+        assertFalse(startIntent.consumeIfRequired(true, true, true, true, false));
     }
 
     @Test

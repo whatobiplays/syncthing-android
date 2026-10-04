@@ -75,6 +75,25 @@ final class SyncthingResetPolicy {
         return true;
     }
 
+    /** Rejects another external delta reset while its single deferred reset still owns admission. */
+    static boolean runExternalDeltaResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState,
+            boolean shutdownInProgress,
+            boolean deltaResetContinuationPending,
+            Runnable resetAction
+    ) {
+        if (deltaResetContinuationPending) return false;
+        return runExternalResetIfUnowned(
+                fileMutationOwnsStoppedState,
+                postMutationOwnsStartup,
+                databaseResetOwnsStoppedState,
+                shutdownInProgress,
+                resetAction
+        );
+    }
+
     /** Forces certificate mutations through stopped-state admission while lifecycle work owns it. */
     static boolean certificateMutationRequiresShutdown(
             boolean serviceExecutionPresent,
