@@ -1,0 +1,40 @@
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_cd5eaf9ab3e468::t_28ca02915b9ebd 729-730,736-737,739,741-803,813,815-818,823-825,831-832
+  s_cd5eaf9ab3e468::t_eb3f9613523876 465-466,562-563,658,679
+  s_cd5eaf9ab3e468::t_40ff4b7bec039c 731-735,738,740,804-812,814,819-822,826-830,833-837
+app/src/test/java/com/nutomic/syncthingandroid/service/DatabaseResetOwnershipTest.java
+  s_cd5eaf9ab3e468::t_59c84158bb9edc 150-153,165-184
+  s_f62532abd49a65::t_eeeaf8c2077364 185-186
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LifecycleLaunchPermit.java
+  s_cd5eaf9ab3e468::t_972394b327f448 8-12,15,25-29,32-53,58-77
+app/src/main/java/com/nutomic/syncthingandroid/service/DatabaseResetOwnership.java
+  s_cd5eaf9ab3e468::t_972394b327f448 44-46
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_cd5eaf9ab3e468::t_972394b327f448 23,25-27,29,218
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_972394b327f448 732-733,1265-1266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "69ec458d30246ab3d9cc3c9051e38fd058a1e04c",
+  "prompts": {},
+  "sessions": {
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_f62532abd49a65": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a107da-78dc-7f81-a770-ffe844d47bae",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
