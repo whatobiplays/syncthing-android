@@ -1539,11 +1539,14 @@ public class SyncthingService extends Service {
 
     private void cancelActionResetDeltasContinuation() {
         ActionResetDeltasContinuation continuation = mActionResetDeltasContinuation;
-        if (continuation == null) return;
-        continuation.cancel();
-        if (mActionResetDeltasContinuation == continuation) {
-            mActionResetDeltasContinuation = null;
-        }
+        ShutdownFailureContinuationCleanup.cancelAndReleaseDeltaReset(
+                continuation,
+                () -> {
+                    if (mActionResetDeltasContinuation == continuation) {
+                        mActionResetDeltasContinuation = null;
+                    }
+                }
+        );
     }
 
     private void onShutdownOutcome(
@@ -1564,7 +1567,10 @@ public class SyncthingService extends Service {
         Log.e(TAG, "Could not prove the owned Syncthing execution exited: " + outcome);
         mShutdownStartIntent.clear();
         mShutdownInProgress = false;
-        mAfterShutdown = null;
+        ShutdownFailureContinuationCleanup.discard(
+                () -> mAfterShutdown = null,
+                this::cancelActionResetDeltasContinuation
+        );
         mShutdownRestApi = null;
         failFileMutationBarrier();
         synchronized (mStateLock) {
@@ -1652,7 +1658,10 @@ public class SyncthingService extends Service {
                     + (assessment == null ? "unknown" : assessment.classification()));
             mShutdownInProgress = false;
             mShutdownRecoveryCheckStarted = false;
-            mAfterShutdown = null;
+            ShutdownFailureContinuationCleanup.discard(
+                    () -> mAfterShutdown = null,
+                    this::cancelActionResetDeltasContinuation
+            );
             mShutdownRestApi = null;
             failFileMutationBarrier();
             synchronized (mStateLock) {

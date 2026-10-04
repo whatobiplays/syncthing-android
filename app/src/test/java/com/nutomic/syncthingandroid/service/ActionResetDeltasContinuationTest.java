@@ -128,6 +128,41 @@ public class ActionResetDeltasContinuationTest {
         assertEquals(1, resetLaunches.get());
     }
 
+    @Test
+    public void terminalShutdownFailureCleanupCancelsAndReleasesDiscardedDeltaReset() {
+        AtomicInteger resetLaunches = new AtomicInteger();
+        AtomicInteger laterResetRequests = new AtomicInteger();
+        AtomicBoolean stopAfterDeltaReset = new AtomicBoolean(true);
+        AtomicReference<Runnable> afterShutdown = new AtomicReference<>();
+        AtomicReference<ActionResetDeltasContinuation> pendingReset = new AtomicReference<>();
+        ActionResetDeltasContinuation reset = new ActionResetDeltasContinuation(
+                resetLaunches::incrementAndGet,
+                () -> stopAfterDeltaReset.set(false)
+        );
+        afterShutdown.set(reset::complete);
+        pendingReset.set(reset);
+
+        ShutdownFailureContinuationCleanup.discard(
+                () -> afterShutdown.set(null),
+                () -> ShutdownFailureContinuationCleanup.cancelAndReleaseDeltaReset(
+                        pendingReset.get(),
+                        () -> pendingReset.compareAndSet(reset, null)
+                )
+        );
+
+        assertNull(afterShutdown.get());
+        assertFalse(reset.complete());
+        assertEquals(0, resetLaunches.get());
+        assertFalse(stopAfterDeltaReset.get());
+        assertNull(pendingReset.get());
+
+        assertTrue(SyncthingResetPolicy.runExternalDeltaResetIfUnowned(
+                false, false, false, false, pendingReset.get() != null,
+                laterResetRequests::incrementAndGet
+        ));
+        assertEquals(1, laterResetRequests.get());
+    }
+
     private static OwnedExecutionShutdown.Outcome stopOldOwnedExecution()
             throws InterruptedException {
         ExecutionIdentity identity = new ExecutionIdentity(
