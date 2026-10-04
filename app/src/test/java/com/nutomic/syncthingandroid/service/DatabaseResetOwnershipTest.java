@@ -3,7 +3,10 @@ package com.nutomic.syncthingandroid.service;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+
+import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -129,5 +132,48 @@ public class DatabaseResetOwnershipTest {
         assertTrue(ownership.isReserved());
         assertTrue(ownership.complete(second));
         assertFalse(ownership.isReserved());
+    }
+
+    @Test
+    public void destructionRevokesPendingResetAndReleasesOnlyItsReservation() {
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        AtomicInteger afterReset = new AtomicInteger();
+        AtomicInteger onFailure = new AtomicInteger();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(
+                afterReset::incrementAndGet,
+                onFailure::incrementAndGet
+        );
+
+        assertTrue(ownership.cancelBeforeLaunch(operation));
+        assertFalse(ownership.isReserved());
+        assertThrows(LifecycleLaunchPermit.CancelledException.class, operation::commitLaunch);
+        assertFalse(ownership.complete(operation));
+        assertEquals(0, afterReset.get());
+        assertEquals(0, onFailure.get());
+
+        DatabaseResetOwnership.Operation newer = ownership.reserve(null, null);
+        assertFalse(ownership.cancelBeforeLaunch(operation));
+        assertTrue(ownership.isReserved());
+        assertTrue(ownership.complete(newer));
+    }
+
+    @Test
+    public void resetLaunchCommitPreventsDestructionFromReleasingItsReservation() {
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        AtomicInteger afterReset = new AtomicInteger();
+        AtomicInteger onFailure = new AtomicInteger();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(
+                afterReset::incrementAndGet,
+                onFailure::incrementAndGet
+        );
+
+        operation.commitLaunch();
+
+        assertFalse(ownership.cancelBeforeLaunch(operation));
+        assertTrue(ownership.isReserved());
+        assertTrue(ownership.complete(operation));
+        assertFalse(ownership.isReserved());
+        assertEquals(0, afterReset.get());
+        assertEquals(0, onFailure.get());
     }
 }

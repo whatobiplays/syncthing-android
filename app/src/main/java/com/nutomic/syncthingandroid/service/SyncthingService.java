@@ -1253,9 +1253,14 @@ public class SyncthingService extends Service {
                 SyncthingRunnable.forOneShotWithRecovery(
                         this,
                         SyncthingCommand.RESET_DATABASE,
-                        recoveryHandler
+                        recoveryHandler,
+                        operation::commitLaunch
                 ).run();
                 outcome = DatabaseResetOutcome.completed();
+            } catch (LifecycleLaunchPermit.CancelledException cancelledBeforeCreation) {
+                // Destruction already revoked and released this operation. No failure callback
+                // may start new service work after that terminal cancellation.
+                return;
             } catch (ExecutionAdmissionException e) {
                 Log.e(TAG, "Database reset rejected because another invocation owns admission", e);
                 outcome = DatabaseResetOutcome.failed(e);
@@ -1346,6 +1351,11 @@ public class SyncthingService extends Service {
     public void onDestroy() {
         Log.d(TAG, "onDestroy");
         mDestroying = true;
+        DatabaseResetOwnership.Operation resetOperation =
+                mDatabaseResetOwnership.currentOperation();
+        if (resetOperation != null) {
+            mDatabaseResetOwnership.cancelBeforeLaunch(resetOperation);
+        }
         revokeStartupLaunchPermit();
         CertificateVerificationStopHandler certificateVerification =
                 mCertificateVerificationStopHandler;

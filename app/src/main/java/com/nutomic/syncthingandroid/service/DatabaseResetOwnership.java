@@ -2,6 +2,8 @@ package com.nutomic.syncthingandroid.service;
 
 import androidx.annotation.Nullable;
 
+import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
+
 /** Holds the single service-thread reservation for a requested database reset. */
 final class DatabaseResetOwnership {
     enum ContinuationPolicy {
@@ -15,6 +17,7 @@ final class DatabaseResetOwnership {
         @Nullable private final Runnable afterReset;
         @Nullable private final Runnable onFailure;
         private final ContinuationPolicy continuationPolicy;
+        private final LifecycleLaunchPermit launchPermit = new LifecycleLaunchPermit();
         private boolean automaticStartupSuppressed;
 
         private Operation(@Nullable Runnable afterReset,
@@ -31,6 +34,15 @@ final class DatabaseResetOwnership {
 
         @Nullable Runnable onFailure() {
             return onFailure;
+        }
+
+        /** Commits this reset at the final boundary immediately before child process creation. */
+        void commitLaunch() {
+            launchPermit.commitLaunch();
+        }
+
+        private boolean cancelBeforeLaunch() {
+            return launchPermit.revoke() == LifecycleLaunchPermit.State.REVOKED;
         }
 
         private void suppressAutomaticStartup() {
@@ -87,6 +99,13 @@ final class DatabaseResetOwnership {
     /** Releases only the operation that completed, making duplicate completions harmless. */
     boolean complete(Operation operation) {
         if (currentOperation != operation) return false;
+        currentOperation = null;
+        return true;
+    }
+
+    /** Cancels and releases only this operation when process creation has not committed. */
+    boolean cancelBeforeLaunch(Operation operation) {
+        if (currentOperation != operation || !operation.cancelBeforeLaunch()) return false;
         currentOperation = null;
         return true;
     }

@@ -57,6 +57,26 @@ public final class DefaultSyncthingRuntime
     }
 
     /**
+     * Starts a one-shot after invoking its cancellation check inside the coordinated process-start
+     * boundary, immediately before the backend may create a child.
+     */
+    public SyncthingExecution startOneShot(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            Runnable beforeProcessCreation
+    ) throws IOException, ExecutableNotFoundException {
+        Runnable launchCheck = Objects.requireNonNull(beforeProcessCreation);
+        admission.acquireOneShot();
+        try {
+            return launch(command, environment, recoveryHandler, launchCheck, false);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("One-shot execution recovery was interrupted", e);
+        }
+    }
+
+    /**
      * Starts the service-owned invocation after the current admission owner exits.
      *
      * @throws InterruptedException when interrupted while waiting for admission or recovery
@@ -91,7 +111,13 @@ public final class DefaultSyncthingRuntime
             LifecycleLaunchCheck launchCheck
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         admission.awaitServiceLifecycleAdmission();
-        return launch(command, environment, recoveryHandler, launchCheck, true);
+        return launch(
+                command,
+                environment,
+                recoveryHandler,
+                launchCheck == null ? null : launchCheck::check,
+                true
+        );
     }
 
     /**
@@ -116,7 +142,7 @@ public final class DefaultSyncthingRuntime
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
-            LifecycleLaunchCheck launchCheck,
+            Runnable launchCheck,
             boolean serviceLifecycle
     ) throws IOException, ExecutableNotFoundException, InterruptedException {
         try {
@@ -126,6 +152,7 @@ public final class DefaultSyncthingRuntime
                 OwnedExecutionShutdown.requireNoUnquiescedRestShutdownRequests();
             }
             backend.validateLaunchPrerequisites();
+            OwnedExecutionShutdown.awaitProcessStartQuiescence();
             ExecutionOwnershipManager.RecoveryAssessment recovery =
                     backend.recoverExecutions();
             if (recovery.classification()
@@ -140,7 +167,7 @@ public final class DefaultSyncthingRuntime
 
             try (OwnedExecutionShutdown.LaunchPermit ignored =
                          OwnedExecutionShutdown.acquireLaunchPermit(serviceLifecycle)) {
-                if (launchCheck != null) launchCheck.check();
+                if (launchCheck != null) launchCheck.run();
                 PrivilegeBackend.Execution execution = backend.start(command, environment);
                 return new SyncthingExecution(execution, admission::release);
             }
@@ -152,6 +179,14 @@ public final class DefaultSyncthingRuntime
     }
 
     public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+        try {
+            OwnedExecutionShutdown.awaitProcessStartQuiescence();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(
+                    "Execution recovery was interrupted while waiting for process creation", e
+            );
+        }
         return backend.recoverExecutions();
     }
 

@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -231,6 +232,130 @@ public class RuntimeSeamTest {
                 "request-canceled",
                 "request-terminal"
         ), events);
+    }
+
+    @Test
+    public void destructionWinningAtOneShotLaunchBoundaryPreventsResetProcessCreation()
+            throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        CountDownLatch finalCheckReached = new CountDownLatch(1);
+        CountDownLatch allowFinalCheck = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+
+        try {
+            Future<String> launch = worker.submit(() -> {
+                try {
+                    runtime.startOneShot(
+                            SyncthingCommand.RESET_DATABASE,
+                            normalModeEnvironment(),
+                            null,
+                            () -> {
+                                finalCheckReached.countDown();
+                                awaitLatch(allowFinalCheck);
+                                permit.commitLaunch();
+                            }
+                    );
+                    return "started";
+                } catch (LifecycleLaunchPermit.CancelledException expected) {
+                    return "cancelled";
+                }
+            });
+
+            assertTrue(finalCheckReached.await(5, TimeUnit.SECONDS));
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+            allowFinalCheck.countDown();
+
+            assertEquals("cancelled", launch.get(5, TimeUnit.SECONDS));
+            assertEquals(0, backend.startCount);
+            assertNull(backend.command);
+        } finally {
+            allowFinalCheck.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
+    public void committedResetCreationIsObservedAndRecoveredBeforeShutdownScan()
+            throws Exception {
+        ExecutionIdentity identity = RecoveryAssessmentFixture.ownedIdentity();
+        GatedProcessCreationBackend backend = new GatedProcessCreationBackend(identity);
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+
+        try {
+            Future<SyncthingExecution> launch = workers.submit(() -> runtime.startOneShot(
+                    SyncthingCommand.RESET_DATABASE,
+                    normalModeEnvironment(),
+                    null,
+                    permit::commitLaunch
+            ));
+
+            assertTrue(backend.startEntered.await(5, TimeUnit.SECONDS));
+            assertEquals(LifecycleLaunchPermit.State.LAUNCH_COMMITTED, permit.revoke());
+
+            CountDownLatch recoveryRequested = new CountDownLatch(1);
+            Future<ExecutionOwnershipManager.RecoveryAssessment> recovery = workers.submit(() -> {
+                recoveryRequested.countDown();
+                return runtime.recoverExecutions();
+            });
+            assertTrue(recoveryRequested.await(5, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> recovery.get(5, TimeUnit.SECONDS));
+            assertEquals("The pending process creation must not be classified as absent",
+                    1, backend.recoveryChecks);
+
+            backend.allowProcessCreation.countDown();
+            SyncthingExecution execution = launch.get(5, TimeUnit.SECONDS);
+            ExecutionOwnershipManager.RecoveryAssessment recovered = recovery.get(
+                    5, TimeUnit.SECONDS
+            );
+            assertTrue(recovered.ownedExecution().sameProcess(identity));
+            assertEquals(1, backend.startCount);
+            assertSame(SyncthingCommand.RESET_DATABASE, backend.command);
+
+            List<ExecutionOwnershipManager.Signal> signals = new ArrayList<>();
+            OwnedExecutionShutdown.Outcome outcome = OwnedExecutionShutdown.stop(
+                    identity,
+                    () -> null,
+                    new OwnedExecutionShutdown.ExecutionControl() {
+                        @Override
+                        public ExecutionOwnershipManager.Observation observe(
+                                ExecutionIdentity observed
+                        ) {
+                            assertTrue(identity.sameProcess(observed));
+                            return backend.processExited
+                                    ? ExecutionOwnershipManager.Observation.EXITED
+                                    : ExecutionOwnershipManager.Observation.OWNED;
+                        }
+
+                        @Override
+                        public ExecutionOwnershipManager.SignalAttempt signalIfOwned(
+                                ExecutionIdentity observed,
+                                ExecutionOwnershipManager.Signal signal
+                        ) {
+                            assertTrue(identity.matches(observed));
+                            signals.add(signal);
+                            backend.markExited();
+                            return ExecutionOwnershipManager.SignalAttempt.SIGNALED;
+                        }
+                    },
+                    (observed, timeout, ignored) -> {
+                        assertTrue(identity.sameProcess(observed));
+                        return timeout != OwnedExecutionShutdown.REST_SHUTDOWN_WAIT_MS;
+                    }
+            );
+
+            assertEquals(OwnedExecutionShutdown.Outcome.EXITED, outcome);
+            assertEquals(Collections.singletonList(ExecutionOwnershipManager.Signal.SIGINT),
+                    signals);
+            assertEquals(0, execution.await());
+            assertTrue(runtime.recoverExecutions().mayLaunch());
+        } finally {
+            backend.allowProcessCreation.countDown();
+            workers.shutdownNow();
+        }
     }
 
     @Test
@@ -1030,20 +1155,20 @@ public class RuntimeSeamTest {
         );
     }
 
-    private static final class RecordingBackend implements PrivilegeBackend {
+    private static class RecordingBackend implements PrivilegeBackend {
         private final ConfigStorage storage = new InMemoryConfigStorage();
-        private final List<String> events = new ArrayList<>();
+        protected final List<String> events = new ArrayList<>();
         private final Deque<ExecutionOwnershipManager.RecoveryAssessment> recoveryAssessments =
                 new ConcurrentLinkedDeque<>();
-        private Execution execution = new ImmediateExecution();
+        protected Execution execution = new ImmediateExecution();
         private ExecutableNotFoundException launchPrerequisiteFailure;
-        private int recoveryChecks;
-        private SyncthingCommand command;
+        protected volatile int recoveryChecks;
+        protected SyncthingCommand command;
         private SyncthingEnvironment environment;
         private ConfiguredFolderReference folder;
         private FolderEvent event;
         private String[] ignore;
-        private int startCount;
+        protected volatile int startCount;
         private ExecutionOwnershipManager.Observation observation =
                 ExecutionOwnershipManager.Observation.UNKNOWN;
 
@@ -1117,6 +1242,42 @@ public class RuntimeSeamTest {
             this.event = event;
         }
 
+    }
+
+    private static final class GatedProcessCreationBackend extends RecordingBackend {
+        private final CountDownLatch startEntered = new CountDownLatch(1);
+        private final CountDownLatch allowProcessCreation = new CountDownLatch(1);
+        private final ExecutionIdentity identity;
+        private volatile boolean processCreated;
+        private volatile boolean processExited;
+
+        private GatedProcessCreationBackend(ExecutionIdentity identity) {
+            this.identity = identity;
+        }
+
+        @Override
+        public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
+                throws IOException, ExecutableNotFoundException {
+            startEntered.countDown();
+            awaitLatch(allowProcessCreation);
+            execution = new ImmediateExecution(identity);
+            processCreated = true;
+            return super.start(command, environment);
+        }
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            if (processCreated && !processExited) {
+                return RecoveryAssessmentFixture.ownedExecution();
+            }
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+
+        private void markExited() {
+            processExited = true;
+        }
     }
 
     private static final class ImmediateExecution implements PrivilegeBackend.Execution {
@@ -1243,6 +1404,15 @@ public class RuntimeSeamTest {
                 .sqliteTemporaryDirectory("/tmp")
                 .gogc(100)
                 .build();
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     /**

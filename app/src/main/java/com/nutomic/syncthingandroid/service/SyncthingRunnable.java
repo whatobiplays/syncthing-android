@@ -13,6 +13,8 @@ import android.os.Build;
 import android.text.TextUtils;
 import android.util.Log;
 
+import androidx.annotation.Nullable;
+
 import com.google.common.base.Charsets;
 import com.google.common.io.Files;
 import com.nutomic.syncthingandroid.R;
@@ -42,6 +44,7 @@ import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 
 import javax.inject.Inject;
 
@@ -69,6 +72,7 @@ public class SyncthingRunnable implements Runnable {
     private final DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler mRecoveryHandler;
     private final LifecycleListener mLifecycleListener;
     private final DefaultSyncthingRuntime.LifecycleLaunchCheck mLifecycleLaunchCheck;
+    @Nullable private final Runnable mOneShotLaunchCheck;
 
     /** Immutable lifecycle result produced by the background execution worker. */
     static final class LifecycleOutcome {
@@ -211,7 +215,7 @@ public class SyncthingRunnable implements Runnable {
      * @param command Which type of Syncthing command to execute.
      */
     public SyncthingRunnable(Context context, SyncthingCommand command) {
-        this(context, command, false, null, null, null);
+        this(context, command, false, null, null, null, null);
     }
 
     /** Creates a one-shot command that can stop a previous execution after proving ownership. */
@@ -220,7 +224,22 @@ public class SyncthingRunnable implements Runnable {
             SyncthingCommand command,
             DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler
     ) {
-        return new SyncthingRunnable(context, command, false, recoveryHandler, null, null);
+        return new SyncthingRunnable(
+                context, command, false, recoveryHandler, null, null, null
+        );
+    }
+
+    /** Creates a one-shot with an atomic check immediately before process creation. */
+    static SyncthingRunnable forOneShotWithRecovery(
+            Context context,
+            SyncthingCommand command,
+            DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler,
+            Runnable beforeProcessCreation
+    ) {
+        return new SyncthingRunnable(
+                context, command, false, recoveryHandler, null, null,
+                Objects.requireNonNull(beforeProcessCreation)
+        );
     }
 
     /**
@@ -232,7 +251,7 @@ public class SyncthingRunnable implements Runnable {
      * @param command Which service lifecycle command to execute.
      */
     static SyncthingRunnable forServiceLifecycle(Context context, SyncthingCommand command) {
-        return new SyncthingRunnable(context, command, true, null, null, null);
+        return new SyncthingRunnable(context, command, true, null, null, null, null);
     }
 
     /** Creates a service lifecycle worker with immutable outcome and exact recovery callbacks. */
@@ -243,7 +262,7 @@ public class SyncthingRunnable implements Runnable {
             LifecycleListener lifecycleListener
     ) {
         return new SyncthingRunnable(
-                context, command, true, recoveryHandler, lifecycleListener, null
+                context, command, true, recoveryHandler, lifecycleListener, null, null
         );
     }
 
@@ -256,7 +275,7 @@ public class SyncthingRunnable implements Runnable {
             DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
     ) {
         return new SyncthingRunnable(
-                context, command, true, recoveryHandler, lifecycleListener, launchCheck
+                context, command, true, recoveryHandler, lifecycleListener, launchCheck, null
         );
     }
 
@@ -273,7 +292,8 @@ public class SyncthingRunnable implements Runnable {
             boolean waitForAdmission,
             DefaultSyncthingRuntime.OwnedExecutionRecoveryHandler recoveryHandler,
             LifecycleListener lifecycleListener,
-            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
+            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck,
+            @Nullable Runnable oneShotLaunchCheck
     ) {
         ((SyncthingApp) context.getApplicationContext()).component().inject(this);
         ENABLE_VERBOSE_LOG = AppPrefs.getPrefVerboseLog(mPreferences);
@@ -283,6 +303,7 @@ public class SyncthingRunnable implements Runnable {
         mRecoveryHandler = recoveryHandler;
         mLifecycleListener = lifecycleListener;
         mLifecycleLaunchCheck = launchCheck;
+        mOneShotLaunchCheck = oneShotLaunchCheck;
         mSyncthingLogFile = Constants.getSyncthingLogFile(mContext);
     }
 
@@ -493,6 +514,11 @@ public class SyncthingRunnable implements Runnable {
         if (mWaitForAdmission) {
             return mRuntime.startServiceLifecycle(
                     mCommand, targetEnv, mRecoveryHandler, mLifecycleLaunchCheck
+            );
+        }
+        if (mOneShotLaunchCheck != null) {
+            return mRuntime.startOneShot(
+                    mCommand, targetEnv, mRecoveryHandler, mOneShotLaunchCheck
             );
         }
         return mRuntime.start(mCommand, targetEnv, mRecoveryHandler);

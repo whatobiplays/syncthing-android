@@ -136,6 +136,16 @@ public final class OwnedExecutionShutdown {
         }
     }
 
+    /**
+     * Waits until any committed backend process creation has returned and can be inspected.
+     * Recovery scans use this so they cannot mistake an in-flight start for an absent process.
+     */
+    public static void awaitProcessStartQuiescence() throws InterruptedException {
+        synchronized (COORDINATOR_MONITOR) {
+            while (processStartInProgress) COORDINATOR_MONITOR.wait();
+        }
+    }
+
     /** Waits for older shutdown requests before a lifecycle start inspects process ownership. */
     public static void awaitNoUnquiescedRestShutdownRequests() throws InterruptedException {
         while (true) {
