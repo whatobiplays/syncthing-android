@@ -6,6 +6,7 @@ import androidx.annotation.Nullable;
 
 import com.android.volley.Request;
 import com.google.common.base.Optional;
+import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 
 import java.net.URL;
 import java.util.Collections;
@@ -21,12 +22,19 @@ public class PostRequest extends ApiRequest {
     public static final String URI_SYSTEM_SHUTDOWN  = "/rest/system/shutdown";
 
     public PostRequest(Context context, URL url, String path, String apiKey,
-        	           @Nullable Map<String, String> params, @Nullable String postBody,
+                       @Nullable Map<String, String> params, @Nullable String postBody,
                        OnSuccessListener listener) {
         super(context, url, path, apiKey);
         Map<String, String> safeParams = Optional.fromNullable(params).or(Collections.emptyMap());
         Uri uri = buildUri(safeParams);
         connect(Request.Method.POST, uri, postBody, listener, null);
+    }
+
+    /** Prepares a one-attempt shutdown request without making it deliverable. */
+    public static OwnedExecutionShutdown.RestShutdownRequest singleAttemptShutdown(
+            Context context, URL url, String apiKey
+    ) {
+        return RecoveryShutdownRequest.create(context, url, apiKey);
     }
 
 }

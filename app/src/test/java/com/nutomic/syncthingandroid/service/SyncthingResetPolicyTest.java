@@ -1,8 +1,11 @@
 package com.nutomic.syncthingandroid.service;
 
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+
+import java.util.ArrayDeque;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
@@ -18,6 +21,9 @@ public class SyncthingResetPolicyTest {
         ));
         assertTrue(SyncthingResetPolicy.shouldWaitForShutdownComplete(
                 SyncthingService.State.DISABLED, true
+        ));
+        assertTrue(SyncthingResetPolicy.shouldWaitForShutdownComplete(
+                SyncthingService.State.DISABLED, false, true
         ));
         assertFalse(SyncthingResetPolicy.shouldWaitForShutdownComplete(
                 SyncthingService.State.DISABLED, false
@@ -41,57 +47,146 @@ public class SyncthingResetPolicyTest {
     }
 
     @Test
-    public void shutdownCompletionWaitsThroughInterruptionsAndRestoresAfterCallback() {
-        RepeatedlyInterruptedJoin join = new RepeatedlyInterruptedJoin(2);
-        boolean[] callbackSawInterrupted = {false};
-        boolean[] callbackSawExit = {false};
-        boolean interruptedBeforeTest = Thread.currentThread().isInterrupted();
-        Thread.interrupted();
+    public void resetCompletionSkipsContinuationWhenServiceIsDestroyedBeforeDispatch() {
+        boolean[] destroying = {false};
+        boolean[] continuationRan = {false};
+        ArrayDeque<Runnable> serviceThreadQueue = new ArrayDeque<>();
 
-        try {
-            TerminationWait.awaitTermination(
-                    join::join,
-                    () -> {
-                        callbackSawInterrupted[0] = Thread.currentThread().isInterrupted();
-                        callbackSawExit[0] = join.exitKnown;
-                    },
-                    () -> { }
-            );
+        serviceThreadQueue.add(SyncthingResetPolicy.afterResetUnlessDestroying(
+                () -> destroying[0],
+                () -> continuationRan[0] = true
+        ));
+        destroying[0] = true;
+        serviceThreadQueue.remove().run();
 
-            assertTrue(join.exitKnown);
-            assertEquals(3, join.joinCount);
-            assertTrue(callbackSawExit[0]);
-            assertFalse(callbackSawInterrupted[0]);
-            assertTrue(Thread.currentThread().isInterrupted());
-        } finally {
-            Thread.interrupted();
-            if (interruptedBeforeTest) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        assertFalse(continuationRan[0]);
     }
 
-    private static final class RepeatedlyInterruptedJoin {
-        private int interruptionsRemaining;
-        private int joinCount;
-        private boolean exitKnown;
+    @Test
+    public void externalDatabaseResetIsRejectedWhileFileMutationOwnsStoppedState() {
+        AtomicInteger resetInvocations = new AtomicInteger();
 
-        private RepeatedlyInterruptedJoin(int interruptionsRemaining) {
-            this.interruptionsRemaining = interruptionsRemaining;
-        }
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                true, false, resetInvocations::incrementAndGet
+        );
 
-        private void join() throws InterruptedException {
-            joinCount++;
-            if (interruptionsRemaining > 0) {
-                interruptionsRemaining--;
-                if (interruptionsRemaining == 0) {
-                    exitKnown = true;
+        assertFalse(accepted);
+        assertEquals(0, resetInvocations.get());
+    }
+
+    @Test
+    public void externalDatabaseResetIsRejectedWhileImportOwnsStartup() {
+        AtomicInteger resetInvocations = new AtomicInteger();
+
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, true, resetInvocations::incrementAndGet
+        );
+
+        assertFalse(accepted);
+        assertEquals(0, resetInvocations.get());
+    }
+
+    @Test
+    public void rejectedDeltaResetDoesNotLaunchOrLeaveStopAfterState() {
+        boolean[] stopAfterDeltaReset = {false};
+        AtomicInteger launches = new AtomicInteger();
+
+        boolean accepted = SyncthingResetPolicy.runExternalResetIfUnowned(
+                true, false, () -> {
+                    stopAfterDeltaReset[0] = true;
+                    launches.incrementAndGet();
                 }
-                throw new InterruptedException("test interruption");
-            }
-            if (!exitKnown) {
-                throw new AssertionError("shutdown completed before execution exit was known");
-            }
-        }
+        );
+
+        assertFalse(accepted);
+        assertFalse(stopAfterDeltaReset[0]);
+        assertEquals(0, launches.get());
+    }
+
+    @Test
+    public void externalResetActionsRunAfterMutationOwnershipEnds() {
+        AtomicInteger databaseResets = new AtomicInteger();
+        AtomicInteger deltaResets = new AtomicInteger();
+
+        assertTrue(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, databaseResets::incrementAndGet
+        ));
+        assertTrue(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, deltaResets::incrementAndGet
+        ));
+
+        assertEquals(1, databaseResets.get());
+        assertEquals(1, deltaResets.get());
+    }
+
+    @Test
+    public void databaseAndDeltaResetsAreRejectedBehindRestartContinuation() {
+        AtomicInteger databaseResets = new AtomicInteger();
+        AtomicInteger deltaResets = new AtomicInteger();
+        boolean[] stopAfterDeltaReset = {false};
+
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, true, databaseResets::incrementAndGet
+        ));
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, true, () -> {
+                    stopAfterDeltaReset[0] = true;
+                    deltaResets.incrementAndGet();
+                }
+        ));
+
+        assertEquals(0, databaseResets.get());
+        assertEquals(0, deltaResets.get());
+        assertFalse(stopAfterDeltaReset[0]);
+    }
+
+    @Test
+    public void shutdownRecoveryWithoutContinuationRejectsExternalDatabaseAndDeltaResets() {
+        AtomicInteger databaseResets = new AtomicInteger();
+        AtomicInteger deltaResets = new AtomicInteger();
+        boolean[] stopAfterDeltaReset = {false};
+        boolean shutdownInProgress = true;
+
+        // Shutdown retains replacement authorization even after handles and continuations clear.
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, shutdownInProgress,
+                databaseResets::incrementAndGet
+        ));
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, false, shutdownInProgress,
+                () -> {
+                    stopAfterDeltaReset[0] = true;
+                    deltaResets.incrementAndGet();
+                }
+        ));
+
+        assertEquals(0, databaseResets.get());
+        assertEquals(0, deltaResets.get());
+        assertFalse(stopAfterDeltaReset[0]);
+    }
+
+    @Test
+    public void externalResetIsRejectedWhileDatabaseResetOwnsStoppedState() {
+        AtomicInteger resets = new AtomicInteger();
+
+        assertFalse(SyncthingResetPolicy.runExternalResetIfUnowned(
+                false, false, true, false, resets::incrementAndGet
+        ));
+
+        assertEquals(0, resets.get());
+    }
+
+    @Test
+    public void certificateMutationUsesStoppedAdmissionDuringImportReset() {
+        assertTrue(SyncthingResetPolicy.certificateMutationRequiresShutdown(
+                false, true, true
+        ));
+    }
+
+    @Test
+    public void certificateMutationsUseStoppedAdmissionDuringDatabaseReset() {
+        assertTrue(SyncthingResetPolicy.certificateMutationRequiresShutdown(
+                false, false, true
+        ));
     }
 }

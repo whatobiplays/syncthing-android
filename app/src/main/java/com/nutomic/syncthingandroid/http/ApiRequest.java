@@ -11,6 +11,7 @@ import android.widget.ImageView;
 import com.android.volley.AuthFailureError;
 import com.android.volley.DefaultRetryPolicy;
 import com.android.volley.NetworkResponse;
+import com.android.volley.Request;
 import com.android.volley.RequestQueue;
 import com.android.volley.Response;
 import com.android.volley.VolleyError;
@@ -68,7 +69,7 @@ public abstract class ApiRequest {
 
     private static RequestQueue sVolleyQueue;
 
-    private RequestQueue getVolleyQueue() {
+    RequestQueue getVolleyQueue() {
         if (sVolleyQueue == null) {
             Context context = mContext.getApplicationContext();
             sVolleyQueue = Volley.newRequestQueue(context, new NetworkStack());
@@ -141,7 +142,25 @@ public abstract class ApiRequest {
             Log.v(TAG, "Performing request to " + uri.toString());
         }
         */
-        StringRequest request = new StringRequest(requestMethod, uri.toString(), reply -> {
+        StringRequest request = createStringRequest(
+                requestMethod, uri, requestBody, listener, errorListener
+        );
+
+        // Some requests seem to be slow or fail, make sure this doesn't break the app
+        // (eg if an event request fails, new event requests won't be triggered).
+        request.setRetryPolicy(new DefaultRetryPolicy(5000, 5,
+                DefaultRetryPolicy.DEFAULT_BACKOFF_MULT));
+        getVolleyQueue().add(request);
+    }
+
+    StringRequest createStringRequest(
+            int requestMethod,
+            Uri uri,
+            @Nullable String requestBody,
+            @Nullable OnSuccessListener listener,
+            @Nullable OnErrorListener errorListener
+    ) {
+        return new StringRequest(requestMethod, uri.toString(), reply -> {
             if (listener != null) {
                 listener.onSuccess(reply);
             }
@@ -191,12 +210,6 @@ public abstract class ApiRequest {
                 return Response.success(parsed, HttpHeaderParser.parseCacheHeaders(response));
             }
         };
-
-        // Some requests seem to be slow or fail, make sure this doesn't break the app
-        // (eg if an event request fails, new event requests won't be triggered).
-        request.setRetryPolicy(new DefaultRetryPolicy(5000, 5,
-                DefaultRetryPolicy.DEFAULT_BACKOFF_MULT));
-        getVolleyQueue().add(request);
     }
 
     /**

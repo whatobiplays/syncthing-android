@@ -1,13 +1,18 @@
 package com.nutomic.syncthingandroid.service;
 
 /**
- * Defines the small amount of reset coordination needed by the service while a service-owned
- * Syncthing invocation may still be active.
+ * Defines the small amount of reset coordination needed while a Syncthing lifecycle or
+ * stopped-state mutation owns admission.
  */
 final class SyncthingResetPolicy {
 
     @FunctionalInterface
     interface ShouldRun {
+        boolean get();
+    }
+
+    @FunctionalInterface
+    interface IsDestroying {
         boolean get();
     }
 
@@ -26,7 +31,78 @@ final class SyncthingResetPolicy {
             SyncthingService.State state,
             boolean serviceRunnablePresent
     ) {
-        return state != SyncthingService.State.DISABLED || serviceRunnablePresent;
+        return shouldWaitForShutdownComplete(state, serviceRunnablePresent, false);
+    }
+
+    static boolean shouldWaitForShutdownComplete(
+            SyncthingService.State state,
+            boolean serviceRunnablePresent,
+            boolean shutdownInProgress
+    ) {
+        return shutdownInProgress
+                || state != SyncthingService.State.DISABLED
+                || serviceRunnablePresent;
+    }
+
+    /** Runs an external reset action only when no stopped-state mutation owns lifecycle admission. */
+    static boolean runExternalResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            Runnable resetAction
+    ) {
+        return runExternalResetIfUnowned(
+                fileMutationOwnsStoppedState,
+                postMutationOwnsStartup,
+                false,
+                false,
+                resetAction
+        );
+    }
+
+    /** Runs an external reset only when no mutation, reset, or active shutdown owns state. */
+    static boolean runExternalResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState,
+            boolean shutdownInProgress,
+            Runnable resetAction
+    ) {
+        if (fileMutationOwnsStoppedState || postMutationOwnsStartup
+                || databaseResetOwnsStoppedState || shutdownInProgress) {
+            return false;
+        }
+        resetAction.run();
+        return true;
+    }
+
+    /** Rejects another external delta reset while its single deferred reset still owns admission. */
+    static boolean runExternalDeltaResetIfUnowned(
+            boolean fileMutationOwnsStoppedState,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState,
+            boolean shutdownInProgress,
+            boolean deltaResetContinuationPending,
+            Runnable resetAction
+    ) {
+        if (deltaResetContinuationPending) return false;
+        return runExternalResetIfUnowned(
+                fileMutationOwnsStoppedState,
+                postMutationOwnsStartup,
+                databaseResetOwnsStoppedState,
+                shutdownInProgress,
+                resetAction
+        );
+    }
+
+    /** Forces certificate mutations through stopped-state admission while lifecycle work owns it. */
+    static boolean certificateMutationRequiresShutdown(
+            boolean serviceExecutionPresent,
+            boolean postMutationOwnsStartup,
+            boolean databaseResetOwnsStoppedState
+    ) {
+        return serviceExecutionPresent
+                || postMutationOwnsStartup
+                || databaseResetOwnsStoppedState;
     }
 
     /**
@@ -38,6 +114,18 @@ final class SyncthingResetPolicy {
             if (shouldRun.get()) {
                 relaunch.run();
             }
+        };
+    }
+
+    /**
+     * Creates a service-thread continuation that rechecks destruction when it is dispatched.
+     *
+     * <p>The reset worker must not read service lifecycle state. Supplying the state reader here
+     * defers that read until the handler runs the returned continuation on the service thread.</p>
+     */
+    static Runnable afterResetUnlessDestroying(IsDestroying isDestroying, Runnable afterReset) {
+        return () -> {
+            if (!isDestroying.get()) afterReset.run();
         };
     }
 }

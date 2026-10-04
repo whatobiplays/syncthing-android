@@ -53,6 +53,7 @@ import com.nutomic.syncthingandroid.model.SystemVersion;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.FolderEvent;
+import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.util.FileUtils;
 import com.nutomic.syncthingandroid.util.Util;
@@ -612,15 +613,14 @@ public class RestApi {
     }
 
     /**
-     * Posts shutdown request.
-     * This will cause SyncthingNative to exit and not restart.
+     * Prepares the recovery shutdown request. The caller registers its admission lease before
+     * sending the returned request.
      */
-    public void shutdown() {
+    public OwnedExecutionShutdown.RestShutdownRequest prepareShutdown() {
         hasShutdown = true;
         executorService.shutdownNow();
         Util.killProcess("find");
-        new PostRequest(mContext, mUrl, PostRequest.URI_SYSTEM_SHUTDOWN, mApiKey,
-                null, null, null);
+        return PostRequest.singleAttemptShutdown(mContext, mUrl, mApiKey);
     }
 
     /**
