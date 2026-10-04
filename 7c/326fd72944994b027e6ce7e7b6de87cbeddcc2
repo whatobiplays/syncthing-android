@@ -1,0 +1,28 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LifecycleLaunchPermit.java
+  s_cd5eaf9ab3e468::t_3920e9ebabdc6a 28-32
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_cd5eaf9ab3e468::t_3ea1dd222dfff3 446-460,475-496,498-525,527-542
+  s_cd5eaf9ab3e468::t_72056e73a4acd1 461-474,497,526,564,570-582,587-588
+  s_cd5eaf9ab3e468::t_4de43747e75c21 445
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_f3cf6c1f3b7221 729-743
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_cd5eaf9ab3e468::t_04a6edcc6af1d4 29,143
+  s_cd5eaf9ab3e468::t_a63ae7c0f52e51 22-28,30-31,97,170,200,204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c326fd72944994b027e6ce7e7b6de87cbeddcc2",
+  "prompts": {},
+  "sessions": {
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
