@@ -1,0 +1,27 @@
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingService.java
+  s_cd5eaf9ab3e468::t_9be02ab72173f7 430,435
+app/src/test/java/com/nutomic/syncthingandroid/service/StartingShutdownDeferralTest.java
+  s_cd5eaf9ab3e468::t_bb8576269ce64e 52
+app/src/test/java/com/nutomic/syncthingandroid/service/ActionResetDeltasContinuationTest.java
+  s_cd5eaf9ab3e468::t_9be02ab72173f7 100
+  s_cd5eaf9ab3e468::t_313f46e7ffac02 101
+  s_cd5eaf9ab3e468::t_bb8576269ce64e 5-6,51-99,102-112
+app/src/main/java/com/nutomic/syncthingandroid/service/SyncthingResetPolicy.java
+  s_cd5eaf9ab3e468::t_313f46e7ffac02 78-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "24df5a914fcaff19337cef3d01f33f2d0786f41b",
+  "prompts": {},
+  "sessions": {
+    "s_cd5eaf9ab3e468": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f441-e0ee-74d3-b16f-8ef32b458abc",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
