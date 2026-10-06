@@ -3,6 +3,7 @@ package com.nutomic.syncthingandroid.runtime;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -11,6 +12,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.Test;
 
@@ -353,11 +355,19 @@ public class RootRunSpoolTest {
             assertFalse("nothing appended the output of an owned run", log.exists());
 
             // The operating system releases a dead process's lease, so the leftover run stays
-            // reconcilable without any durable ownership marker of its own.
+            // reconcilable without any durable ownership marker of its own. Process death releases
+            // the lock; it never unlinks the file the lock lives in, because unlinking would create
+            // a new pathname whose new inode a second owner could lock while this run still existed.
             leftover.releaseLease();
+            assertFalse("a released lease no longer owns its run", leftover.leaseHeld());
+            assertTrue("a released lease leaves the file it lived in behind", leftover.leaseFile().isFile());
             assertEquals(1, reconciler.reconcile(null));
             assertFalse(leftover.directory().exists());
             assertEquals("leftover output\n", readText(log));
+            assertFalse(
+                    "the lease file is removed with the run it protected",
+                    leftover.leaseFile().exists()
+            );
         } finally {
             deleteRecursively(root);
         }
@@ -532,6 +542,229 @@ public class RootRunSpoolTest {
         } finally {
             deleteRecursively(root);
         }
+    }
+
+
+    /**
+     * A handle that cannot take a run's lease must never touch the run another owner holds.
+     *
+     * <p>The lease is taken before the run directory is created, so a failed acquisition means the
+     * run belongs to somebody else and every durable file of that owner has to survive untouched.
+     * </p>
+     */
+    @Test
+    public void failedLeaseAcquisitionNeverTouchesAnotherOwnersRun() throws IOException {
+        File root = temporaryDirectory();
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool owner = RootRunSpool.create(
+                    spoolRoot, "token-shared", SyncthingCommand.SERVE.name()
+            );
+            appendText(owner.outputFile(), "owner output\n");
+            assertTrue(owner.acquireLease());
+            String contentsBefore = describeRun(owner.directory());
+
+            RootRunSpool intruder = RootRunSpool.plan(
+                    spoolRoot, "token-shared", SyncthingCommand.SERVE.name()
+            );
+            IOException failure = assertThrows(
+                    IOException.class,
+                    () -> intruder.materialize(RecoveryAssessmentFixture.ownedIdentity())
+            );
+
+            assertTrue(failure.getMessage(), failure.getMessage().contains("ownership"));
+            assertFalse("the failed handle never owns the run", intruder.leaseHeld());
+            assertTrue("the owner still owns the run", owner.leaseHeld());
+            assertEquals(
+                    "a failed acquisition leaves every file of the owner untouched",
+                    contentsBefore,
+                    describeRun(owner.directory())
+            );
+            assertEquals("owner output\n", readText(owner.outputFile()));
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    /**
+     * A run whose deletion has begun stays exclusively owned until that deletion completes.
+     *
+     * <p>The lease lives in a stable sibling file, so removing the run's contents never unlinks the
+     * inode that provides exclusion. Another handle must therefore keep failing to acquire the run
+     * for the whole deletion, and the run ceases to be protected only once it no longer exists.</p>
+     */
+    @Test
+    public void aRunStaysExclusivelyOwnedWhileItsDeletionIsInProgress() throws IOException {
+        File root = temporaryDirectory();
+        try {
+            File spoolRoot = new File(root, "runs");
+            File log = new File(root, "syncthing.log");
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(spoolRoot, log, root);
+            RootRunSpool owned = RootRunSpool.create(
+                    spoolRoot, "token-deleting", SyncthingCommand.DEVICE_ID.name()
+            );
+            appendText(owned.outputFile(), "deleted run output\n");
+            assertTrue(owned.acquireLease());
+
+            AtomicBoolean deletionStarted = new AtomicBoolean();
+            owned.deletionStartedHookForTesting = () -> {
+                deletionStarted.set(true);
+                RootRunSpool other = RootRunSpool.plan(
+                        spoolRoot, "token-deleting", SyncthingCommand.DEVICE_ID.name()
+                );
+                assertFalse(
+                        "a deletion in progress still excludes every other handle",
+                        other.acquireLease()
+                );
+                assertEquals(
+                        "a run whose deletion has begun is not reconciled",
+                        0,
+                        reconciler.reconcile(null)
+                );
+                assertTrue(
+                        "the protected run still exists while its deletion is in progress",
+                        owned.directory().isDirectory()
+                );
+            };
+
+            assertTrue(owned.delete());
+            assertTrue("the deletion hook observed the deletion", deletionStarted.get());
+            assertFalse("the run is gone once its deletion completed", owned.directory().exists());
+            assertFalse("ownership is released with the completed deletion", owned.leaseHeld());
+            assertFalse(
+                    "the lease file is removed only after the run directory is gone",
+                    owned.leaseFile().exists()
+            );
+            assertEquals("the deleted run is absent from later reconciliation", 0, reconciler.reconcile(null));
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    /**
+     * A run directory is never visible before the handle that creates it holds its lease.
+     *
+     * <p>Arming takes the lease first and only then creates the directory and its durable state, so
+     * no concurrent classification can ever observe a run that has no owner.</p>
+     */
+    @Test
+    public void noRunDirectoryIsVisibleBeforeItsOwnerHoldsTheLease() throws IOException {
+        File root = temporaryDirectory();
+        try {
+            File spoolRoot = new File(root, "runs");
+            File log = new File(root, "syncthing.log");
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(spoolRoot, log, root);
+            RootRunSpool arming = RootRunSpool.plan(
+                    spoolRoot, "token-arming", SyncthingCommand.SERVE.name()
+            );
+
+            AtomicBoolean leaseObserved = new AtomicBoolean();
+            arming.leaseAcquiredHookForTesting = () -> {
+                leaseObserved.set(true);
+                assertTrue("the arming handle owns the run", arming.leaseHeld());
+                RootRunSpool other = RootRunSpool.plan(
+                        spoolRoot, "token-arming", SyncthingCommand.SERVE.name()
+                );
+                assertFalse("no second handle can arm the same run", other.acquireLease());
+                assertFalse(
+                        "no unleased run directory is ever visible",
+                        arming.directory().exists()
+                );
+                assertEquals(
+                        "a run that is still arming is never reconciled as leftover",
+                        0,
+                        reconciler.reconcile(null)
+                );
+            };
+
+            arming.materialize(RecoveryAssessmentFixture.ownedIdentity());
+
+            assertTrue("the lease hook observed arming", leaseObserved.get());
+            assertTrue(arming.leaseHeld());
+            assertTrue(arming.directory().isDirectory());
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    /**
+     * A partially created run whose directory cannot be removed keeps its lease file.
+     *
+     * <p>Unlinking the pathname that provides exclusion while the partial run directory still
+     * exists would let another owner lock a replacement inode of the same pathname. Failed arming
+     * therefore gives up ownership but leaves the lease file until the directory is really gone, so
+     * no second owner can ever take over a run that survived the failure.</p>
+     */
+    @Test
+    public void aPartiallyCreatedRunThatCannotBeRemovedKeepsItsLeaseFile() throws IOException {
+        File root = temporaryDirectory();
+        File partialRun = null;
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool spool = RootRunSpool.plan(
+                    spoolRoot, "token-partial", SyncthingCommand.SERVE.name()
+            );
+            partialRun = spool.directory();
+            File survivingRun = partialRun;
+            spool.leaseAcquiredHookForTesting = () -> {
+                // Models a partial run that survives cleanup: the directory exists, is not empty,
+                // and cannot be listed or written to, so arming fails and recursive deletion cannot
+                // remove it.
+                try {
+                    assertTrue(survivingRun.mkdirs() || survivingRun.isDirectory());
+                    writeText(new File(survivingRun, "partial"), "partial\n");
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+                assertTrue(
+                        "the test requires a run directory that cannot be written to",
+                        survivingRun.setWritable(false)
+                );
+                assertTrue(
+                        "the test requires a run directory that cannot be listed",
+                        survivingRun.setReadable(false)
+                );
+            };
+
+            assertThrows(
+                    IOException.class,
+                    () -> spool.materialize(RecoveryAssessmentFixture.ownedIdentity())
+            );
+
+            assertFalse("the failed arming gives up ownership", spool.leaseHeld());
+            assertTrue(
+                    "the surviving partial run keeps the namespace that provides exclusion",
+                    spool.leaseFile().isFile()
+            );
+            assertTrue("the partial run itself survives", partialRun.exists());
+
+            // Ownership was released, so a later handle can take the surviving run and classify it.
+            RootRunSpool later = RootRunSpool.plan(
+                    spoolRoot, "token-partial", SyncthingCommand.SERVE.name()
+            );
+            assertTrue(later.acquireLease());
+            later.releaseLease();
+        } finally {
+            if (partialRun != null) {
+                partialRun.setWritable(true);
+                partialRun.setReadable(true);
+            }
+            deleteRecursively(root);
+        }
+    }
+
+    /** Describes the durable files of one run so a test can prove nothing was touched. */
+    private static String describeRun(File directory) {
+        StringBuilder description = new StringBuilder();
+        File[] children = directory.listFiles();
+        if (children == null) {
+            return "<unreadable>";
+        }
+        java.util.Arrays.sort(children);
+        for (File child : children) {
+            description.append(child.getName()).append(':').append(child.length()).append(';');
+        }
+        return description.toString();
     }
 
     private static String readExact(InputStream input, int length) throws IOException {

@@ -92,6 +92,12 @@ public final class RootBackend implements PrivilegeBackend {
     /** Poll interval of the creation-confirmation reads. */
     private static final long CREATION_CONFIRMATION_POLL_MILLIS = 25;
 
+    /**
+     * Poll interval of the bounded post-signal exit wait, which observes only launch transport
+     * liveness and never runs a command on the shell it watches.
+     */
+    private static final long CLEANUP_EXIT_POLL_MILLIS = 25;
+
     private static final String TAG = "RootBackend";
     private static final String STATE_DIRECTORY = "superuser-runtime";
     private static final String RECORD_FILE = "root-execution-v1.txt";
@@ -104,6 +110,7 @@ public final class RootBackend implements PrivilegeBackend {
     private final RootActivation activation;
     private final long activationTimeoutMillis;
     private final long creationConfirmationTimeoutMillis;
+    private final long cleanupExitWaitMillis;
     private final ExecutorService activationWorker;
     private final RootEvidenceStore records;
     private final RootRunSpoolReconciler reconciler;
@@ -127,7 +134,8 @@ public final class RootBackend implements PrivilegeBackend {
                 context.getApplicationContext().getFilesDir(),
                 new LibsuRootShellFactory(),
                 ACTIVATION_TIMEOUT_MILLIS,
-                CREATION_CONFIRMATION_TIMEOUT_MILLIS
+                CREATION_CONFIRMATION_TIMEOUT_MILLIS,
+                OwnedExecutionShutdown.SIGKILL_WAIT_MS
         );
     }
 
@@ -143,6 +151,8 @@ public final class RootBackend implements PrivilegeBackend {
      * @param activationTimeoutMillis caller-visible activation deadline
      * @param creationConfirmationTimeoutMillis bounded wait for a delivered launch to prove that it
      *     created its process
+     * @param cleanupExitWaitMillis bounded wait for a failed launch process to exit after its
+     *     exact-ownership signal, in milliseconds
      */
     RootBackend(
             Context context,
@@ -152,7 +162,8 @@ public final class RootBackend implements PrivilegeBackend {
             File logTemporaryDirectory,
             RootShellFactory shellFactory,
             long activationTimeoutMillis,
-            long creationConfirmationTimeoutMillis
+            long creationConfirmationTimeoutMillis,
+            long cleanupExitWaitMillis
     ) {
         this.context = context;
         this.binary = Objects.requireNonNull(binary);
@@ -160,6 +171,7 @@ public final class RootBackend implements PrivilegeBackend {
         this.logTemporaryDirectory = logTemporaryDirectory;
         this.activationTimeoutMillis = activationTimeoutMillis;
         this.creationConfirmationTimeoutMillis = creationConfirmationTimeoutMillis;
+        this.cleanupExitWaitMillis = cleanupExitWaitMillis;
         this.activation = new RootActivation(
                 Objects.requireNonNull(shellFactory),
                 activationTimeoutMillis
@@ -539,9 +551,11 @@ public final class RootBackend implements PrivilegeBackend {
      * manager proved to be this launch's own process.
      *
      * <p>The candidate is signaled only after the ownership manager re-verifies it inside the
-     * preparation's own helper session. A candidate that cannot be identified keeps its shell, its
-     * evidence, and its run spool, so no unverified process is touched and no evidence is
-     * destroyed.</p>
+     * preparation's own helper session. The wait for its exit is bounded by
+     * {@link #awaitExitWithinCleanupWindow(RootShell)}, so a process that outlives the signal cannot
+     * make cleanup hang. A candidate that cannot be identified, or whose exit is not proven inside
+     * that window, keeps its shell, its evidence, and its run spool, so no unverified process is
+     * touched and no evidence is destroyed.</p>
      */
     private void terminateUnrecordedLaunch(
             RootShell launchShell,
@@ -560,7 +574,7 @@ public final class RootBackend implements PrivilegeBackend {
                         launched, ExecutionOwnershipManager.Signal.SIGKILL)
                 == ExecutionOwnershipManager.SignalAttempt.SIGNALED;
         if (signaled) {
-            awaitExitQuietly(launchShell);
+            awaitExitWithinCleanupWindow(launchShell);
         }
         if (launchShell.hasExited()) {
             // The possible execution is proven gone, so its transport and its evidence may be
@@ -634,6 +648,58 @@ public final class RootBackend implements PrivilegeBackend {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return -1;
+        }
+    }
+
+    /**
+     * Waits for the launch transport's own process to exit inside the bounded post-signal window.
+     *
+     * <p>Failure cleanup must never wait without a bound: an accepted signal does not prove that the
+     * process ended, and an unbounded wait would leave a launch that can no longer reach its caller
+     * hanging forever. The wait observes only the launch transport's own liveness, so it runs no
+     * command and acquires no root shell, and it stops at a monotonic deadline derived from
+     * {@link OwnedExecutionShutdown#SIGKILL_WAIT_MS}. A caller interrupt is preserved and reported as
+     * "exit not proven", because a caller must never close a transport whose process state is
+     * unknown.</p>
+     *
+     * @return whether process exit was proven inside the bounded window
+     */
+    private boolean awaitExitWithinCleanupWindow(RootShell shell) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(cleanupExitWaitMillis);
+        while (!shell.hasExited()) {
+            long remainingNanos = deadline - System.nanoTime();
+            if (remainingNanos <= 0) {
+                return false;
+            }
+            try {
+                Thread.sleep(Math.min(
+                        CLEANUP_EXIT_POLL_MILLIS,
+                        Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
+                ));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return shell.hasExited();
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Models the death of the application process that owns this backend's run state.
+     *
+     * <p>A JVM test cannot terminate the process that holds an operating-system file lock, so this
+     * seam releases the ephemeral run ownership exactly as process death would: the lock is released
+     * while the durable evidence and the run directory stay in place, and a restarted application
+     * can then reconcile the leftover run. Test-only; production code never calls it.</p>
+     */
+    void releaseRunOwnershipForTesting() {
+        RootRunSpool active = activeSpool;
+        if (active != null) {
+            active.releaseLease();
+        }
+        RootRunSpool prepared = preparedSpool;
+        if (prepared != null) {
+            prepared.releaseLease();
         }
     }
 
@@ -976,7 +1042,16 @@ public final class RootBackend implements PrivilegeBackend {
             closeQuietly(launchShell);
             closeHelperSession();
             preparedSpool = null;
-            spool.delete();
+            if (armed) {
+                // Nothing was transported yet, so removing the durable pre-delivery run this
+                // preparation owns is safe and its lease covers the deletion. A preparation that
+                // never acquired the run must not delete a directory another owner holds.
+                spool.delete();
+            } else {
+                // Arming failed: materialize() already removed anything it created while it held
+                // its own lease, and this preparation never owned the run.
+                spool.releaseLease();
+            }
         }
     }
 
@@ -1094,7 +1169,10 @@ public final class RootBackend implements PrivilegeBackend {
          * Releases one confirmed execution whose output tail could not be opened.
          *
          * <p>The exactly recorded process is re-verified before it is signaled, and the transport,
-         * the durable record, and the spool are released only after its exit was proven.</p>
+         * the durable record, and the spool are released only after its exit was proven inside the
+         * bounded window of {@link RootBackend#awaitExitWithinCleanupWindow(RootShell)}. A process
+         * that outlives that window keeps its transport, its evidence, and its spool, and this
+         * operation reports the original output failure instead of waiting forever.</p>
          *
          * @return whether the process was re-verified, signaled, proven exited, and cleaned up
          */
@@ -1115,7 +1193,7 @@ public final class RootBackend implements PrivilegeBackend {
                 logWarning("Could not verify the launched root execution", e);
                 return false;
             }
-            awaitExitQuietly(runShell);
+            awaitExitWithinCleanupWindow(runShell);
             if (!runShell.hasExited()) {
                 // The exact process is still alive after a requested signal, so nothing may be
                 // closed or deleted; a later recovery keeps the complete durable state.

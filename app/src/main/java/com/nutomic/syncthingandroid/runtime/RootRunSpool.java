@@ -41,20 +41,41 @@ final class RootRunSpool {
     static final String OUTPUT_FILE = "output";
     static final String COMMAND_FILE = "command";
     static final String CONSUMED_FILE = "consumed";
-    /** App-owned file whose exclusive file lock represents in-process ownership of this run. */
-    static final String LEASE_FILE = "lease";
+    /**
+     * Prefix of the stable sibling file whose exclusive file lock represents ownership of one run.
+     *
+     * <p>The lease file never lives inside the run directory it protects. Unlinking a locked file
+     * keeps its lock attached to the old inode, so a lease inside the deletable directory could be
+     * replaced by a second lock on a new inode while the first owner still believed it owned the
+     * run.</p>
+     */
+    static final String LEASE_FILE_PREFIX = ".lease-";
     /** Poll interval used while tailing a growing spool file. */
     static final long OUTPUT_POLL_MILLIS = 50;
 
     private static final int MAXIMUM_COMMAND_BYTES = 256;
 
+    private final File spoolRoot;
     private final File directory;
     private final String runToken;
     private final String commandName;
     /** Exclusive in-process ownership of this run, held while a local handle still works on it. */
     private Lease lease;
+    /**
+     * Test seam invoked after this handle has taken the run's lease and before the run directory is
+     * created, so a test can prove no run is ever visible without an owner. Production code leaves
+     * it {@code null}.
+     */
+    Runnable leaseAcquiredHookForTesting;
+    /**
+     * Test seam invoked after this handle has started deleting a run it owns and before the run
+     * directory is unlinked, so a test can prove a deletion in progress still excludes other
+     * owners. Production code leaves it {@code null}.
+     */
+    Runnable deletionStartedHookForTesting;
 
-    private RootRunSpool(File directory, String runToken, String commandName) {
+    private RootRunSpool(File spoolRoot, File directory, String runToken, String commandName) {
+        this.spoolRoot = spoolRoot;
         this.directory = directory;
         this.runToken = runToken;
         this.commandName = commandName;
@@ -74,7 +95,7 @@ final class RootRunSpool {
         Objects.requireNonNull(spoolRoot);
         Objects.requireNonNull(runToken);
         Objects.requireNonNull(commandName);
-        return new RootRunSpool(new File(spoolRoot, runToken), runToken, commandName);
+        return new RootRunSpool(spoolRoot, new File(spoolRoot, runToken), runToken, commandName);
     }
 
     /**
@@ -99,35 +120,54 @@ final class RootRunSpool {
     /**
      * Creates the complete app-owned spool of this run and records its durable pre-delivery state.
      *
-     * <p>The durable state is written first, so no concurrent recovery can ever observe this run as
-     * an empty leftover: either the run directory does not exist yet, or it already carries the
-     * pre-delivery state that makes every classifier fail closed. The remaining app-owned files -
-     * the staging file the launch script fills, the output file, the consumption offset, and the
-     * command name - are created before any launch byte can be delivered, so the UID-0 process
-     * always writes into files this application created. A failure while the spool is being created
-     * removes the partially created run directory, so a launch that cannot be armed leaves no
-     * leftovers behind.</p>
+     * <p>Ownership is taken before the run becomes visible: the lease is acquired first, and only
+     * then are the run directory and its durable pre-delivery state created. A concurrent
+     * reconciliation can therefore never observe a run directory that no owner holds, and can never
+     * take the lease of the handle that is arming it. The durable state is written before any launch
+     * byte can be delivered, so a recovery either sees no run at all or a run whose pending state
+     * makes every classifier fail closed. The remaining app-owned files - the staging file the
+     * launch script fills, the output file, the consumption offset, and the command name - are
+     * created before transport, so the UID-0 process always writes into files this application
+     * created.</p>
+     *
+     * <p>A failed acquisition leaves every existing run directory untouched, because that directory
+     * may belong to another owner. A failure after acquisition removes only the partially created
+     * run of this handle while the handle still holds its lease.</p>
      *
      * @param pendingTransport the launch transport recorded as the durable pre-delivery state
-     * @throws IOException when the run directory or one of its app-owned files cannot be created
+     * @throws IOException when the run's lease cannot be taken or its app-owned files cannot be
+     *     created
      */
     void materialize(ExecutionIdentity pendingTransport) throws IOException {
         Objects.requireNonNull(pendingTransport);
-        if (!directory.mkdirs() && !directory.isDirectory()) {
-            throw new IOException("Could not create the root run spool directory");
+        if (!spoolRoot.isDirectory() && !spoolRoot.mkdirs() && !spoolRoot.isDirectory()) {
+            throw new IOException("Could not create the root run spool root");
+        }
+        // A failed acquisition must not touch the run directory, because that directory may belong
+        // to another owner that holds the lease this handle could not take.
+        if (!acquireLease()) {
+            throw new IOException("Could not take exclusive ownership of the root run spool");
+        }
+        if (leaseAcquiredHookForTesting != null) {
+            leaseAcquiredHookForTesting.run();
         }
         try {
-            // Arming takes exclusive in-process ownership first, so no concurrent reconciliation
-            // in this application process can ever inspect, append to, or delete a run this
-            // launch is still preparing. A failure to take the lease fails arming before any
-            // launch byte can be transported.
-            if (!acquireLease()) {
-                throw new IOException("Could not take exclusive ownership of the root run spool");
+            if (!directory.mkdirs() && !directory.isDirectory()) {
+                throw new IOException("Could not create the root run spool directory");
             }
             RootExecutionRecordStore.writePendingEvidence(evidenceFile(), pendingTransport);
             createAppOwnedFiles();
         } catch (IOException | RuntimeException e) {
-            delete();
+            // This handle owns the run, so removing what it just created is safe; ownership is
+            // released only after the partially created run is gone. A partial run directory that
+            // cannot be removed keeps its lease file, because unlinking the namespace that provides
+            // exclusion while the directory still exists would let another owner lock a replacement
+            // inode of the same pathname.
+            if (deleteDirectory(directory)) {
+                releaseLeaseAndDeleteLeaseFile();
+            } else {
+                releaseLease();
+            }
             throw e;
         }
     }
@@ -146,7 +186,7 @@ final class RootRunSpool {
             return true;
         }
         releaseLease();
-        Lease acquired = tryAcquireLease(directory);
+        Lease acquired = tryAcquireLease(leaseFile());
         if (acquired == null) {
             return false;
         }
@@ -175,17 +215,41 @@ final class RootRunSpool {
         }
     }
 
+    /** Returns this run's stable sibling lease file. */
+    File leaseFile() {
+        return leaseFileFor(spoolRoot, runToken);
+    }
+
+    /** Unlinks this run's lease file while this handle still holds its lock. */
+    private void deleteLeaseFileWhileHeld() {
+        if (leaseHeld()) {
+            leaseFile().delete();
+        }
+    }
+
     /**
-     * Takes the exclusive ownership lease of one run directory.
+     * Gives up ownership after removing this run's lease file while the lock is still held.
      *
-     * @param directory run directory to own
-     * @return the held lease, or {@code null} when another handle in this application process
-     *     already owns the run or the lock cannot be taken at all
+     * <p>Only a handle that owns the run and has already removed the run directory may call this,
+     * so the unlink never races another owner of a live run.</p>
      */
-    static Lease tryAcquireLease(File directory) {
+    private void releaseLeaseAndDeleteLeaseFile() {
+        deleteLeaseFileWhileHeld();
+        releaseLease();
+    }
+
+    /**
+     * Takes the exclusive ownership lease of one run.
+     *
+     * @param leaseFile stable sibling lease file of the run, which must never live inside a
+     *     directory its owner may delete
+     * @return the held lease, or {@code null} when another handle in this application process or
+     *     another application process already owns the run, or the lock cannot be taken at all
+     */
+    static Lease tryAcquireLease(File leaseFile) {
         FileChannel channel = null;
         try {
-            channel = new RandomAccessFile(new File(directory, LEASE_FILE), "rw").getChannel();
+            channel = new RandomAccessFile(leaseFile, "rw").getChannel();
             FileLock lock;
             try {
                 lock = channel.tryLock();
@@ -207,6 +271,63 @@ final class RootRunSpool {
                 }
             }
             return null;
+        }
+    }
+
+    /** Returns the stable sibling lease file of one run below its spool root. */
+    static File leaseFileFor(File spoolRoot, String runToken) {
+        return new File(spoolRoot, LEASE_FILE_PREFIX + runToken);
+    }
+
+    /** Reports whether one spool-root entry is a lease file rather than a run directory. */
+    static boolean isLeaseFileName(String name) {
+        return name.startsWith(LEASE_FILE_PREFIX);
+    }
+
+    /**
+     * Unlinks the lease file of one run while its lock is held.
+     *
+     * <p>Callers must already hold the lease and must only call this after the run directory is
+     * gone: unlinking a lease that still protects a live run would let another owner lock a new
+     * inode of the same pathname and believe it owned that run.</p>
+     */
+    static void deleteLeaseFileWhileHeld(File spoolRoot, String runToken) {
+        leaseFileFor(spoolRoot, runToken).delete();
+    }
+
+    /**
+     * Removes the lease files whose run directory is gone.
+     *
+     * <p>An orphaned lease file is never execution evidence and never blocks recovery, because a
+     * run is only ever reconciled through its own directory. Removing one is only safe while this
+     * process can take its lock, because the unlink then cannot detach an inode another owner
+     * holds.</p>
+     */
+    static void deleteOrphanLeaseFiles(File spoolRoot) {
+        File[] children = spoolRoot == null ? null : spoolRoot.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            String name = child.getName();
+            if (!isLeaseFileName(name)) {
+                continue;
+            }
+            String runToken = name.substring(LEASE_FILE_PREFIX.length());
+            if (new File(spoolRoot, runToken).exists()) {
+                continue;
+            }
+            Lease orphan = tryAcquireLease(child);
+            if (orphan == null) {
+                continue;
+            }
+            try {
+                if (!new File(spoolRoot, runToken).exists()) {
+                    child.delete();
+                }
+            } finally {
+                orphan.release();
+            }
         }
     }
 
@@ -307,12 +428,20 @@ final class RootRunSpool {
     /**
      * Removes this run's spool directory after its exit has been proven.
      *
-     * <p>The owner keeps exclusive ownership through the deletion itself and releases its lease
-     * only afterwards, so no concurrent reconciliation can interleave between giving up ownership
-     * and removing the directory.</p>
+     * <p>The owner keeps exclusive ownership through the whole deletion: the run contents are
+     * unlinked while the lease is still held, and the lease file itself is only unlinked after the
+     * run directory it protects no longer exists. A concurrent reconciliation can therefore never
+     * interleave between giving up ownership and removing the directory, and can never replace the
+     * lock while this deletion is still running.</p>
      */
     boolean delete() {
+        if (deletionStartedHookForTesting != null) {
+            deletionStartedHookForTesting.run();
+        }
         boolean deleted = deleteDirectory(directory);
+        if (deleted) {
+            deleteLeaseFileWhileHeld();
+        }
         releaseLease();
         return deleted;
     }

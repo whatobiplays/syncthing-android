@@ -54,13 +54,16 @@ final class RootRunSpoolReconciler {
             if (activeSpool != null && directory.equals(activeSpool.directory())) {
                 continue;
             }
-            // A run spool is only ever inspected, appended to, or deleted while this
+            // A run spool is only ever inspected, appended to, or deleted while
             // reconciliation holds its exclusive lease, and the lease is held until the whole
             // decision - including any deletion - has completed. A run that an in-process
             // preparation or execution still owns is skipped, because that handle is still
-            // reading or writing it. The lease is an operating-system lock, so it disappears with
-            // the owning application process and an orphaned run stays reconcilable afterwards.
-            RootRunSpool.Lease lease = RootRunSpool.tryAcquireLease(directory);
+            // reading or writing it. The lease lives in a stable sibling file that deleting the
+            // run never touches, so it is an operating-system lock that disappears with the
+            // owning application process and an orphaned run stays reconcilable afterwards.
+            RootRunSpool.Lease lease = RootRunSpool.tryAcquireLease(
+                    RootRunSpool.leaseFileFor(spoolRoot, directory.getName())
+            );
             if (lease == null) {
                 continue;
             }
@@ -80,8 +83,10 @@ final class RootRunSpoolReconciler {
                     continue;
                 }
                 if (!RootRunSpool.hasOutput(directory)) {
-                    RootRunSpool.deleteDirectory(directory);
-                    reconciled++;
+                    if (RootRunSpool.deleteDirectory(directory)) {
+                        RootRunSpool.deleteLeaseFileWhileHeld(spoolRoot, directory.getName());
+                        reconciled++;
+                    }
                     continue;
                 }
                 if (command.writesServeLog()) {
@@ -97,6 +102,7 @@ final class RootRunSpoolReconciler {
                     appendedWriter = writer;
                 }
                 if (RootRunSpool.deleteDirectory(directory)) {
+                    RootRunSpool.deleteLeaseFileWhileHeld(spoolRoot, directory.getName());
                     reconciled++;
                 }
             } finally {
@@ -106,6 +112,9 @@ final class RootRunSpoolReconciler {
         if (appendedWriter != null) {
             appendedWriter.trimLog();
         }
+        // Lease files of runs that no longer exist are not evidence and never block recovery, so
+        // they are removed here while this process can still take their lock.
+        RootRunSpool.deleteOrphanLeaseFiles(spoolRoot);
         return reconciled;
     }
 }

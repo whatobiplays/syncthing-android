@@ -104,6 +104,11 @@ final class FakeRootTransport {
         boolean failRunTokenRead;
         /** When true, the kernel rejects every signal. */
         boolean rejectSignals;
+        /**
+         * When true, a signal is accepted and recorded but its fake process stays alive, which
+         * models a process that outlives the bounded post-signal cleanup window.
+         */
+        boolean surviveSignals;
 
         /** Command-like operations each shell ran, as {@code "<shell index>:<operation>"}. */
         final List<String> shellOperations = new ArrayList<>();
@@ -487,7 +492,7 @@ final class FakeRootTransport {
             }
             device.signals.add(pid + ":" + signal);
             Entry entry = device.processes.get(pid);
-            if (entry != null && entry.alive) {
+            if (entry != null && entry.alive && !device.surviveSignals) {
                 entry.exit(128 + signal);
             }
             return true;
