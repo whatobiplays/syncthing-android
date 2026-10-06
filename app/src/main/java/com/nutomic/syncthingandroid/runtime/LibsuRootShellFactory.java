@@ -1,0 +1,209 @@
+package com.nutomic.syncthingandroid.runtime;
+
+import com.topjohnwu.superuser.NoShellException;
+import com.topjohnwu.superuser.Shell;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.Objects;
+
+/**
+ * Acquires root shells from the device's superuser transport using libsu core.
+ *
+ * <p>The factory never uses libsu's default {@link Shell.Builder#build()} path, because that path
+ * silently falls back to a non-root {@code sh} when root is unavailable. It creates the root
+ * process itself and hands that exact process to libsu, so a non-root fallback can never be
+ * mistaken for a granted root request. A shell is only returned after both the libsu shell status
+ * and an explicit {@code id -u} probe confirm UID 0.</p>
+ *
+ * <p>Deadline coordination: libsu's internal shell-verification timeout is set strictly below the
+ * caller's activation deadline, and every shell operation has its own bounded transport timeout.
+ * The bounds together keep a whole activation inside the requested deadline, and each failure mode
+ * maps to a distinct {@link RootFailure}.</p>
+ */
+final class LibsuRootShellFactory implements RootShellFactory {
+    /** Time reserved inside the activation deadline for classification and the UID probe. */
+    static final long INTERNAL_TIMEOUT_MARGIN_MILLIS = 20_000;
+    /** Upper bound for libsu's own shell-verification timeout, in seconds. */
+    private static final long MAXIMUM_INTERNAL_TIMEOUT_SECONDS = 40;
+
+    private final String[] rootCommand;
+
+    LibsuRootShellFactory() {
+        this(new String[] {"su"});
+    }
+
+    LibsuRootShellFactory(String[] rootCommand) {
+        Objects.requireNonNull(rootCommand);
+        if (rootCommand.length == 0) {
+            throw new IllegalArgumentException("The root command must not be empty");
+        }
+        this.rootCommand = rootCommand.clone();
+    }
+
+    @Override
+    public RootShell acquire(long timeoutMillis) throws RootTransportException {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("The activation deadline must be positive");
+        }
+        Process process = startRootTransportProcess();
+        Shell shell;
+        try {
+            shell = Shell.Builder.create()
+                    .setTimeout(internalShellTimeoutSeconds(timeoutMillis))
+                    .build(process);
+        } catch (NoShellException e) {
+            String evidence = buildFailureEvidence(e, process);
+            destroyQuietly(process);
+            throw classifyBuildFailure(evidence);
+        } catch (RuntimeException e) {
+            destroyQuietly(process);
+            throw new RootTransportException(
+                    RootFailure.ROOT_TRANSPORT_FAILED,
+                    "Could not construct the root shell",
+                    e
+            );
+        }
+        try {
+            requireRootShellStatus(shell.getStatus(), Shell.ROOT_SHELL, Shell.NON_ROOT_SHELL);
+            LibsuRootShell rootShell = new LibsuRootShell(shell, process);
+            requireRootUser(rootShell.currentUid());
+            return rootShell;
+        } catch (RootTransportException e) {
+            closeQuietly(shell);
+            throw e;
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(shell);
+            throw new RootTransportException(
+                    RootFailure.ROOT_TRANSPORT_FAILED,
+                    "Could not verify the acquired root shell",
+                    e
+            );
+        }
+    }
+
+    /**
+     * Returns the timeout handed to libsu's internal shell verification.
+     *
+     * <p>The value stays below the caller's deadline by {@link #INTERNAL_TIMEOUT_MARGIN_MILLIS}
+     * and never exceeds {@link #MAXIMUM_INTERNAL_TIMEOUT_SECONDS}, so libsu reports its own
+     * timeout verdict before the caller's deadline expires.</p>
+     */
+    static long internalShellTimeoutSeconds(long timeoutMillis) {
+        long availableMillis = timeoutMillis - INTERNAL_TIMEOUT_MARGIN_MILLIS;
+        long seconds = (Math.max(availableMillis, 1) + 999) / 1000;
+        return Math.min(seconds, MAXIMUM_INTERNAL_TIMEOUT_SECONDS);
+    }
+
+    /** Maps the combined libsu and transport evidence onto one typed failure. */
+    static RootTransportException classifyBuildFailure(String evidence) {
+        String text = evidence == null ? "" : evidence.toLowerCase(Locale.ROOT);
+        if (text.contains("timeout")) {
+            return new RootTransportException(
+                    RootFailure.ROOT_ACTIVATION_TIMEOUT,
+                    "The root shell did not respond inside the activation window: " + evidence
+            );
+        }
+        if (text.contains("terminated")
+                || text.contains("denied")
+                || text.contains("permission")
+                || text.contains("not a shell")) {
+            return new RootTransportException(
+                    RootFailure.ROOT_DENIED,
+                    "The root request was not granted: " + evidence
+            );
+        }
+        return new RootTransportException(
+                RootFailure.ROOT_TRANSPORT_FAILED,
+                "Could not construct the root shell: " + evidence
+        );
+    }
+
+    /** Rejects every shell that libsu did not verify as a root shell. */
+    static void requireRootShellStatus(int status, int rootShellStatus, int nonRootShellStatus) {
+        if (status == rootShellStatus) {
+            return;
+        }
+        if (status == nonRootShellStatus) {
+            throw new RootTransportException(
+                    RootFailure.ROOT_DENIED,
+                    "The root transport fell back to a non-root shell"
+            );
+        }
+        throw new RootTransportException(
+                RootFailure.ROOT_DENIED,
+                "The acquired shell was not verified as a root shell"
+        );
+    }
+
+    /** Requires the explicit user-id probe to confirm UID 0. */
+    static void requireRootUser(String uid) {
+        if (!"0".equals(uid)) {
+            throw new RootTransportException(
+                    RootFailure.UID_VERIFICATION_FAILED,
+                    "The root shell reported user id '" + uid + "' instead of 0"
+            );
+        }
+    }
+
+    private Process startRootTransportProcess() {
+        try {
+            return new ProcessBuilder(rootCommand).start();
+        } catch (IOException | RuntimeException e) {
+            throw new RootTransportException(
+                    RootFailure.ROOT_UNAVAILABLE,
+                    "No root transport is available on this device",
+                    e
+            );
+        }
+    }
+
+    private static String buildFailureEvidence(NoShellException failure, Process process) {
+        StringBuilder evidence = new StringBuilder();
+        Throwable cause = failure.getCause();
+        if (cause != null && cause.getMessage() != null) {
+            evidence.append(cause.getMessage());
+        }
+        if (failure.getMessage() != null) {
+            evidence.append(' ').append(failure.getMessage());
+        }
+        String stderr = drainAvailableStderr(process);
+        if (!stderr.isEmpty()) {
+            evidence.append(' ').append(stderr);
+        }
+        return evidence.toString().trim();
+    }
+
+    private static String drainAvailableStderr(Process process) {
+        try {
+            InputStream stderr = process.getErrorStream();
+            int available = stderr.available();
+            if (available <= 0) {
+                return "";
+            }
+            byte[] buffer = new byte[Math.min(available, 4096)];
+            int read = stderr.read(buffer, 0, buffer.length);
+            return read <= 0 ? "" : new String(buffer, 0, read, StandardCharsets.UTF_8).trim();
+        } catch (IOException | RuntimeException ignored) {
+            return "";
+        }
+    }
+
+    private static void destroyQuietly(Process process) {
+        try {
+            process.destroy();
+        } catch (RuntimeException ignored) {
+            // The transport process is already gone.
+        }
+    }
+
+    private static void closeQuietly(Shell shell) {
+        try {
+            shell.close();
+        } catch (IOException | RuntimeException ignored) {
+            // The transport process is already gone.
+        }
+    }
+}

@@ -17,7 +17,15 @@ public final class ExecutionOwnershipManager {
         BOOT_ID_MISMATCH,
         NONMATCHING_RECORD,
         NO_BUNDLED_CANDIDATE,
-        AMBIGUOUS_EXECUTION
+        AMBIGUOUS_EXECUTION,
+        /**
+         * One owned launch is between the durable pre-exec evidence write and the terminal exec
+         * that replaces the root shell with the bundled binary. The live process is the recorded
+         * one, so recovery must preserve its evidence, must never treat it as launchable, and must
+         * never signal it: exact ownership is only proven once the process itself is the bundled
+         * executable.
+         */
+        LAUNCH_IN_FLIGHT
     }
 
     public enum RecordEvidence {
@@ -185,6 +193,31 @@ public final class ExecutionOwnershipManager {
             );
         }
 
+        ExecutionRecordStore.PendingLaunch pending = records.readPendingLaunch();
+        if (pending.status() == ExecutionRecordStore.PendingLaunch.Status.UNRESOLVED) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION,
+                    RecordEvidence.CORRUPT,
+                    candidates.isEmpty()
+                            ? CandidateEvidence.NONE
+                            : CandidateEvidence.UNOWNED_CANDIDATE,
+                    null
+            );
+        }
+        if (pending.status() == ExecutionRecordStore.PendingLaunch.Status.PENDING) {
+            RecoveryAssessment inFlight =
+                    classifyPendingLaunch(pending.transportIdentity(), currentBootId, candidates);
+            if (inFlight != null) {
+                return inFlight;
+            }
+            // The recorded transport is proven gone, so its state was cleared token-safely and the
+            // stale candidate snapshot was refreshed before any launchable assessment. Read the
+            // durable store again: the ordinary classification below must describe what actually
+            // remains instead of the pre-delivery state this call just removed.
+            stored = records.read();
+            evidence = recordEvidence(stored.status());
+        }
+
         if (stored.status() == ExecutionRecordStore.ReadResult.Status.READ_FAILED) {
             return assessment(
                     Classification.AMBIGUOUS_EXECUTION, RecordEvidence.READ_FAILED,
@@ -248,8 +281,13 @@ public final class ExecutionOwnershipManager {
         ExecutionIdentity live = inspection.identity();
 
         if (recorded.matches(live)) {
-            boolean competingCandidate = candidates.stream()
-                    .anyMatch(candidate -> !recorded.sameProcess(candidate));
+            boolean competingCandidate = false;
+            for (ExecutionIdentity candidate : candidates) {
+                if (!recorded.sameProcess(candidate)) {
+                    competingCandidate = true;
+                    break;
+                }
+            }
             return !competingCandidate
                     ? assessment(
                             Classification.OWNED_EXECUTION, RecordEvidence.VALID,
@@ -274,6 +312,28 @@ public final class ExecutionOwnershipManager {
             );
         }
 
+        if (recorded.sameKernelProcess(live)) {
+            // Same kernel process, different executable: the launch script has written its
+            // durable pre-exec evidence and has not executed the terminal exec yet, because the
+            // evidence names the expected bundled binary while the process still runs something
+            // else. This is an owned launch in flight, so its evidence stays and no classifier
+            // may treat it as launchable or signal it.
+            return ExecutionIdentity.sameExecutableTarget(
+                    expectedExecutable, recorded.executablePath())
+                    ? assessment(
+                            Classification.LAUNCH_IN_FLIGHT,
+                            RecordEvidence.VALID,
+                            CandidateEvidence.UNOWNED_CANDIDATE,
+                            null, InspectionEvidence.LIVE
+                    )
+                    : assessment(
+                            Classification.AMBIGUOUS_EXECUTION,
+                            RecordEvidence.NONMATCHING,
+                            CandidateEvidence.UNOWNED_CANDIDATE,
+                            null, InspectionEvidence.LIVE
+                    );
+        }
+
         deleteStaleRecord(recorded);
         return classifyAfterRecordedExit(
                 Classification.NONMATCHING_RECORD,
@@ -282,8 +342,141 @@ public final class ExecutionOwnershipManager {
         );
     }
 
+    /**
+     * Classifies the durable pre-delivery state of one launch transport.
+     *
+     * <p>A live process that still carries the recorded kernel identity keeps the launch
+     * non-launchable: the transport may still replace itself with the bundled binary. When that
+     * process already reached the expected bundled executable the launch is an exactly owned
+     * execution, and when the identity no longer names a live process the recorded state is stale
+     * and is cleared with the ordinary run-token-safe cleanup. Clearing the state refreshes
+     * bundled candidate discovery before recovery may report a launchable absence.</p>
+     *
+     * @return an assessment that must block the launch, or {@code null} when the pending state
+     *     was cleared, no bundled candidate exists, and the ordinary classification must continue
+     */
+    private RecoveryAssessment classifyPendingLaunch(
+            ExecutionIdentity transport,
+            String currentBootId,
+            List<ExecutionIdentity> candidates
+    ) {
+        if (!transport.bootId().equals(currentBootId)) {
+            // A launch transport cannot survive a reboot, so this state belongs to a finished boot.
+            deletePendingLaunch(transport);
+            return blockOnRefreshedCandidatesAfterCleanup(
+                    RecordEvidence.BOOT_ID_MISMATCH,
+                    InspectionEvidence.NOT_CHECKED
+            );
+        }
+        ExecutionInspector.InspectionResult inspection;
+        try {
+            inspection = inspector.inspect(transport.pid());
+        } catch (IOException | RuntimeException e) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, RecordEvidence.VALID,
+                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.UNKNOWN
+            );
+        }
+        if (inspection == null
+                || inspection.status() == ExecutionInspector.InspectionResult.Status.UNKNOWN) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, RecordEvidence.VALID,
+                    CandidateEvidence.UNKNOWN, null, InspectionEvidence.UNKNOWN
+            );
+        }
+        if (inspection.status() == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
+            deletePendingLaunch(transport);
+            return blockOnRefreshedCandidatesAfterCleanup(
+                    RecordEvidence.PROCESS_GONE,
+                    InspectionEvidence.PROCESS_ABSENT
+            );
+        }
+        ExecutionIdentity live = inspection.identity();
+        if (transport.matches(live)) {
+            for (ExecutionIdentity candidate : candidates) {
+                if (!transport.sameProcess(candidate)) {
+                    return assessment(
+                            Classification.AMBIGUOUS_EXECUTION, RecordEvidence.VALID,
+                            CandidateEvidence.UNOWNED_CANDIDATE, null, InspectionEvidence.LIVE
+                    );
+                }
+            }
+            return assessment(
+                    Classification.OWNED_EXECUTION, RecordEvidence.VALID,
+                    candidates.isEmpty()
+                            ? CandidateEvidence.NONE
+                            : CandidateEvidence.EXACTLY_RECORDED_PROCESS,
+                    transport, InspectionEvidence.LIVE
+            );
+        }
+        if (transport.sameProcess(live)) {
+            // The same kernel process now runs the expected bundled executable, but its run token
+            // is missing, unreadable, or different. Exact ownership needs the token as well, so a
+            // pre-delivery transport in this state is never reported as an owned execution and
+            // never authorizes a signal.
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION, RecordEvidence.NONMATCHING,
+                    CandidateEvidence.UNOWNED_CANDIDATE, null, InspectionEvidence.LIVE
+            );
+        }
+        if (transport.sameKernelProcess(live)) {
+            return ExecutionIdentity.sameExecutableTarget(
+                    expectedExecutable, transport.executablePath())
+                    ? assessment(
+                            Classification.LAUNCH_IN_FLIGHT, RecordEvidence.VALID,
+                            CandidateEvidence.UNOWNED_CANDIDATE, null, InspectionEvidence.LIVE
+                    )
+                    : assessment(
+                            Classification.AMBIGUOUS_EXECUTION, RecordEvidence.NONMATCHING,
+                            CandidateEvidence.UNOWNED_CANDIDATE, null, InspectionEvidence.LIVE
+                    );
+        }
+        // The recorded process identifier now belongs to an unrelated process.
+        deletePendingLaunch(transport);
+        return blockOnRefreshedCandidatesAfterCleanup(
+                RecordEvidence.NONMATCHING,
+                InspectionEvidence.LIVE
+        );
+    }
+
+    /** Clears only the durable state that names the run token of one obsolete transport. */
+    private void deletePendingLaunch(ExecutionIdentity transport) {
+        try {
+            records.deleteIfRunTokenMatches(transport.runToken());
+        } catch (IOException | RuntimeException e) {
+            // Cleanup stays best effort: the state is only cleared after its process was proven
+            // gone, and a later recovery reaches the same conclusion and tries again.
+        }
+    }
+
     private RecoveryAssessment classifyAfterRecordedExit(
             Classification noCandidateClassification,
+            RecordEvidence recordEvidence,
+            InspectionEvidence inspectionEvidence
+    ) {
+        RecoveryAssessment blocked =
+                blockOnRefreshedCandidatesAfterCleanup(recordEvidence, inspectionEvidence);
+        return blocked != null
+                ? blocked
+                : assessment(
+                        noCandidateClassification, recordEvidence,
+                        CandidateEvidence.NONE, null, inspectionEvidence
+                );
+    }
+
+    /**
+     * Takes a fresh bundled candidate snapshot after durable process evidence was cleared.
+     *
+     * <p>Clearing a durable record or a pre-delivery state removes the evidence the previous
+     * classification was based on, so a candidate snapshot taken before the cleanup can no longer
+     * decide whether a bundled process exists. Recovery rescans before it may report any launchable
+     * absence, and a failed scan stays fail-closed with unknown candidate evidence. No signal is
+     * ever authorized from this refresh.</p>
+     *
+     * @return a fail-closed assessment when a bundled candidate exists or the refresh fails, or
+     *     {@code null} when the refresh proved that no bundled candidate exists
+     */
+    private RecoveryAssessment blockOnRefreshedCandidatesAfterCleanup(
             RecordEvidence recordEvidence,
             InspectionEvidence inspectionEvidence
     ) {
@@ -297,14 +490,10 @@ public final class ExecutionOwnershipManager {
             );
         }
         return refreshed.isEmpty()
-                ? assessment(
-                        noCandidateClassification, recordEvidence,
-                        CandidateEvidence.NONE, null, inspectionEvidence
-                )
+                ? null
                 : assessment(
                         Classification.AMBIGUOUS_EXECUTION, recordEvidence,
-                        CandidateEvidence.UNOWNED_CANDIDATE, null,
-                        inspectionEvidence
+                        CandidateEvidence.UNOWNED_CANDIDATE, null, inspectionEvidence
                 );
     }
 
@@ -315,13 +504,128 @@ public final class ExecutionOwnershipManager {
                         expectedExecutable, launched.executablePath()
                 )
                 || !runToken.equals(launched.runToken())) {
-            throw new IOException("Could not identify the newly launched bundled process");
+            throw new ExecutionVerificationFailedException(
+                    "Could not identify the newly launched bundled process"
+            );
         }
         records.write(launched);
         if (!verify(launched)) {
-            throw new IOException("New process identity did not verify after recording");
+            throw new ExecutionVerificationFailedException(
+                    "New process identity did not verify after recording"
+            );
         }
         return launched;
+    }
+
+    /**
+     * Finds the live bundled process that carries one run token inside this manager's session.
+     *
+     * <p>A launch whose durable record could not be written is identified this way before it may
+     * be signaled. The returned identity is an inspection result, not an authorization: signaling
+     * still requires {@link #signalIfOwned} to re-verify it.</p>
+     */
+    ExecutionIdentity findLaunchedProcess(String runToken) throws IOException {
+        return inspector.findLaunchedProcess(expectedExecutable, runToken);
+    }
+
+    /** One launch's creation boundary as far as durable evidence and the live process prove it. */
+    public static final class LaunchConfirmation {
+        public enum State {
+            /** The bundled process is live and exactly matches the durable evidence. */
+            OWNED,
+            /** Evidence is durable and the terminal exec has not replaced the shell yet. */
+            HANDOFF_IN_FLIGHT,
+            /** Evidence is durable and the recorded process is proven to be gone. */
+            PROCESS_GONE,
+            /** No recognized state could be proven from the current evidence and process table. */
+            UNRESOLVED
+        }
+
+        private final State state;
+        private final ExecutionIdentity identity;
+
+        private LaunchConfirmation(State state, ExecutionIdentity identity) {
+            this.state = state;
+            this.identity = identity;
+        }
+
+        public State state() {
+            return state;
+        }
+
+        /** Verified durable identity of the launched process, present exactly for OWNED. */
+        public ExecutionIdentity identity() {
+            return identity;
+        }
+
+        /**
+         * Whether the creation boundary is proven, so every concurrent recovery classifier now
+         * fails closed instead of treating the launch as absent.
+         */
+        public boolean recognized() {
+            return state != State.UNRESOLVED;
+        }
+    }
+
+    /**
+     * Classifies one launch's creation boundary without acquiring any new root capability.
+     *
+     * <p>The classification only reads durable evidence and the live process table through the
+     * session that provides this manager. When the launch has reached exact ownership, its
+     * canonical durable record is written before this method returns, so recovery sees an owned
+     * execution as soon as the process-start reservation is released.</p>
+     *
+     * @param runToken run token the launch script was encoded with
+     * @return the recognized state, or UNRESOLVED while the launch has not proven itself yet
+     */
+    LaunchConfirmation confirmLaunch(String runToken) {
+        Objects.requireNonNull(runToken);
+        ExecutionRecordStore.ReadResult stored = records.read();
+        if (stored.status() != ExecutionRecordStore.ReadResult.Status.VALID) {
+            // The launch script has not written its complete evidence yet.
+            return unresolved();
+        }
+        ExecutionIdentity recorded = stored.identity();
+        if (!runToken.equals(recorded.runToken())
+                || !ExecutionIdentity.sameExecutableTarget(
+                        expectedExecutable, recorded.executablePath())) {
+            // This evidence belongs to another launch, so this one has not reached its handoff.
+            return unresolved();
+        }
+        ExecutionInspector.InspectionResult inspection;
+        try {
+            inspection = inspector.inspect(recorded.pid());
+        } catch (IOException | RuntimeException e) {
+            return unresolved();
+        }
+        if (inspection == null
+                || inspection.status()
+                == ExecutionInspector.InspectionResult.Status.UNKNOWN) {
+            return unresolved();
+        }
+        if (inspection.status()
+                == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
+            return new LaunchConfirmation(LaunchConfirmation.State.PROCESS_GONE, null);
+        }
+        ExecutionIdentity live = inspection.identity();
+        if (recorded.matches(live)) {
+            // Exact ownership is proven by the field comparison; make it durable before the
+            // caller may release the process-start reservation.
+            try {
+                records.write(live);
+            } catch (IOException e) {
+                return unresolved();
+            }
+            return new LaunchConfirmation(LaunchConfirmation.State.OWNED, live);
+        }
+        return recorded.sameKernelProcess(live)
+                ? new LaunchConfirmation(LaunchConfirmation.State.HANDOFF_IN_FLIGHT, null)
+                : unresolved();
+    }
+
+    /** Reports a launch whose creation boundary is not proven by the current evidence. */
+    static LaunchConfirmation unresolved() {
+        return new LaunchConfirmation(LaunchConfirmation.State.UNRESOLVED, null);
     }
 
     SignalAttempt signalIfOwned(ExecutionIdentity identity, Signal signal) {

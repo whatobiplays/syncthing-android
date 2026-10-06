@@ -73,6 +73,22 @@ public final class ExecutionIdentity {
                 && sameExecutableTarget(executablePath, other.executablePath);
     }
 
+    /**
+     * Reports whether both identities describe the same kernel process, ignoring what the
+     * process currently executes.
+     *
+     * <p>A process keeps its PID, start time, and boot identity across {@code exec}, so this is
+     * the comparison that recognizes the handoff window in which a launch script has already
+     * written its durable evidence but has not replaced the shell with the bundled binary
+     * yet.</p>
+     */
+    boolean sameKernelProcess(ExecutionIdentity other) {
+        return other != null
+                && pid == other.pid
+                && processStartTimeTicks == other.processStartTimeTicks
+                && bootId.equals(other.bootId);
+    }
+
     static boolean sameExecutableTarget(String firstPath, String secondPath) {
         return withoutProcDeletedSuffix(firstPath).equals(withoutProcDeletedSuffix(secondPath));
     }

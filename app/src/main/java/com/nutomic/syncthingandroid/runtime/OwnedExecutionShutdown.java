@@ -186,7 +186,16 @@ public final class OwnedExecutionShutdown {
     }
 
     private static void removeObservedTerminalLeasesLocked() {
-        boolean removed = PENDING_REQUESTS.removeIf(RequestLease::isTerminal);
+        // Iterating explicitly keeps this cleanup available on every supported API level;
+        // Collection.removeIf requires a newer platform than the project minimum.
+        boolean removed = false;
+        java.util.Iterator<RequestLease> leases = PENDING_REQUESTS.iterator();
+        while (leases.hasNext()) {
+            if (leases.next().isTerminal()) {
+                leases.remove();
+                removed = true;
+            }
+        }
         if (removed) COORDINATOR_MONITOR.notifyAll();
     }
 

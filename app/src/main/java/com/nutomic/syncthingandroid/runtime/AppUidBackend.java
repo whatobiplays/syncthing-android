@@ -73,9 +73,10 @@ public final class AppUidBackend implements PrivilegeBackend {
     }
 
     @Override
-    public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
-            throws IOException, ExecutableNotFoundException {
-        String binaryPath = binary.getPath();
+    public LaunchPreparation prepareLaunch(
+            SyncthingCommand command,
+            SyncthingEnvironment environment
+    ) throws IOException, ExecutableNotFoundException {
         validateLaunchPrerequisites();
 
         ExecutionOwnershipManager.RecoveryAssessment recovery = ownershipManager.recover();
@@ -83,25 +84,63 @@ public final class AppUidBackend implements PrivilegeBackend {
             throw new ExecutionRecoveryException(recovery);
         }
 
-        String runToken = java.util.UUID.randomUUID().toString();
-        Map<String, String> processEnvironment = new HashMap<>(environment.values());
+        final String runToken = java.util.UUID.randomUUID().toString();
+        final Map<String, String> processEnvironment = new HashMap<>(environment.values());
         processEnvironment.put(
                 ProcExecutionInspector.RUN_TOKEN_ENVIRONMENT,
                 runToken
         );
-        Process process = processLauncher.start(command.argv(binaryPath), processEnvironment);
-        ExecutionIdentity identity = null;
-        try {
-            identity = ownershipManager.recordLaunchedProcess(runToken);
-        } catch (IOException | RuntimeException e) {
-            if (context != null) {
-                Log.e(TAG, "Could not durably record the launched Syncthing process", e);
+        final String[] argv = command.argv(binary.getPath());
+        return new LaunchPreparation() {
+            @Override
+            public ExecutionOwnershipManager.RecoveryAssessment classifyLaunch() {
+                // This backend needs no prepared capability: its recovery classification reads the
+                // local process table and never acquires root.
+                return ownershipManager.recover();
             }
-        }
-        boolean exitedBeforeIdentityCapture = identity == null && hasExited(process);
-        return new ProcessExecution(
-                process, identity, exitedBeforeIdentityCapture, ownershipManager
-        );
+
+            @Override
+            public Execution start(ProcessStartReservation reservation) throws IOException {
+                Process process = processLauncher.start(argv, processEnvironment);
+                ExecutionIdentity identity = null;
+                try {
+                    identity = ownershipManager.recordLaunchedProcess(runToken);
+                } catch (IOException | RuntimeException e) {
+                    if (context != null) {
+                        Log.e(TAG, "Could not durably record the launched Syncthing process", e);
+                    }
+                }
+                // The process exists and its durable ownership evidence has been written, or its
+                // failure was observed, so the creation boundary ends here.
+                reservation.release();
+                boolean exitedBeforeIdentityCapture = identity == null && hasExited(process);
+                return new ProcessExecution(
+                        process, identity, exitedBeforeIdentityCapture, ownershipManager
+                );
+            }
+
+            @Override
+            public void discard() {
+                // The application-UID preparation owns nothing outside start(...).
+            }
+
+            @Override
+            public void armLaunch() {
+                // The application-UID launch records no durable state before start(...), so there
+                // is nothing this backend has to arm before the lifecycle layer commits.
+            }
+        };
+    }
+
+    @Override
+    public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
+            throws IOException, ExecutableNotFoundException {
+        LaunchPreparation preparation = prepareLaunch(command, environment);
+        // This entry point settles no lifecycle launch check of its own, so the preparation is
+        // armed here, directly in front of process creation. Arming records nothing for this
+        // backend, and preparation steps that can fail still ran before this point.
+        preparation.armLaunch();
+        return preparation.start(ProcessStartReservation.NONE);
     }
 
     @Override

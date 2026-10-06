@@ -29,6 +29,7 @@ dependencies {
     implementation(libs.guava)
     implementation(libs.jbcrypt)
     implementation(libs.kotlinx.serialization.core)
+    implementation(libs.libsu.core)
     implementation(libs.lingala.zip4j)
     implementation(libs.localbroadcastmanager)
     implementation(libs.navigation3.runtime)

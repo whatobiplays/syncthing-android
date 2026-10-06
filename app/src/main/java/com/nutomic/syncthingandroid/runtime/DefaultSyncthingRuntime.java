@@ -32,7 +32,10 @@ public final class DefaultSyncthingRuntime
         void check();
     }
 
-    /** Acquires the process-start reservation used immediately before backend process creation. */
+    /**
+     * Acquires the process-start reservation held across final recovery classification and the
+     * backend process creation that follows it.
+     */
     @FunctionalInterface
     interface LaunchPermitAcquirer {
         OwnedExecutionShutdown.LaunchPermit acquire(boolean waitForPendingRequests)
@@ -98,9 +101,9 @@ public final class DefaultSyncthingRuntime
      * Starts a cancellable service-owned one-shot with separate cancellation observation and final
      * process-creation checks.
      *
-     * <p>The cancellation check runs after final recovery classification and before a recovery
-     * failure is reported. The final check runs only when recovery permits launch and remains the
-     * process-creation commit boundary.</p>
+     * <p>The cancellation check settles the final recovery classification before a recovery failure
+     * is reported. The final check runs only when recovery permits launch, directly in front of
+     * process creation and after every fallible preparation step already ran.</p>
      */
     public SyncthingExecution startOneShotWithLifecycleCheck(
             SyncthingCommand command,
@@ -207,20 +210,44 @@ public final class DefaultSyncthingRuntime
             }
             if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
 
-            try (OwnedExecutionShutdown.LaunchPermit ignored =
-                         launchPermitAcquirer.acquire(serviceLifecycle)) {
-                // The initial recovery above may be stale if another runtime starts a process
-                // before this launch reservation is acquired. Reclassify under the reservation,
-                // where only a launchable result may proceed; do not stop or reconcile here.
-                ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
-                        backend.recoverExecutions();
-                if (!finalRecovery.mayLaunch()) {
-                    if (launchCheck != null) launchCheck.commitRecoveryBlocked();
-                    throw new ExecutionRecoveryException(finalRecovery);
+            // Preparation - rooted activation above all - is slow, can prompt, and can fail, so it
+            // runs before the process-start reservation is taken and never holds that reservation.
+            PrivilegeBackend.LaunchPreparation preparation =
+                    backend.prepareLaunch(command, environment);
+            boolean started = false;
+            try {
+                try (OwnedExecutionShutdown.LaunchPermit permit =
+                             launchPermitAcquirer.acquire(serviceLifecycle)) {
+                    // The preparation above may be stale if another runtime starts a process before
+                    // this launch reservation is acquired. Reclassify under the reservation using
+                    // capability the preparation already acquired, so a superuser backend never
+                    // acquires root or prompts the user while process-start quiescence is blocked.
+                    // Only a launchable result may proceed; nothing is stopped or reconciled here.
+                    ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
+                            preparation.classifyLaunch();
+                    if (!finalRecovery.mayLaunch()) {
+                        if (launchCheck != null) launchCheck.commitRecoveryBlocked();
+                        throw new ExecutionRecoveryException(finalRecovery);
+                    }
+                    // Every slow or fallible step already ran during preparation, so the committed
+                    // launch check sits directly in front of process creation. A check that refuses
+                    // the launch discards the preparation, which closes the prepared transport and
+                    // removes this run's armed pending state without having created a process.
+                    // The durable launch state is armed here, under the reservation and after
+                    // the final classification: it is the last fallible step of the launch, so it
+                    // must fail before the lifecycle layer commits to creating a process. Arming
+                    // therefore sits directly in front of the launch check, never behind it.
+                    preparation.armLaunch();
+                    if (launchCheck != null) launchCheck.check();
+                    // The preparation releases the reservation itself once the process and its
+                    // durable ownership evidence exist. Slow post-launch verification runs after
+                    // that release, so it never keeps process-start quiescence blocked.
+                    PrivilegeBackend.Execution execution = preparation.start(permit::close);
+                    started = true;
+                    return new SyncthingExecution(execution, admission::release);
                 }
-                if (launchCheck != null) launchCheck.check();
-                PrivilegeBackend.Execution execution = backend.start(command, environment);
-                return new SyncthingExecution(execution, admission::release);
+            } finally {
+                if (!started) preparation.discard();
             }
         } catch (IOException | ExecutableNotFoundException | InterruptedException
                  | RuntimeException e) {
