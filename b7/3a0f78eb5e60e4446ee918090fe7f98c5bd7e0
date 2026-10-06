@@ -1,0 +1,21 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactory.java
+  s_7995548deb2efc::t_c21596e4aa2de3 51-68,71,84-91,97,100,109-113,190-195,235-243,246-248
+app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactoryTest.java
+  s_7995548deb2efc::t_6380c86d6efecb 7-23,151-507
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b73a0f78eb5e60e4446ee918090fe7f98c5bd7e0",
+  "prompts": {},
+  "sessions": {
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "unknown"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
