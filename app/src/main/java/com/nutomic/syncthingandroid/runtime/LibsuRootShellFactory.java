@@ -48,12 +48,27 @@ final class LibsuRootShellFactory implements RootShellFactory {
         if (timeoutMillis <= 0) {
             throw new IllegalArgumentException("The activation deadline must be positive");
         }
-        Process process = startRootTransportProcess();
+        return acquire(timeoutMillis, startRootTransportProcess(), LibsuRootShellFactory::buildLibsuShell);
+    }
+
+    /**
+     * Acquires a root shell over an already-started root transport process.
+     *
+     * <p>The libsu build step is a parameter so tests can drive the acceptance-failure teardown
+     * deterministically; production always passes {@link LibsuRootShellFactory#buildLibsuShell}.
+     * Once libsu has returned a shell, the transport wrapper is constructed immediately, so every
+     * later verification failure is torn down through {@link LibsuRootShell#close()}. That close
+     * destroys the underlying process when libsu cannot close the shell itself, which is what
+     * prevents an invalid UID probe or a rejected shell status from leaving a privileged
+     * transport process alive.</p>
+     */
+    RootShell acquire(long timeoutMillis, Process process, ShellBuilder shellBuilder)
+            throws RootTransportException {
+        Objects.requireNonNull(process);
+        Objects.requireNonNull(shellBuilder);
         Shell shell;
         try {
-            shell = Shell.Builder.create()
-                    .setTimeout(internalShellTimeoutSeconds(timeoutMillis))
-                    .build(process);
+            shell = shellBuilder.build(process, internalShellTimeoutSeconds(timeoutMillis));
         } catch (NoShellException e) {
             String evidence = buildFailureEvidence(e, process);
             destroyQuietly(process);
@@ -66,22 +81,34 @@ final class LibsuRootShellFactory implements RootShellFactory {
                     e
             );
         }
+        if (shell == null) {
+            destroyQuietly(process);
+            throw new RootTransportException(
+                    RootFailure.ROOT_TRANSPORT_FAILED,
+                    "The root shell build returned no shell for the root transport process"
+            );
+        }
+        LibsuRootShell rootShell = new LibsuRootShell(shell, process);
         try {
             requireRootShellStatus(shell.getStatus(), Shell.ROOT_SHELL, Shell.NON_ROOT_SHELL);
-            LibsuRootShell rootShell = new LibsuRootShell(shell, process);
             requireRootUser(rootShell.currentUid());
             return rootShell;
         } catch (RootTransportException e) {
-            closeQuietly(shell);
+            closeQuietly(rootShell);
             throw e;
         } catch (IOException | RuntimeException e) {
-            closeQuietly(shell);
+            closeQuietly(rootShell);
             throw new RootTransportException(
                     RootFailure.ROOT_TRANSPORT_FAILED,
                     "Could not verify the acquired root shell",
                     e
             );
         }
+    }
+
+    /** Builds the libsu shell that wraps one already-started root transport process. */
+    interface ShellBuilder {
+        Shell build(Process process, long internalTimeoutSeconds);
     }
 
     /**
@@ -160,6 +187,12 @@ final class LibsuRootShellFactory implements RootShellFactory {
         }
     }
 
+    private static Shell buildLibsuShell(Process process, long internalTimeoutSeconds) {
+        return Shell.Builder.create()
+                .setTimeout(internalTimeoutSeconds)
+                .build(process);
+    }
+
     private static String buildFailureEvidence(NoShellException failure, Process process) {
         StringBuilder evidence = new StringBuilder();
         Throwable cause = failure.getCause();
@@ -199,11 +232,20 @@ final class LibsuRootShellFactory implements RootShellFactory {
         }
     }
 
-    private static void closeQuietly(Shell shell) {
+    /**
+     * Closes a transport whose verification failed without masking the verification verdict.
+     *
+     * <p>{@link LibsuRootShell#close()} destroys the underlying root process when libsu cannot
+     * close its shell, so a post-build verification failure can never leave a privileged
+     * transport process alive. Any remaining teardown failure is swallowed so the caller still
+     * receives the original typed failure.</p>
+     */
+    private static void closeQuietly(RootShell shell) {
         try {
             shell.close();
-        } catch (IOException | RuntimeException ignored) {
-            // The transport process is already gone.
+        } catch (RuntimeException ignored) {
+            // The transport process is already gone or cannot be torn down further; the
+            // verification failure remains the result the caller has to receive.
         }
     }
 }
