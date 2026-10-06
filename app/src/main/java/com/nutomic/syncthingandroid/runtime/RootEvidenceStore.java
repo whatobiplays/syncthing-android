@@ -58,10 +58,43 @@ final class RootEvidenceStore implements ExecutionRecordStore {
         return preExec.readPendingLaunch();
     }
 
+    /**
+     * Removes every piece of durable evidence that names one run token.
+     *
+     * <p>Both sources can describe the same run at the same time, so both are asked to delete
+     * before either result is judged. The answer is then derived from a re-read of both sources
+     * instead of from the individual deletion results: deletion only counts as proven when a
+     * source no longer reports evidence for this run, and damaged, unreadable, or unsupported
+     * state can never prove absence. Recovery becomes launchable on this answer, so a cleanup that
+     * cannot prove every source free of the run fails closed and leaves the next attempt to
+     * retry.</p>
+     */
     @Override
     public boolean deleteIfRunTokenMatches(String runToken) throws IOException {
-        boolean canonicalDeleted = canonical.deleteIfRunTokenMatches(runToken);
-        boolean preExecDeleted = preExec.deleteIfRunTokenMatches(runToken);
-        return canonicalDeleted || preExecDeleted;
+        canonical.deleteIfRunTokenMatches(runToken);
+        preExec.deleteIfRunTokenMatches(runToken);
+        return provenFreeOf(canonical.read(), runToken)
+                && provenFreeOf(preExec.read(), runToken);
+    }
+
+    /**
+     * Reports whether one source proves that no evidence for the given run token survives.
+     *
+     * <p>A source is free of the run when it holds no record at all, or when the record it holds
+     * belongs to a different run. Every other state is unproven, because evidence this build
+     * cannot interpret could still be the record of the run that is being cleared.</p>
+     */
+    private static boolean provenFreeOf(ReadResult result, String runToken) {
+        switch (result.status()) {
+            case MISSING:
+                return true;
+            case VALID:
+                return !runToken.equals(result.identity().runToken());
+            case CORRUPT:
+            case UNSUPPORTED_VERSION:
+            case READ_FAILED:
+            default:
+                return false;
+        }
     }
 }

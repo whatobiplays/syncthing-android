@@ -12,13 +12,18 @@ import java.util.Objects;
  * to the shared Syncthing log and the leftover spool directory is removed. One-shot output stays
  * operation-scoped and is discarded instead of polluting the long-running log.</p>
  *
+ * <p>Which runs own shared-log output is decided by the closed command vocabulary itself
+ * ({@link SyncthingCommand#writesServeLog()}), so this reconciliation and the live launch path can
+ * never disagree about a command's output policy. A run whose recorded command cannot be resolved
+ * to that vocabulary is retained untouched.</p>
+ *
  * <p>Reconciliation uses the same {@link RootServeLogWriter} as the live run, so it resumes at the
  * durably recorded consumption offset rather than replaying a whole run: output that already
  * reached the log is never appended twice, and a reconciliation that could not delete its spool
  * appends nothing on the next attempt.</p>
  *
- * <p>A leftover run that cannot be attributed to a bundled command is never removed while it still
- * holds output, so evidence is never destroyed by a failed reconciliation.</p>
+ * <p>A leftover run that cannot be attributed to a bundled command is never removed, so neither
+ * its evidence nor output is ever destroyed by a failed reconciliation.</p>
  */
 final class RootRunSpoolReconciler {
     private final File spoolRoot;
@@ -56,9 +61,11 @@ final class RootRunSpoolReconciler {
                 // removed here.
                 continue;
             }
-            String commandName = RootRunSpool.readCommandName(directory);
-            if (commandName == null) {
-                // A run that cannot be attributed to a bundled command keeps its evidence.
+            SyncthingCommand command =
+                    SyncthingCommand.fromPersistedName(RootRunSpool.readCommandName(directory));
+            if (command == null) {
+                // A run whose recorded command is missing or unknown to the closed vocabulary has
+                // no defined output policy, so its evidence and any output stay untouched.
                 continue;
             }
             if (!RootRunSpool.hasOutput(directory)) {
@@ -66,7 +73,7 @@ final class RootRunSpoolReconciler {
                 reconciled++;
                 continue;
             }
-            if (SyncthingCommand.SERVE.name().equals(commandName)) {
+            if (command.writesServeLog()) {
                 RootServeLogWriter writer = RootServeLogWriter.forRunDirectory(
                         directory, logFile, logTemporaryDirectory
                 );

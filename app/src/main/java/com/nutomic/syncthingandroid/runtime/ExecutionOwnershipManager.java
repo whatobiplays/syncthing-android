@@ -242,8 +242,8 @@ public final class ExecutionOwnershipManager {
 
         ExecutionIdentity recorded = stored.identity();
         if (!recorded.bootId().equals(currentBootId)) {
-            deleteStaleRecord(recorded);
-            return classifyAfterRecordedExit(
+            return classifyAfterClearedRecord(
+                    recorded,
                     Classification.BOOT_ID_MISMATCH,
                     RecordEvidence.BOOT_ID_MISMATCH,
                     InspectionEvidence.NOT_CHECKED
@@ -270,8 +270,8 @@ public final class ExecutionOwnershipManager {
 
         if (inspection.status()
                 == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
-            deleteStaleRecord(recorded);
-            return classifyAfterRecordedExit(
+            return classifyAfterClearedRecord(
+                    recorded,
                     Classification.RECORDED_PROCESS_GONE,
                     RecordEvidence.PROCESS_GONE,
                     InspectionEvidence.PROCESS_ABSENT
@@ -334,8 +334,8 @@ public final class ExecutionOwnershipManager {
                     );
         }
 
-        deleteStaleRecord(recorded);
-        return classifyAfterRecordedExit(
+        return classifyAfterClearedRecord(
+                recorded,
                 Classification.NONMATCHING_RECORD,
                 RecordEvidence.NONMATCHING,
                 InspectionEvidence.LIVE
@@ -349,8 +349,11 @@ public final class ExecutionOwnershipManager {
      * non-launchable: the transport may still replace itself with the bundled binary. When that
      * process already reached the expected bundled executable the launch is an exactly owned
      * execution, and when the identity no longer names a live process the recorded state is stale
-     * and is cleared with the ordinary run-token-safe cleanup. Clearing the state refreshes
-     * bundled candidate discovery before recovery may report a launchable absence.</p>
+     * and is cleared with the ordinary run-token-safe cleanup. A recovery may only become
+     * launchable once that cleanup proved the obsolete state removed, because surviving evidence
+     * would keep overriding a replacement run's own pre-exec evidence; every other cleanup
+     * outcome fails closed. Clearing the state refreshes bundled candidate discovery before
+     * recovery may report a launchable absence.</p>
      *
      * @return an assessment that must block the launch, or {@code null} when the pending state
      *     was cleared, no bundled candidate exists, and the ordinary classification must continue
@@ -362,8 +365,8 @@ public final class ExecutionOwnershipManager {
     ) {
         if (!transport.bootId().equals(currentBootId)) {
             // A launch transport cannot survive a reboot, so this state belongs to a finished boot.
-            deletePendingLaunch(transport);
-            return blockOnRefreshedCandidatesAfterCleanup(
+            return classifyAfterClearedPendingLaunch(
+                    transport,
                     RecordEvidence.BOOT_ID_MISMATCH,
                     InspectionEvidence.NOT_CHECKED
             );
@@ -385,8 +388,8 @@ public final class ExecutionOwnershipManager {
             );
         }
         if (inspection.status() == ExecutionInspector.InspectionResult.Status.PROCESS_ABSENT) {
-            deletePendingLaunch(transport);
-            return blockOnRefreshedCandidatesAfterCleanup(
+            return classifyAfterClearedPendingLaunch(
+                    transport,
                     RecordEvidence.PROCESS_GONE,
                     InspectionEvidence.PROCESS_ABSENT
             );
@@ -432,21 +435,80 @@ public final class ExecutionOwnershipManager {
                     );
         }
         // The recorded process identifier now belongs to an unrelated process.
-        deletePendingLaunch(transport);
-        return blockOnRefreshedCandidatesAfterCleanup(
+        return classifyAfterClearedPendingLaunch(
+                transport,
                 RecordEvidence.NONMATCHING,
                 InspectionEvidence.LIVE
         );
     }
 
-    /** Clears only the durable state that names the run token of one obsolete transport. */
-    private void deletePendingLaunch(ExecutionIdentity transport) {
-        try {
-            records.deleteIfRunTokenMatches(transport.runToken());
-        } catch (IOException | RuntimeException e) {
-            // Cleanup stays best effort: the state is only cleared after its process was proven
-            // gone, and a later recovery reaches the same conclusion and tries again.
+    /**
+     * Classifies one pending launch whose transport is proven gone, after clearing its durable
+     * state.
+     *
+     * <p>When the matching pre-delivery evidence cannot be proven removed, recovery fails closed
+     * for this attempt: the surviving state could keep every later launch confirmation unresolved,
+     * so permitting a replacement could leave a live root process without its execution handle.
+     * Nothing is signaled, no replacement may start, and the evidence stays for the next
+     * attempt.</p>
+     */
+    private RecoveryAssessment classifyAfterClearedPendingLaunch(
+            ExecutionIdentity transport,
+            RecordEvidence recordEvidence,
+            InspectionEvidence inspectionEvidence
+    ) {
+        if (!deletePendingLaunch(transport)) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION,
+                    recordEvidence,
+                    CandidateEvidence.UNKNOWN,
+                    null,
+                    inspectionEvidence
+            );
         }
+        return blockOnRefreshedCandidatesAfterCleanup(recordEvidence, inspectionEvidence);
+    }
+
+    /**
+     * Clears only the durable state that names the run token of one obsolete transport.
+     *
+     * @return whether the matching durable evidence was proven removed
+     */
+    private boolean deletePendingLaunch(ExecutionIdentity transport) {
+        try {
+            return records.deleteIfRunTokenMatches(transport.runToken());
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Classifies one stale record whose process is proven gone, after clearing its durable
+     * evidence.
+     *
+     * <p>A classification may only become launchable once the obsolete evidence has been proven
+     * removed: while it survives it keeps taking precedence over any new run's pre-exec evidence,
+     * so a replacement launch could never confirm its own identity. A cleanup that throws, or
+     * that cannot prove the removal, therefore fails closed for this attempt and keeps the
+     * evidence for the next one.</p>
+     */
+    private RecoveryAssessment classifyAfterClearedRecord(
+            ExecutionIdentity recorded,
+            Classification noCandidateClassification,
+            RecordEvidence recordEvidence,
+            InspectionEvidence inspectionEvidence
+    ) {
+        if (!deleteStaleRecord(recorded)) {
+            return assessment(
+                    Classification.AMBIGUOUS_EXECUTION,
+                    recordEvidence,
+                    CandidateEvidence.UNKNOWN,
+                    null,
+                    inspectionEvidence
+            );
+        }
+        return classifyAfterRecordedExit(
+                noCandidateClassification, recordEvidence, inspectionEvidence);
     }
 
     private RecoveryAssessment classifyAfterRecordedExit(
@@ -708,11 +770,16 @@ public final class ExecutionOwnershipManager {
         return records.deleteIfRunTokenMatches(identity.runToken());
     }
 
-    private void deleteStaleRecord(ExecutionIdentity identity) {
+    /**
+     * Clears the durable record of one stale execution.
+     *
+     * @return whether the matching durable evidence was proven removed
+     */
+    private boolean deleteStaleRecord(ExecutionIdentity identity) {
         try {
-            records.deleteIfRunTokenMatches(identity.runToken());
-        } catch (IOException | RuntimeException ignored) {
-            // Stale evidence remains available for the next recovery attempt.
+            return records.deleteIfRunTokenMatches(identity.runToken());
+        } catch (IOException | RuntimeException e) {
+            return false;
         }
     }
 

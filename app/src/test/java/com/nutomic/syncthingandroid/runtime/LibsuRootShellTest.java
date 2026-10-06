@@ -2,12 +2,28 @@ package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
+import com.topjohnwu.superuser.Shell;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
@@ -127,5 +143,278 @@ public class LibsuRootShellTest {
                 9500,
                 entries.get(1).processStartTimeTicks()
         );
+    }
+
+    @Test
+    public void timedOutHelperOperationClosesThroughTheTransportFallback() throws Exception {
+        FailingCloseShell shell = new FailingCloseShell();
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
+        LibsuRootShell transport = new LibsuRootShell(shell, process, 50);
+
+        try {
+            transport.currentUid();
+            fail("Expected the helper operation to time out");
+        } catch (IOException expected) {
+            assertTrue(
+                    "the timeout has to surface unchanged",
+                    expected.getMessage().contains("timed out")
+            );
+        }
+
+        assertTrue("the stalled helper job is cancelled", shell.awaitJobInterrupted());
+        assertTrue("the libsu shell is asked to close first", shell.closeAttempted());
+        assertEquals(
+                "a shell that libsu cannot close has its transport process destroyed",
+                1,
+                process.destroyCount()
+        );
+    }
+
+    @Test
+    public void interruptedHelperOperationClosesThroughTheTransportFallback() throws Exception {
+        FailingCloseShell shell = new FailingCloseShell();
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
+        LibsuRootShell transport = new LibsuRootShell(shell, process);
+        AtomicReference<IOException> failure = new AtomicReference<>();
+        AtomicBoolean interruptStatus = new AtomicBoolean();
+        Thread caller = new Thread(() -> {
+            try {
+                transport.currentUid();
+            } catch (IOException e) {
+                failure.set(e);
+                interruptStatus.set(Thread.currentThread().isInterrupted());
+            }
+        }, "interrupted-helper-caller");
+
+        caller.start();
+        assertTrue("the helper job has to be running", shell.awaitJobStarted());
+        caller.interrupt();
+        caller.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse("the caller has to finish", caller.isAlive());
+
+        assertNotNull("the interruption has to reach the caller", failure.get());
+        assertTrue(
+                "the interruption has to surface unchanged",
+                failure.get().getMessage().contains("interrupted")
+        );
+        assertTrue("the caller's interrupt status is restored", interruptStatus.get());
+        assertTrue("the stalled helper job is cancelled", shell.awaitJobInterrupted());
+        assertTrue(shell.closeAttempted());
+        assertEquals(
+                "a shell that libsu cannot close has its transport process destroyed",
+                1,
+                process.destroyCount()
+        );
+    }
+
+    @Test
+    public void teardownFailureNeverMasksTheTimedOutHelperOperation() throws Exception {
+        FailingCloseShell shell = new FailingCloseShell();
+        LibsuRootShell transport = new LibsuRootShell(shell, new DestroyFailingProcess(), 50);
+
+        try {
+            transport.currentUid();
+            fail("Expected the helper operation to time out");
+        } catch (IOException expected) {
+            assertTrue(
+                    "a failed teardown must not replace the timeout",
+                    expected.getMessage().contains("timed out")
+            );
+        }
+
+        assertTrue(shell.closeAttempted());
+    }
+
+    @Test
+    public void uncheckedTeardownFailureStillDestroysTheTransportProcess() throws Exception {
+        FailingCloseShell shell = new FailingCloseShell(
+                new IllegalStateException("libsu cannot close a shell in this state"));
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
+        LibsuRootShell transport = new LibsuRootShell(shell, process, 50);
+
+        try {
+            transport.currentUid();
+            fail("Expected the helper operation to time out");
+        } catch (IOException expected) {
+            assertTrue(
+                    "an unchecked teardown failure must not replace the timeout",
+                    expected.getMessage().contains("timed out")
+            );
+        }
+
+        assertTrue(shell.closeAttempted());
+        assertEquals(
+                "an unchecked close failure still destroys the transport process",
+                1,
+                process.destroyCount()
+        );
+    }
+
+    /**
+     * A libsu shell double whose close always fails, either with the declared I/O failure or
+     * with an unchecked state error, and whose jobs block until they are cancelled, so the
+     * deterministic replacement is the transport-level process teardown.
+     */
+    private static class FailingCloseShell extends Shell {
+        private final CountDownLatch jobStarted = new CountDownLatch(1);
+        private final CountDownLatch jobInterrupted = new CountDownLatch(1);
+        private final AtomicBoolean closeAttempted = new AtomicBoolean();
+        private final RuntimeException uncheckedFailure;
+
+        FailingCloseShell() {
+            this(null);
+        }
+
+        FailingCloseShell(RuntimeException uncheckedFailure) {
+            this.uncheckedFailure = uncheckedFailure;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return true;
+        }
+
+        @Override
+        public void execTask(Task task) {
+            throw new AssertionError("Helper operations never use raw terminal tasks");
+        }
+
+        @Override
+        public void submitTask(Task task) {
+            throw new AssertionError("Helper operations never submit raw tasks");
+        }
+
+        @Override
+        public Job newJob() {
+            return new BlockingJob();
+        }
+
+        @Override
+        public int getStatus() {
+            return ROOT_SHELL;
+        }
+
+        @Override
+        public boolean waitAndClose(long timeout, TimeUnit unit) {
+            return true;
+        }
+
+        @Override
+        public void close() throws IOException {
+            closeAttempted.set(true);
+            if (uncheckedFailure != null) {
+                throw uncheckedFailure;
+            }
+            throw new IOException("libsu cannot flush the exit command");
+        }
+
+        private boolean awaitJobStarted() throws InterruptedException {
+            return jobStarted.await(5, TimeUnit.SECONDS);
+        }
+
+        private boolean awaitJobInterrupted() throws InterruptedException {
+            return jobInterrupted.await(5, TimeUnit.SECONDS);
+        }
+
+        private boolean closeAttempted() {
+            return closeAttempted.get();
+        }
+
+        private final class BlockingJob extends Job {
+            @Override
+            public Job to(List<String> stdout) {
+                return this;
+            }
+
+            @Override
+            public Job to(List<String> stdout, List<String> stderr) {
+                return this;
+            }
+
+            @Override
+            public Job add(String... commands) {
+                return this;
+            }
+
+            @Override
+            public Job add(InputStream in) {
+                return this;
+            }
+
+            @Override
+            public Result exec() {
+                jobStarted.countDown();
+                try {
+                    new CountDownLatch(1).await();
+                } catch (InterruptedException cancelled) {
+                    jobInterrupted.countDown();
+                    Thread.currentThread().interrupt();
+                }
+                return null;
+            }
+
+            @Override
+            public void submit(Executor executor, ResultCallback callback) {
+                throw new AssertionError("Helper operations run their job synchronously");
+            }
+
+            @Override
+            public Future<Result> enqueue() {
+                throw new AssertionError("Helper operations never enqueue jobs");
+            }
+        }
+    }
+
+    /** A transport process double that records every destroy call. */
+    private static class DestroyRecordingProcess extends Process {
+        private final AtomicInteger destroyCount = new AtomicInteger();
+
+        @Override
+        public OutputStream getOutputStream() {
+            return new ByteArrayOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public int waitFor() {
+            return 0;
+        }
+
+        @Override
+        public int exitValue() {
+            return 0;
+        }
+
+        @Override
+        public void destroy() {
+            destroyCount.incrementAndGet();
+        }
+
+        @Override
+        public boolean isAlive() {
+            return false;
+        }
+
+        private int destroyCount() {
+            return destroyCount.get();
+        }
+    }
+
+    /** A transport process double whose teardown fails as well. */
+    private static final class DestroyFailingProcess extends DestroyRecordingProcess {
+        @Override
+        public void destroy() {
+            super.destroy();
+            throw new IllegalStateException("the transport process cannot be destroyed");
+        }
     }
 }

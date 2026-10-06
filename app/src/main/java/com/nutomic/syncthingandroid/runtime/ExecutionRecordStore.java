@@ -8,6 +8,18 @@ interface ExecutionRecordStore {
 
     void write(ExecutionIdentity identity) throws IOException;
 
+    /**
+     * Removes the durable evidence that names one run token and reports whether removal was
+     * proven.
+     *
+     * <p>Deletion is token-safe: evidence of another run, and evidence that cannot be attributed
+     * to a token at all, is never destroyed. Implementations throw when evidence matching the
+     * token was found and could not be removed, and answer {@code true} only when no evidence for
+     * that run survives, because callers let a proven removal decide whether a replacement launch
+     * may proceed.</p>
+     *
+     * @return whether no durable evidence for {@code runToken} remains
+     */
     boolean deleteIfRunTokenMatches(String runToken) throws IOException;
 
     /**

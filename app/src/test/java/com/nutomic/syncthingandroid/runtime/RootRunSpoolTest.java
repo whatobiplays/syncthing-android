@@ -157,6 +157,88 @@ public class RootRunSpoolTest {
     }
 
     @Test
+    public void reconciliationAppendsLeftoverDeltaResetOutputToSharedLog() throws IOException {
+        File root = temporaryDirectory();
+        File log = new File(root, "syncthing.log");
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool leftover = RootRunSpool.create(
+                    spoolRoot, "token-a", SyncthingCommand.RESET_DELTAS.name()
+            );
+            RootServeLogWriter writer = RootServeLogWriter.forRunDirectory(
+                    leftover.directory(), log, root
+            );
+            appendText(leftover.outputFile(), "delta reset while the app was alive\n");
+            writer.appendPendingOutput();
+
+            appendText(leftover.outputFile(), "delta reset while the app was gone\n");
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(spoolRoot, log, root);
+
+            assertEquals(1, reconciler.reconcile(null));
+
+            assertEquals(
+                    "the delta-reset run is serve-style: only its unconsumed bytes are appended",
+                    "delta reset while the app was alive\n"
+                            + "delta reset while the app was gone\n",
+                    readText(log)
+            );
+            assertFalse(leftover.directory().exists());
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    @Test
+    public void unknownCommandNameWithOutputIsRetained() throws IOException {
+        File root = temporaryDirectory();
+        File log = new File(root, "syncthing.log");
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool leftover = RootRunSpool.create(
+                    spoolRoot, "token-a", SyncthingCommand.SERVE.name()
+            );
+            appendText(leftover.outputFile(), "output of an unattributable run\n");
+            writeText(leftover.commandFile(), "serve --debug-reset-delta-idxs");
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(spoolRoot, log, root);
+
+            assertEquals(0, reconciler.reconcile(null));
+
+            assertTrue(
+                    "a command outside the closed vocabulary has no defined output policy",
+                    leftover.directory().exists()
+            );
+            assertFalse("nothing may be appended on a guessed policy", log.exists());
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    @Test
+    public void unknownCommandNameWithEvidenceIsRetained() throws IOException {
+        File root = temporaryDirectory();
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool leftover = RootRunSpool.create(
+                    spoolRoot, "token-a", SyncthingCommand.DEVICE_ID.name()
+            );
+            writeText(leftover.commandFile(), "device");
+            appendText(leftover.evidenceFile(), "version=1\npid=17\n");
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(
+                    spoolRoot, new File(root, "syncthing.log"), root
+            );
+
+            assertEquals(0, reconciler.reconcile(null));
+
+            assertTrue(
+                    "recorded evidence is never destroyed with an unattributable run",
+                    leftover.directory().exists()
+            );
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    @Test
     public void unattributableLeftoverOutputIsRetained() throws IOException {
         File root = temporaryDirectory();
         try {
@@ -407,6 +489,12 @@ public class RootRunSpoolTest {
 
     private static void appendText(File file, String text) throws IOException {
         try (FileOutputStream output = new FileOutputStream(file, true)) {
+            output.write(text.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static void writeText(File file, String text) throws IOException {
+        try (FileOutputStream output = new FileOutputStream(file)) {
             output.write(text.getBytes(StandardCharsets.UTF_8));
         }
     }

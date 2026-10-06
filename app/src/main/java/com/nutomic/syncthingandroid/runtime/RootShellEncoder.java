@@ -11,12 +11,14 @@ import java.util.regex.Pattern;
  * shell text. The produced script:</p>
  *
  * <ol>
- * <li>exports the shared structured environment, plus the private run token;</li>
  * <li>refuses to continue unless the shell really runs as UID 0;</li>
  * <li>writes the durable execution evidence that recovery depends on, using the PID that the
  * shell keeps while it replaces itself with the bundled binary, into an app-owned staging file
  * and renames that file over the pre-delivery run evidence, so the durable record changes from
  * pending state to complete pre-exec evidence atomically;</li>
+ * <li>exports the shared structured environment, including every custom user variable and the
+ * private run token, as the last step before the terminal {@code exec}, so no protocol command
+ * ever runs under caller-supplied environment semantics;</li>
  * <li>finally {@code exec}s the bundled binary with its standard output and standard error
  * redirected into the app-owned per-run spool.</li>
  * </ol>
@@ -69,15 +71,11 @@ final class RootShellEncoder {
             throw new IllegalArgumentException("The approved environment needs the private run token");
         }
 
-        StringBuilder script = new StringBuilder();
-        for (Map.Entry<String, String> entry : environment.entrySet()) {
-            requireEnvironmentName(entry.getKey());
-            script.append("export ")
-                    .append(entry.getKey())
-                    .append('=')
-                    .append(quote(entry.getValue()))
-                    .append('\n');
+        for (String name : environment.keySet()) {
+            requireEnvironmentName(name);
         }
+
+        StringBuilder script = new StringBuilder();
         script.append("[ \"$(id -u)\" = \"0\" ] || exit ")
                 .append(UID_GUARD_EXIT_CODE)
                 .append('\n');
@@ -112,6 +110,16 @@ final class RootShellEncoder {
                 .append(" || exit ")
                 .append(EVIDENCE_WRITE_EXIT_CODE)
                 .append('\n');
+        // The environment is installed only now. Custom variables may legitimately carry names
+        // such as PATH or LD_PRELOAD, so every command that reads or writes durable state above
+        // has to run under the root shell's own environment.
+        for (Map.Entry<String, String> entry : environment.entrySet()) {
+            script.append("export ")
+                    .append(entry.getKey())
+                    .append('=')
+                    .append(quote(entry.getValue()))
+                    .append('\n');
+        }
         script.append("exec ").append(quote(argv[0]));
         for (int index = 1; index < argv.length; index++) {
             script.append(' ').append(quote(argv[index]));

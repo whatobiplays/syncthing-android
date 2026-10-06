@@ -289,7 +289,7 @@ public final class RootBackend implements PrivilegeBackend {
                 launchScript,
                 runToken,
                 transportIdentity,
-                writesServeOutput(command)
+                command.writesServeLog()
         );
     }
 
@@ -624,13 +624,6 @@ public final class RootBackend implements PrivilegeBackend {
                 RootFailure.PRIVILEGED_STATE_NOT_IMPLEMENTED,
                 operation + " is not part of this implementation slice"
         );
-    }
-
-    /** Reports whether one bundled command writes long-running serve output. */
-    private static boolean writesServeOutput(SyncthingCommand command) {
-        return command != SyncthingCommand.DEVICE_ID
-                && command != SyncthingCommand.GENERATE
-                && command != SyncthingCommand.RESET_DATABASE;
     }
 
     private static int awaitExitQuietly(RootShell shell) {

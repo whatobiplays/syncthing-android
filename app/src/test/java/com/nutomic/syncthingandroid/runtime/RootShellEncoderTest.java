@@ -162,6 +162,59 @@ public class RootShellEncoderTest {
         }
     }
 
+    @Test
+    public void hostileEnvironmentVariablesAreInstalledOnlyAfterTheProtocol() {
+        Map<String, String> values = environment();
+        values.put("PATH", "/data/local/tmp:/system/bin");
+        values.put("LD_PRELOAD", "/data/local/tmp/libhook.so");
+        values.put("STTRACE", "all'; id -u; echo '");
+
+        String script = RootShellEncoder.launchScript(
+                new String[]{"/data/app/lib/libsyncthingnative.so", "serve", "--no-browser"},
+                values,
+                EVIDENCE,
+                STAGING,
+                OUTPUT
+        );
+
+        int firstExport = script.indexOf("\nexport ");
+        int exec = script.indexOf("\nexec ");
+        assertTrue("the environment has to be installed at all", firstExport > 0);
+        assertTrue(
+                "the UID guard runs under the root shell's own environment",
+                script.indexOf("\"$(id -u)\"") < firstExport
+        );
+        assertTrue(
+                "the durable evidence protocol completes before any export",
+                script.indexOf("mv -f '") < firstExport
+        );
+        assertTrue("the environment is installed right before the exec", firstExport < exec);
+        for (String line : script.substring(firstExport + 1, exec).split("\n", -1)) {
+            assertTrue(
+                    "no protocol command may run under the custom environment: " + line,
+                    line.startsWith("export ")
+            );
+        }
+
+        assertTrue("PATH parities Normal Mode and Superuser Mode",
+                script.contains("export PATH='/data/local/tmp:/system/bin'\n"));
+        assertTrue("LD_PRELOAD parities Normal Mode and Superuser Mode",
+                script.contains("export LD_PRELOAD='/data/local/tmp/libhook.so'\n"));
+        assertTrue("the run token still reaches the launched process",
+                script.contains("export " + LibsuRootShell.RUN_TOKEN_ENVIRONMENT
+                        + "='" + TOKEN + "'\n"));
+        assertTrue(
+                "value quoting still escapes single quotes",
+                script.contains("export STTRACE='all'\\''; id -u; echo '\\'''\n")
+        );
+        assertTrue(
+                "the terminal executable stays the fixed absolute bundled path",
+                script.contains("\nexec '/data/app/lib/libsyncthingnative.so' 'serve' '--no-browser'"
+                        + " > '" + OUTPUT + "' 2>&1\n")
+        );
+        assertEquals(1, countOccurrences(script, "\nexec "));
+    }
+
     private static String launchScript() {
         return RootShellEncoder.launchScript(
                 new String[] {"/data/app/lib/libsyncthingnative.so", "serve"},

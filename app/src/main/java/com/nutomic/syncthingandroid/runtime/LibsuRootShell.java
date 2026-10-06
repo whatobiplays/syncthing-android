@@ -58,11 +58,27 @@ final class LibsuRootShell implements RootShell {
 
     private final Shell shell;
     private final Process process;
+    private final long operationTimeoutMillis;
     private int shellPid;
 
     LibsuRootShell(Shell shell, Process process) {
+        this(shell, process, OPERATION_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * Creates one transport over an acquired shell with an explicit helper-operation bound.
+     *
+     * <p>Production acquires transports with {@link #OPERATION_TIMEOUT_MILLIS}; the override
+     * exists so the cleanup behavior of a timing-out helper operation can be exercised
+     * deterministically.</p>
+     */
+    LibsuRootShell(Shell shell, Process process, long operationTimeoutMillis) {
         this.shell = Objects.requireNonNull(shell);
         this.process = Objects.requireNonNull(process);
+        if (operationTimeoutMillis <= 0) {
+            throw new IllegalArgumentException("The helper-operation timeout must be positive");
+        }
+        this.operationTimeoutMillis = operationTimeoutMillis;
     }
 
     @Override
@@ -180,10 +196,28 @@ final class LibsuRootShell implements RootShell {
     public void close() {
         try {
             shell.close();
-        } catch (IOException e) {
-            // libsu could not flush its exit command; terminate the shell process directly
-            // so a failed close never leaves a root shell alive behind the transport.
+        } catch (IOException | RuntimeException e) {
+            // libsu could not flush its exit command, or it failed with an unchecked state
+            // error; either way terminate the shell process directly so a failed close never
+            // leaves a root shell alive behind the transport.
             process.destroy();
+        }
+    }
+
+    /**
+     * Closes the transport after a failed helper operation.
+     *
+     * <p>The cleanup runs through {@link #close()}, so a shell that libsu cannot close cleanly
+     * still has its underlying root transport process destroyed instead of staying alive behind
+     * an abandoned transport. A failure of that teardown itself is swallowed: the caller has to
+     * receive the timeout or interruption that actually ended the operation, because the failure
+     * of one helper operation must never be reported as something else.</p>
+     */
+    private void closeAfterFailedOperation() {
+        try {
+            close();
+        } catch (RuntimeException ignored) {
+            // The primary timeout or interruption outcome outranks a teardown failure.
         }
     }
 
@@ -212,10 +246,10 @@ final class LibsuRootShell implements RootShell {
                 () -> shell.newJob().add(command).to(stdout, stderr).exec()
         );
         try {
-            return future.get(OPERATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            return future.get(operationTimeoutMillis, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
-            shell.close();
+            closeAfterFailedOperation();
             throw new IOException("The root shell operation timed out", e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
@@ -226,7 +260,7 @@ final class LibsuRootShell implements RootShell {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             future.cancel(true);
-            shell.close();
+            closeAfterFailedOperation();
             throw new IOException("The root shell operation was interrupted", e);
         }
     }
