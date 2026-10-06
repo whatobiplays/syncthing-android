@@ -1,0 +1,51 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootEvidenceStore.java
+  s_09b05cf592369e::t_1117384206f0b7 61-71,74-98
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionOwnershipManager.java
+  s_7995548deb2efc::t_4ea456db4850bf 245-246,273-274,337-338,352-356,368-369,391-392,438-439,445-477,479,481,485-513,773-778,780-782
+app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionRecordStore.java
+  s_7995548deb2efc::t_f392f4683251ef 11-22
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShell.java
+  s_7995548deb2efc::t_6e68958b26d4a3 61,65-75,78-81,199-202,207-223,249,252,263
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootBackend.java
+  s_7995548deb2efc::t_df69db6f3319e7 292
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolReconciler.java
+  s_7995548deb2efc::t_ff993e44b18523 15-19,25-26,64-68,76
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootShellEncoder.java
+  s_7995548deb2efc::t_6a68e614ce13ef 19-21,74-75,77-78,113-122
+app/src/main/java/com/nutomic/syncthingandroid/runtime/SyncthingCommand.java
+  s_7995548deb2efc::t_46bff41a315c06 30-69
+app/src/test/java/com/nutomic/syncthingandroid/runtime/ExecutionOwnershipManagerTest.java
+  s_7995548deb2efc::t_81a65f31838b8f 818-1001,1031-1034,1063-1068
+app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellTest.java
+  s_7995548deb2efc::t_750ad2f3b76887 5,8,10-16,20-26,147-419
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootEvidenceStoreTest.java
+  s_7995548deb2efc::t_e2bee4fab526d5 1-167
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolTest.java
+  s_7995548deb2efc::t_215bb75444ab49 159-240,496-501
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootShellEncoderTest.java
+  s_7995548deb2efc::t_fdd53a6d9acdbf 165-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1517e89710eebca954c259b27ab507f6a22c64e7",
+  "prompts": {},
+  "sessions": {
+    "s_09b05cf592369e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f8e2-4b10-7ff1-bbb2-622c77762fbd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "unknown"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
