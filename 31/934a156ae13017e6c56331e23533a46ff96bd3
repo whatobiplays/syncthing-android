@@ -4,13 +4,13 @@ app/src/main/java/com/nutomic/syncthingandroid/runtime/AppUidBackend.java
   s_7995548deb2efc::t_7ddb0f0231eea1 103,113-115
   s_7995548deb2efc::t_84b55106264b4a 126-131,138-143
 app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShell.java
-  s_7995548deb2efc::t_49859d1a31b7d6 78-97,94-113
+  s_7995548deb2efc::t_49859d1a31b7d6 78-97,94-113,94-97
   s_7995548deb2efc::t_1cc6db50a8103a 61
   s_7995548deb2efc::t_642e84f08eb6ad 216-217,250-251
   s_7995548deb2efc::t_216f63a96d3c13 165-171,181-187
   s_7995548deb2efc::t_d37f57cd3a423f 238-240,272-274
   s_7995548deb2efc::t_f3af48f0ef5536 40-41
-  s_7995548deb2efc::t_d9e9663a3d2005 1-39,42-60,61-63,62-93,64-65,66-77,98-136,114-152,148-164,164-180,172-182,186-189,188-249,190-214,219-228,230-237,241-302,252-271,275-336
+  s_7995548deb2efc::t_d9e9663a3d2005 1-39,42-60,61-63,62-93,64-65,66-77,66-93,98-136,114-152,148-164,148-152,164-180,164-182,172-182,186-189,188-249,190-214,216-217,219-228,230-237,230-302,241-302,252-271,275-336
   s_7995548deb2efc::t_638e136d63c3ec 137-147,153-163
   s_7995548deb2efc::t_08ef4f3d2a1237 303-305
   s_7995548deb2efc::t_06d9aac9445421 306-336
@@ -34,7 +34,7 @@ app/src/main/java/com/nutomic/syncthingandroid/runtime/RootProcessSignalTranspor
   s_7995548deb2efc::t_8de5241d5e3b55 1-33
 app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolReconciler.java
   s_7995548deb2efc::t_fe487c31ff56a1 1-51,1-14,15-19,22-46,54-58,59-90,62-68,70-83
-  s_7995548deb2efc::t_a3bb8ae59cbd10 47-53,52-58
+  s_7995548deb2efc::t_a3bb8ae59cbd10 47-53,47-58,52-58
   s_7995548deb2efc::t_1fa8eb59e408dd 84-86
   s_7995548deb2efc::t_c6097431f4e8cd 87-90
 app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellTest.java
@@ -63,7 +63,7 @@ app/src/test/java/com/nutomic/syncthingandroid/runtime/RootExecutionRecordStoreT
   s_7995548deb2efc::t_c44cdedad59730 249-373
   s_7995548deb2efc::t_6fb43a9c7377a9 1-122,126-217,243-248,374-377
 app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactoryTest.java
-  s_7995548deb2efc::t_bfb95346747272 1-24,28-134
+  s_7995548deb2efc::t_bfb95346747272 1-24,1-6,7-24,28-134,28-133,134
   s_7995548deb2efc::t_899dcee754e156 25-27
 app/src/main/java/com/nutomic/syncthingandroid/runtime/RootServeLogWriter.java
   s_7995548deb2efc::t_2bd68df6c24beb 1-47,68-157
@@ -110,15 +110,15 @@ app/src/main/java/com/nutomic/syncthingandroid/runtime/RootBackend.java
 app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionOwnershipManager.java
   s_7995548deb2efc::t_3959df472e6599 20-28,284-290,315-334
   s_7995548deb2efc::t_bd4fd40ba87cbb 364,367-368
-  s_7995548deb2efc::t_1abe189b75e5c2 335,456,469-481,493,496,507-509,513-515,520-563,531-625,566-568,576-577,582,584-585,589,597,601,605,613,615-616,620,625,628-630
+  s_7995548deb2efc::t_1abe189b75e5c2 335,456,469-481,493,496,507-509,513-515,520-563,531-625,531-563,566-568,576-577,582,584-585,589,597,601,605,613,615-616,620,625,628-630
   s_7995548deb2efc::t_fd40e3adc07e70 458-468,520-530
-  s_7995548deb2efc::t_63ce4e5b554790 213-216,352-353,355-356,363,366,369,386-387,389-392,433-434,436-439,444,446,449-451,456-481,493,496
+  s_7995548deb2efc::t_63ce4e5b554790 213-216,352-353,355-356,363,366,369,386-387,389-392,433-434,436-439,444,446,449-451,456-481,456,458-481,493,496
   s_7995548deb2efc::t_3387f5b1e9cbcb 217-218
   s_7995548deb2efc::t_1606f86e9be3cd 196-212,219-220
   s_7995548deb2efc::t_762a5cf8614dde 507-509,513-515
-  s_7995548deb2efc::t_2eb3753fb8acb9 392,395,407-416,410-419
+  s_7995548deb2efc::t_2eb3753fb8acb9 392,395,407-416,410-419,410-416
   s_7995548deb2efc::t_a3555ff97951e1 564-565,626-627
-  s_7995548deb2efc::t_e68b6dd35ffe9f 345-351,354,354-362,357-365,367-385,370-388,390-391,393-394,393-406,396-409,417-432,420-435,437-441,440-451
+  s_7995548deb2efc::t_e68b6dd35ffe9f 345-351,354,354-362,354-364,357-365,367-385,367-387,370-388,390-391,393-394,393-406,393-409,396-409,417-432,417-434,420-435,437-441,440-451,444,446,449-451
   s_b6ea83b5fbd538::t_a9aa3ea6123889 336
   s_7995548deb2efc::t_55adccedcccbf8 457
   s_7995548deb2efc::t_1ca324dc87917d 569-571,573-575
@@ -194,12 +194,13 @@ app/src/main/java/com/nutomic/syncthingandroid/runtime/SyncthingExecution.java
 app/src/main/java/com/nutomic/syncthingandroid/runtime/RootShellSession.java
   s_7995548deb2efc::t_b6c50b0d0d5b7f 1-99
 app/src/main/java/com/nutomic/syncthingandroid/runtime/RootShellEncoder.java
-  s_7995548deb2efc::t_d9e035403cdaeb 1-16,1-13,15-16,20-47,20-44,47-52,50-55,54-58,57-61,60-71,63-103,72,81-96,105-114,112-134,115-117,119,124-125
-  s_7995548deb2efc::t_7ce6ac0941d4e7 17-19,45-46,48-49,53,56,59,62,97-104,104-111
+  s_7995548deb2efc::t_d9e035403cdaeb 1-16,1-13,15-16,20-47,20-44,47-52,47,50-55,50-52,54-58,54-55,57-61,57-58,60-71,60-61,63-103,63-71,72,81-96,105-114,112-134,112-114,115-117,119,124-125
+  s_7995548deb2efc::t_7ce6ac0941d4e7 17-19,45-46,48-49,53,56,59,62,97-104,97-111,104-111
   s_7995548deb2efc::t_01a0c731be5e46 118
   s_7995548deb2efc::t_91f5c45c279c7b 120-123
   s_7995548deb2efc::t_cfcc5b8bdfee0a 126-128
   s_7995548deb2efc::t_832dcfd373b62f 129-134
+  s_7995548deb2efc::t_6a68e614ce13ef 72
 app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionRecordStore.java
   s_7995548deb2efc::t_0f7f81c9c2d611 112-138
   s_7995548deb2efc::t_2871af22649c22 13-74
@@ -289,8 +290,10 @@ gradle/libs.versions.toml
 app/src/main/java/com/nutomic/syncthingandroid/runtime/ExecutionIdentity.java
   s_7995548deb2efc::t_944c963e8b653b 76-91
 app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactory.java
-  s_7995548deb2efc::t_5fbf1b982b6e33 1-204,206-209
-  s_7995548deb2efc::t_ad384ff41ea031 205
+  s_7995548deb2efc::t_5fbf1b982b6e33 1-204,1-50,52-53,57-68,69-70,72-74,76-77,79-86,87-162,163-170,172-175,206-209
+  s_7995548deb2efc::t_ad384ff41ea031 171,205
+  s_7995548deb2efc::t_e57b20ccc7ab7a 176-178
+  s_7995548deb2efc::t_dec08c5bd9e648 179-201,203-204,207-209
 app/src/main/java/com/nutomic/syncthingandroid/runtime/RootActivation.java
   s_7995548deb2efc::t_d86b1d98f0f231 1-2,4-8,13,17,29,32-33,48-49,51-52,58,60-65,71,84-86,88,97,99-100,117,131-132,142,185-186,208-210
   s_7995548deb2efc::t_9822a294ea9c39 24-28,66-70,72-83,102-115,120,143,146-155,163,168,173,178-179,181-182,193,196-197
