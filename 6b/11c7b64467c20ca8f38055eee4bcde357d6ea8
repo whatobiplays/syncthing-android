@@ -1,0 +1,29 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootBackend.java
+  s_7995548deb2efc::t_1f9015363777fd 95-100,113,137-138,154-155,165-166,174,554-558,577,654-705,1045-1054,1172-1175,1196
+app/src/test/java/com/nutomic/syncthingandroid/runtime/FakeRootTransport.java
+  s_7995548deb2efc::t_ef09d4a5da2794 107-111,495
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootBackendTest.java
+  s_7995548deb2efc::t_91a1f0075af3c9 46-53,748-749,1573-1644,2217-2294,2633,3067-3079,3111-3122,3138-3139,3153-3154
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolTest.java
+  s_7995548deb2efc::t_07c387fcd90356 6,15,358-360,362-363,367-370,547-769
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpool.java
+  s_7995548deb2efc::t_7de4b065b3caee 44-52,58,64-75,77-78,98,123-135,138-139,143-152,155-156,161-170,189,218-229,231,233-234,236-249,252,277-333,431-435,438-440,442-444
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolReconciler.java
+  s_7995548deb2efc::t_577cd1d5637b02 57,61-66,86-89,105,115-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6b11c7b64467c20ca8f38055eee4bcde357d6ea8",
+  "prompts": {},
+  "sessions": {
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
