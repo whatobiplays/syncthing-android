@@ -54,39 +54,53 @@ final class RootRunSpoolReconciler {
             if (activeSpool != null && directory.equals(activeSpool.directory())) {
                 continue;
             }
-            if (RootSpoolEvidence.readPendingLaunch(directory).status()
-                    != ExecutionRecordStore.PendingLaunch.Status.NONE) {
-                // The run still carries durable pre-delivery state, so its transport may yet
-                // become the bundled process and neither its evidence nor its spool may be
-                // removed here.
+            // A run spool is only ever inspected, appended to, or deleted while this
+            // reconciliation holds its exclusive lease, and the lease is held until the whole
+            // decision - including any deletion - has completed. A run that an in-process
+            // preparation or execution still owns is skipped, because that handle is still
+            // reading or writing it. The lease is an operating-system lock, so it disappears with
+            // the owning application process and an orphaned run stays reconcilable afterwards.
+            RootRunSpool.Lease lease = RootRunSpool.tryAcquireLease(directory);
+            if (lease == null) {
                 continue;
             }
-            SyncthingCommand command =
-                    SyncthingCommand.fromPersistedName(RootRunSpool.readCommandName(directory));
-            if (command == null) {
-                // A run whose recorded command is missing or unknown to the closed vocabulary has
-                // no defined output policy, so its evidence and any output stay untouched.
-                continue;
-            }
-            if (!RootRunSpool.hasOutput(directory)) {
-                RootRunSpool.deleteDirectory(directory);
-                reconciled++;
-                continue;
-            }
-            if (command.writesServeLog()) {
-                RootServeLogWriter writer = RootServeLogWriter.forRunDirectory(
-                        directory, logFile, logTemporaryDirectory
-                );
-                try {
-                    writer.appendPendingOutput();
-                } catch (IOException e) {
-                    // Output that did not reach the log keeps its spool, so nothing is lost.
+            try {
+                if (RootSpoolEvidence.readPendingLaunch(directory).status()
+                        != ExecutionRecordStore.PendingLaunch.Status.NONE) {
+                    // The run still carries durable pre-delivery state, so its transport may yet
+                    // become the bundled process and neither its evidence nor its spool may be
+                    // removed here.
                     continue;
                 }
-                appendedWriter = writer;
-            }
-            if (RootRunSpool.deleteDirectory(directory)) {
-                reconciled++;
+                SyncthingCommand command =
+                        SyncthingCommand.fromPersistedName(RootRunSpool.readCommandName(directory));
+                if (command == null) {
+                    // A run whose recorded command is missing or unknown to the closed vocabulary
+                    // has no defined output policy, so its evidence and any output stay untouched.
+                    continue;
+                }
+                if (!RootRunSpool.hasOutput(directory)) {
+                    RootRunSpool.deleteDirectory(directory);
+                    reconciled++;
+                    continue;
+                }
+                if (command.writesServeLog()) {
+                    RootServeLogWriter writer = RootServeLogWriter.forRunDirectory(
+                            directory, logFile, logTemporaryDirectory
+                    );
+                    try {
+                        writer.appendPendingOutput();
+                    } catch (IOException e) {
+                        // Output that did not reach the log keeps its spool, so nothing is lost.
+                        continue;
+                    }
+                    appendedWriter = writer;
+                }
+                if (RootRunSpool.deleteDirectory(directory)) {
+                    reconciled++;
+                }
+            } finally {
+                lease.release();
             }
         }
         if (appendedWriter != null) {

@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
@@ -1898,6 +1899,241 @@ public class RootBackendTest {
     }
 
     /**
+     * A second backend that proves the recorded process gone and reaches a launchable recovery
+     * state must still leave the run spool of an active execution alone: the original operation is
+     * still draining the run's output, and reconciling it here would append that output twice or
+     * destroy the part that has not reached the shared log yet.
+     */
+    @Test
+    public void anotherBackendNeverReconcilesTheSpoolOfAnActiveServeExecution() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            // The pump asks the launch shell whether the process exited; holding that answer open
+            // parks the pump while the run still owns its spool.
+            fixture.device.pauseLaunchShellLiveness = new CountDownLatch(1);
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            writeText(new File(spoolDirectory, RootRunSpool.OUTPUT_FILE), "serve output\n");
+            fixture.device.exit(fixture.device.onlyLiveProcess(), 3);
+
+            RootBackend restarted = fixture.newBackend();
+            assertTrue(
+                    "the recorded process is gone, so recovery may launch again",
+                    restarted.recoverExecutions().mayLaunch()
+            );
+            assertTrue(
+                    "another backend keeps the run an active execution still owns",
+                    spoolDirectory.exists()
+            );
+            assertTrue(
+                    "another backend keeps the output an active execution still drains",
+                    new File(spoolDirectory, RootRunSpool.OUTPUT_FILE).isFile()
+            );
+            assertEquals(
+                    "another backend must not append output the active execution still drains",
+                    0,
+                    occurrencesOf(readLogText(fixture.logFile), "serve output\n")
+            );
+
+            // The owner finishes its own run: its pump drains the output into the shared log and
+            // the proven exit releases everything the run owned.
+            fixture.device.pauseLaunchShellLiveness.countDown();
+            assertEquals(3, execution.await());
+            assertEquals(
+                    "the active execution's own drain appends its output exactly once",
+                    1,
+                    occurrencesOf(readLogText(fixture.logFile), "serve output\n")
+            );
+            assertFalse("the finished run releases its spool", spoolDirectory.exists());
+            assertEquals(
+                    "a later reconciliation finds nothing left to reconcile",
+                    0,
+                    new RootRunSpoolReconciler(
+                            new File(fixture.directory, "runs"),
+                            fixture.logFile,
+                            fixture.directory
+                    ).reconcile(null)
+            );
+            assertEquals(
+                    "no reconciliation appended the output a second time",
+                    1,
+                    occurrencesOf(readLogText(fixture.logFile), "serve output\n")
+            );
+        } finally {
+            if (fixture.device.pauseLaunchShellLiveness != null) {
+                fixture.device.pauseLaunchShellLiveness.countDown();
+            }
+            fixture.close();
+        }
+    }
+
+    /**
+     * A one-shot run whose process exit becomes visible before its operation consumed the output
+     * must still own its spool: a second backend that reaches a launchable recovery state may not
+     * delete the run the original operation is still using.
+     */
+    @Test
+    public void anotherBackendNeverReconcilesTheSpoolOfAnActiveOneShot() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            SyncthingExecution execution = runtime.start(SyncthingCommand.DEVICE_ID, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            assertTrue("the one-shot run owns its spool", spoolDirectory.exists());
+
+            fixture.device.exit(fixture.device.onlyLiveProcess(), 0);
+            RootBackend restarted = fixture.newBackend();
+            assertTrue(
+                    "the recorded process is gone, so recovery may launch again",
+                    restarted.recoverExecutions().mayLaunch()
+            );
+            assertTrue(
+                    "the one-shot's run survives another backend's reconciliation",
+                    spoolDirectory.exists()
+            );
+
+            assertEquals("the one-shot still reports its real exit status", 0, execution.await());
+            assertFalse("the finished one-shot releases its spool", spoolDirectory.exists());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
+     * A one-shot whose output tail cannot be opened must still clean up through exact ownership:
+     * the exactly verified process is signaled through the ownership path, its exit is proven, and
+     * only then are its durable record, its run spool, and its transport released.
+     */
+    @Test
+    public void unavailableOutputTailCleansUpOnlyTheExactlyVerifiedProcess() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            AtomicInteger launchedPid = new AtomicInteger();
+            AtomicReference<File> spool = new AtomicReference<>();
+            fixture.device.afterProcessSpawned = () -> {
+                launchedPid.set(fixture.device.onlyLiveProcess().pid);
+                File spoolDirectory = new File(
+                        FakeRootTransport.evidencePathOf(onlyLaunchScript(fixture))
+                ).getParentFile();
+                spool.set(spoolDirectory);
+                if (!new File(spoolDirectory, RootRunSpool.OUTPUT_FILE).delete()) {
+                    throw new AssertionError("Could not remove the run output before its tail opens");
+                }
+            };
+
+            RootTransportException failure = assertThrows(
+                    RootTransportException.class,
+                    () -> fixture.backend.start(SyncthingCommand.DEVICE_ID, environment())
+            );
+
+            assertEquals(RootFailure.ROOT_TRANSPORT_FAILED, failure.failure());
+            assertEquals(
+                    "only the exactly verified process is signaled, and only through the"
+                            + " ownership path",
+                    launchedPid.get() + ":9",
+                    fixture.device.signals.get(0)
+            );
+            assertEquals("no other signal is sent", 1, fixture.device.signals.size());
+            for (String operation : fixture.device.shellOperations) {
+                if (operation.endsWith(":sendSignal")) {
+                    assertFalse(
+                            "a signal never travels through the dedicated launch shell",
+                            operation.startsWith(launchShellIndex(fixture.device) + ":")
+                    );
+                }
+            }
+            assertFalse(
+                    "the proven exit leaves no live bundled process",
+                    fixture.device.processes.get(launchedPid.get()).alive
+            );
+            assertFalse("the proven exit releases the run spool", spool.get().exists());
+            assertFalse(
+                    "the proven exit releases the durable evidence",
+                    new File(spool.get(), RootRunSpool.EVIDENCE_FILE).exists()
+            );
+            assertEquals(
+                    "the exited launch shell is closed exactly once",
+                    1,
+                    fixture.device.launchShellCloses
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
+     * When the exact process cannot be signaled or its exit cannot be proven, an output-tail
+     * failure must leave the possible execution completely untouched: no transport is closed, no
+     * evidence or spool is deleted, and a later recovery still blocks a replacement launch.
+     */
+    @Test
+    public void unavailableOutputTailKeepsAnUnprovableProcessUntouched() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.rejectSignals = true;
+            AtomicInteger launchedPid = new AtomicInteger();
+            AtomicReference<File> spool = new AtomicReference<>();
+            fixture.device.afterProcessSpawned = () -> {
+                launchedPid.set(fixture.device.onlyLiveProcess().pid);
+                File spoolDirectory = new File(
+                        FakeRootTransport.evidencePathOf(onlyLaunchScript(fixture))
+                ).getParentFile();
+                spool.set(spoolDirectory);
+                if (!new File(spoolDirectory, RootRunSpool.OUTPUT_FILE).delete()) {
+                    throw new AssertionError("Could not remove the run output before its tail opens");
+                }
+            };
+
+            RootTransportException failure = assertThrows(
+                    RootTransportException.class,
+                    () -> fixture.backend.start(SyncthingCommand.DEVICE_ID, environment())
+            );
+
+            assertEquals(RootFailure.ROOT_TRANSPORT_FAILED, failure.failure());
+            assertTrue(
+                    "the possible execution is left running",
+                    fixture.device.processes.get(launchedPid.get()).alive
+            );
+            assertTrue("its run spool stays in place", spool.get().exists());
+            assertTrue(
+                    "its durable evidence stays in place",
+                    new File(spool.get(), RootRunSpool.EVIDENCE_FILE).isFile()
+            );
+            assertEquals(
+                    "no launch shell is closed while its process may still be live",
+                    0,
+                    fixture.device.launchShellCloses
+            );
+            assertTrue("no signal reached the possible execution", fixture.device.signals.isEmpty());
+
+            // The failed launch gives up its in-process spool ownership, so a later recovery can
+            // still take the run, and its durable evidence still blocks a replacement launch.
+            RootRunSpool recoverable = RootRunSpool.plan(
+                    new File(fixture.directory, "runs"),
+                    FakeRootTransport.runTokenOf(onlyLaunchScript(fixture)),
+                    SyncthingCommand.DEVICE_ID.name()
+            );
+            assertTrue(
+                    "a failed launch leaks no in-process spool ownership",
+                    recoverable.acquireLease()
+            );
+            recoverable.releaseLease();
+            ExecutionOwnershipManager.RecoveryAssessment blocked =
+                    fixture.newBackend().recoverExecutions();
+            assertFalse("a live possible execution never permits a replacement", blocked.mayLaunch());
+            assertEquals(
+                    ExecutionOwnershipManager.Classification.OWNED_EXECUTION,
+                    blocked.classification()
+            );
+            assertTrue("recovery signals nothing", fixture.device.signals.isEmpty());
+            assertTrue("the run stays recoverable", spool.get().exists());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
      * A launch whose transport accepted script bytes but never wrote pre-exec evidence must remain
      * non-launchable after the application process that prepared it is gone.
      */
@@ -2228,6 +2464,18 @@ public class RootBackendTest {
                     cleared.classification()
             );
             assertFalse("only the matching pending evidence is cleared", evidence.exists());
+            assertTrue(
+                    "the run an in-process execution still owns is not reconciled away",
+                    spoolDirectory.exists()
+            );
+
+            // The application process that owned the abandoned attempt is gone, so its ephemeral
+            // run lease died with it and a restarted application reconciles the leftover run.
+            fixture.modelOwnerProcessDeath(spoolDirectory);
+            assertTrue(
+                    "a restarted application may launch after the expired run is reconciled",
+                    restarted.recoverExecutions().mayLaunch()
+            );
             assertFalse("its expired run directory is reconciled away", spoolDirectory.exists());
 
             fixture.device.deferLaunchExecution = false;
@@ -2570,6 +2818,11 @@ public class RootBackendTest {
         }
     }
 
+    /** Reads a log that may not exist yet, as before anything appended to it. */
+    private static String readLogText(File log) throws IOException {
+        return log.exists() ? readText(log) : "";
+    }
+
     private static String readText(File file) throws IOException {
         try (FileInputStream input = new FileInputStream(file);
              java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream()) {
@@ -2724,6 +2977,22 @@ public class RootBackendTest {
 
         RootExecutionRecordStore recordStore() {
             return new RootExecutionRecordStore(recordFile());
+        }
+
+        /**
+         * Models the death of the application process that owned a run.
+         *
+         * <p>When an application process dies, the operating system releases every file lock it
+         * held, so a restarted application opens the run as a fresh owner. A unit test cannot kill
+         * the JVM that holds the lease, so this helper removes the run's lease file: the next owner
+         * creates and locks a new file, exactly as a restarted application process does, while the
+         * dead owner never touches the run again.</p>
+         */
+        void modelOwnerProcessDeath(File runDirectory) {
+            File lease = new File(runDirectory, RootRunSpool.LEASE_FILE);
+            if (lease.exists() && !lease.delete()) {
+                throw new AssertionError("Could not model the death of the run's owner process");
+            }
         }
 
         void close() {

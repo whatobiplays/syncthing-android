@@ -574,7 +574,9 @@ public final class RootBackend implements PrivilegeBackend {
      *
      * <p>Only a launch whose process is already proven gone may be released this way: closing a
      * transport whose process could still be the bundled binary would destroy an unverified
-     * execution, and deleting its spool would destroy the only ownership evidence.</p>
+     * execution, and deleting its spool would destroy the only ownership evidence. Deleting the run
+     * spool also releases this backend's in-process ownership of the run, which a proven-gone
+     * launch no longer needs.</p>
      */
     private void releaseProvenGoneLaunch(RootShell launchShell, RootRunSpool spool) {
         closeQuietly(launchShell);
@@ -730,6 +732,14 @@ public final class RootBackend implements PrivilegeBackend {
             consumed = true;
             try {
                 return create(reservation);
+            } catch (IOException | RuntimeException e) {
+                // A failed start returns no execution handle: the possible process, its durable
+                // evidence, and its transport stay untouched for ordinary exact-ownership
+                // recovery, so this preparation gives up only its in-process spool ownership.
+                // Everything a failed launch already proved gone released its own lease while it
+                // cleaned up.
+                spool.releaseLease();
+                throw e;
             } finally {
                 closeHelperSession();
             }
@@ -937,7 +947,7 @@ public final class RootBackend implements PrivilegeBackend {
         private RootProcessExecution ownedExecution(ExecutionIdentity identity) {
             try {
                 return new RootProcessExecution(
-                        launchShell, identity, identity == null, spool, serveOutput
+                        launchShell, identity, identity == null, spool, serveOutput, helperShell
                 );
             } catch (RuntimeException e) {
                 if (activeSpool == spool) {
@@ -973,6 +983,14 @@ public final class RootBackend implements PrivilegeBackend {
     /** One admitted root Syncthing execution. */
     private final class RootProcessExecution implements Execution {
         private final RootShell shell;
+        /**
+         * Operation-scoped helper session of the preparation that created this execution.
+         *
+         * <p>It stays open while the preparation's start(...) runs, and the output-tail failure
+         * path uses it to re-verify and clean up through exact ownership without acquiring root
+         * again.</p>
+         */
+        private final RootShell helperShell;
         private final ExecutionIdentity identity;
         private final boolean exitedBeforeIdentityCapture;
         private final RootRunSpool spool;
@@ -1001,9 +1019,11 @@ public final class RootBackend implements PrivilegeBackend {
                 ExecutionIdentity identity,
                 boolean exitedBeforeIdentityCapture,
                 RootRunSpool spool,
-                boolean serveOutput
+                boolean serveOutput,
+                RootShell helperShell
         ) {
             this.shell = shell;
+            this.helperShell = helperShell;
             this.identity = identity;
             this.exitedBeforeIdentityCapture = exitedBeforeIdentityCapture;
             this.spool = spool;
@@ -1027,14 +1047,87 @@ public final class RootBackend implements PrivilegeBackend {
             }
         }
 
+        /**
+         * Opens the operation-scoped output tail of this one-shot run.
+         *
+         * <p>Opening the tail is the last fallible step of the launch, so a failure here can
+         * already have created the bundled process. The failure therefore never closes the launch
+         * transport or deletes the run spool directly: it is settled through exact ownership, and
+         * every unproven outcome leaves the possible execution untouched.</p>
+         */
         private InputStream openOutputTail(RootRunSpool runSpool, RootShell runShell) {
             try {
                 return runSpool.openOutputTail(runShell);
             } catch (IOException e) {
-                runSpool.delete();
-                closeQuietly(runShell);
-                throw new IllegalStateException("Could not open the root run output spool", e);
+                settleUnavailableOutputTail(runSpool, runShell);
+                throw new RootTransportException(
+                        RootFailure.ROOT_TRANSPORT_FAILED,
+                        "Could not open the root run output spool",
+                        e
+                );
             }
+        }
+
+        /**
+         * Settles a one-shot run whose output tail could not be opened.
+         *
+         * <p>A launch that never captured an execution identity already proved that its process
+         * exited, so ordinary proven-gone cleanup is safe. Otherwise the launch may be the live
+         * bundled process, so the run is only ever cleaned up through exact ownership: re-verify
+         * the recorded process inside this preparation's own helper session, signal it through the
+         * exact-ownership signal path, wait for the proven exit, and only then release the durable
+         * record, the run spool, and the launch transport. If any of those steps is not proven, the
+         * process, its evidence, and its spool stay untouched and only the in-process spool
+         * ownership is given up, so a later recovery can still reconcile the run.</p>
+         */
+        private void settleUnavailableOutputTail(RootRunSpool runSpool, RootShell runShell) {
+            if (identity == null) {
+                releaseProvenGoneLaunch(runShell, runSpool);
+                return;
+            }
+            if (!settleOwnedProcessAfterUnavailableOutputTail(runSpool, runShell)) {
+                runSpool.releaseLease();
+            }
+        }
+
+        /**
+         * Releases one confirmed execution whose output tail could not be opened.
+         *
+         * <p>The exactly recorded process is re-verified before it is signaled, and the transport,
+         * the durable record, and the spool are released only after its exit was proven.</p>
+         *
+         * @return whether the process was re-verified, signaled, proven exited, and cleaned up
+         */
+        private boolean settleOwnedProcessAfterUnavailableOutputTail(
+                RootRunSpool runSpool,
+                RootShell runShell
+        ) {
+            try {
+                ExecutionOwnershipManager manager = ownershipManagerFor(helperShell);
+                if (manager.observe(identity) != ExecutionOwnershipManager.Observation.OWNED) {
+                    return false;
+                }
+                if (manager.signalIfOwned(identity, ExecutionOwnershipManager.Signal.SIGKILL)
+                        != ExecutionOwnershipManager.SignalAttempt.SIGNALED) {
+                    return false;
+                }
+            } catch (RuntimeException e) {
+                logWarning("Could not verify the launched root execution", e);
+                return false;
+            }
+            awaitExitQuietly(runShell);
+            if (!runShell.hasExited()) {
+                // The exact process is still alive after a requested signal, so nothing may be
+                // closed or deleted; a later recovery keeps the complete durable state.
+                return false;
+            }
+            try {
+                ownershipManagerFor(helperShell).clearAfterExit(identity);
+            } catch (IOException | RuntimeException e) {
+                logWarning("Could not clear the exited root execution record", e);
+            }
+            releaseProvenGoneLaunch(runShell, runSpool);
+            return true;
         }
 
         @Override
@@ -1154,6 +1247,12 @@ public final class RootBackend implements PrivilegeBackend {
             }
             if (!spoolRequiresRecovery.get()) {
                 spool.delete();
+            } else {
+                // The spool is retained for a later reconciliation, so this execution gives up
+                // in-process ownership after every local reader and writer - the serve log pump
+                // above - has stopped. The durable launch evidence keeps blocking unsafe
+                // reconciliation of the run itself.
+                spool.releaseLease();
             }
             if (activeSpool == spool) {
                 activeSpool = null;

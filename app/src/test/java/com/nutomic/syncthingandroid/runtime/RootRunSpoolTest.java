@@ -304,6 +304,66 @@ public class RootRunSpoolTest {
     }
 
     @Test
+    public void materializeTakesOwnershipSoOnlyOneHandleOwnsTheRun() throws IOException {
+        File root = temporaryDirectory();
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool owned = RootRunSpool.plan(
+                    spoolRoot, "token-owner", SyncthingCommand.SERVE.name()
+            );
+
+            owned.materialize(RecoveryAssessmentFixture.ownedIdentity());
+
+            assertTrue("arming a run takes its ownership lease", owned.leaseHeld());
+            RootRunSpool other = RootRunSpool.plan(
+                    spoolRoot, "token-owner", SyncthingCommand.SERVE.name()
+            );
+            assertFalse(
+                    "a second handle can never take a run another handle still owns",
+                    other.acquireLease()
+            );
+
+            assertTrue("an owned run is deleted while its owner holds the lease", owned.delete());
+            assertFalse("deleting a run releases its lease", owned.leaseHeld());
+            assertFalse(owned.directory().exists());
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    @Test
+    public void aReleasedLeaseLeavesTheLeftoverRunReconcilable() throws IOException {
+        File root = temporaryDirectory();
+        File log = new File(root, "syncthing.log");
+        try {
+            File spoolRoot = new File(root, "runs");
+            RootRunSpool leftover = RootRunSpool.create(
+                    spoolRoot, "token-leftover", SyncthingCommand.SERVE.name()
+            );
+            appendText(leftover.outputFile(), "leftover output\n");
+            assertTrue(leftover.acquireLease());
+            RootRunSpoolReconciler reconciler = new RootRunSpoolReconciler(spoolRoot, log, root);
+
+            assertEquals(
+                    "a run another in-process handle owns is never reconciled",
+                    0,
+                    reconciler.reconcile(null)
+            );
+            assertTrue(leftover.directory().exists());
+            assertFalse("nothing appended the output of an owned run", log.exists());
+
+            // The operating system releases a dead process's lease, so the leftover run stays
+            // reconcilable without any durable ownership marker of its own.
+            leftover.releaseLease();
+            assertEquals(1, reconciler.reconcile(null));
+            assertFalse(leftover.directory().exists());
+            assertEquals("leftover output\n", readText(log));
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    @Test
     public void reconciliationResumesAtTheRecordedConsumptionOffset() throws IOException {
         File root = temporaryDirectory();
         File log = new File(root, "syncthing.log");

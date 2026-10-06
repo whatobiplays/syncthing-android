@@ -86,6 +86,14 @@ final class FakeRootTransport {
         RootFailure activationFailure;
         /** When true, writing the launch script spawns the process it describes. */
         boolean spawnOnLaunch = true;
+        /**
+         * Invoked right after the launch shell became the bundled process and its durable pre-exec
+         * evidence exists.
+         *
+         * <p>A test uses it to change device state that only exists after process creation, such as
+         * removing the operation-scoped output file before the execution opens its tail.</p>
+         */
+        Runnable afterProcessSpawned;
         /** When true, writing the launch script spawns a bundled process with another token. */
         boolean spawnCompetingOnLaunch;
         /** When true, listing processes fails, as when a shell cannot read {@code /proc}. */
@@ -529,6 +537,10 @@ final class FakeRootTransport {
                 launched.exec(launchedExecutableOf(script), runTokenOf(script));
                 device.writePreExecEvidence(stagingPathOf(script), launched);
                 device.replaceStagedEvidence(stagingPathOf(script), evidencePathOf(script));
+                Runnable afterProcessSpawned = device.afterProcessSpawned;
+                if (afterProcessSpawned != null) {
+                    afterProcessSpawned.run();
+                }
             }
         }
 

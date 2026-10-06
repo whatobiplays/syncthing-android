@@ -20,11 +20,16 @@ public final class DefaultSyncthingRuntime
     @FunctionalInterface
     public interface LifecycleLaunchCheck {
         /**
-         * Atomically settles a final non-launchable recovery result against service cancellation.
+         * Atomically settles a non-launchable recovery result against service cancellation.
          *
-         * <p>Implementations without a service-owned cancellation source need no action. This
-         * callback must only settle the launch decision; it must not reconcile or signal an
-         * execution while the process-start reservation is held.</p>
+         * <p>The runtime invokes this for every recovery verdict that forbids a launch: the
+         * classification backend preparation performs, and the final classification taken under
+         * the process-start reservation. Implementations without a service-owned cancellation
+         * source need no action. An implementation that owns one must let an already-revoked
+         * lifecycle stay the reported outcome, which is what
+         * {@link LifecycleLaunchPermit#commitRecoveryBlocked()} enforces when it throws
+         * {@link LifecycleLaunchPermit.CancelledException}. This callback must only settle the
+         * launch decision; it must not reconcile or signal an execution.</p>
          */
         default void commitRecoveryBlocked() {}
 
@@ -212,8 +217,20 @@ public final class DefaultSyncthingRuntime
 
             // Preparation - rooted activation above all - is slow, can prompt, and can fail, so it
             // runs before the process-start reservation is taken and never holds that reservation.
-            PrivilegeBackend.LaunchPreparation preparation =
-                    backend.prepareLaunch(command, environment);
+            PrivilegeBackend.LaunchPreparation preparation;
+            try {
+                preparation = backend.prepareLaunch(command, environment);
+            } catch (ExecutionRecoveryException preparationBlocked) {
+                // A preparation-time recovery classification is the same non-launchable verdict
+                // as the final classification under the reservation, so it has to settle the
+                // lifecycle permit the same way. Without this, a concurrent STOP could revoke a
+                // permit that the worker would have settled as recovery-blocked, and the launch
+                // would report cancellation instead of the recovery failure that decided the
+                // outcome. A revocation that already won stays the reported outcome, because
+                // commitRecoveryBlocked() then throws CancelledException.
+                if (launchCheck != null) launchCheck.commitRecoveryBlocked();
+                throw preparationBlocked;
+            }
             boolean started = false;
             try {
                 try (OwnedExecutionShutdown.LaunchPermit permit =
