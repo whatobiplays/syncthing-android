@@ -1,0 +1,41 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootBackend.java
+  s_09b05cf592369e::t_b79f8011e18fef 577-579,735-742,950,986-993,1022-1023,1026,1050-1057,1062-1067,1071-1132,1250-1255
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpool.java
+  s_09b05cf592369e::t_83ec661e34dc37 9,11-13,30-35,44-45,54-55,120-126,130,135-245,307-313,315-317
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootBackendTest.java
+  s_09b05cf592369e::t_297afa1b174263 27,1901-2135,2467-2478,2821-2825,2982-2997
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolTest.java
+  s_09b05cf592369e::t_702d2df8268226 306-365
+app/src/main/java/com/nutomic/syncthingandroid/runtime/DefaultSyncthingRuntime.java
+  s_7995548deb2efc::t_36db4d3bbfb837 23,25-32,220-233
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootRunSpoolReconciler.java
+  s_7995548deb2efc::t_0b5741d8567f7e 57-64,67-72,75-103
+app/src/test/java/com/nutomic/syncthingandroid/runtime/FakeRootTransport.java
+  s_7995548deb2efc::t_83d27171b21958 89-96,540-543
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RuntimeSeamTest.java
+  s_7995548deb2efc::t_b296b28d81397c 838-983,1858-1877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "383652bfbd43c8de1751fcba8f2debac3d9a339f",
+  "prompts": {},
+  "sessions": {
+    "s_09b05cf592369e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f8e2-4b10-7ff1-bbb2-622c77762fbd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    },
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "unknown"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
