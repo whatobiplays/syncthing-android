@@ -30,17 +30,30 @@ final class LibsuRootShellFactory implements RootShellFactory {
     private static final long MAXIMUM_INTERNAL_TIMEOUT_SECONDS = 40;
 
     private final String[] rootCommand;
+    private final long operationTimeoutMillis;
 
     LibsuRootShellFactory() {
         this(new String[] {"su"});
     }
 
     LibsuRootShellFactory(String[] rootCommand) {
+        this(rootCommand, LibsuRootShell.OPERATION_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * Creates a factory whose acquired transports use an explicit helper-operation bound.
+     *
+     * <p>Production acquires shells with {@link LibsuRootShell#OPERATION_TIMEOUT_MILLIS}; the
+     * override exists so the acquisition failure of a provenance probe that stalls past its
+     * deadline can be exercised deterministically.</p>
+     */
+    LibsuRootShellFactory(String[] rootCommand, long operationTimeoutMillis) {
         Objects.requireNonNull(rootCommand);
         if (rootCommand.length == 0) {
             throw new IllegalArgumentException("The root command must not be empty");
         }
         this.rootCommand = rootCommand.clone();
+        this.operationTimeoutMillis = operationTimeoutMillis;
     }
 
     @Override
@@ -103,7 +116,7 @@ final class LibsuRootShellFactory implements RootShellFactory {
                     "The root shell build returned no shell for the root transport process"
             );
         }
-        LibsuRootShell rootShell = new LibsuRootShell(shell, process);
+        LibsuRootShell rootShell = new LibsuRootShell(shell, process, operationTimeoutMillis);
         try {
             requireRootShellStatus(shell.getStatus(), Shell.ROOT_SHELL, Shell.NON_ROOT_SHELL);
             requireRootUser(rootShell.currentUid());
@@ -125,11 +138,17 @@ final class LibsuRootShellFactory implements RootShellFactory {
     /**
      * Records whether the transport's exit status may be attributed to the launched process.
      *
-     * <p>The probe runs while the transport client is still alive and never fails an acquisition
-     * that already verified UID 0: an unreadable answer leaves the status unattributable, and the
-     * exit verification then reports a typed result instead of an unauthenticated status.</p>
+     * <p>The probe runs while the transport client is still alive. An unreadable answer never
+     * fails an acquisition that already verified UID 0: the status simply stays unattributable,
+     * and the exit verification then reports a typed result instead of an unauthenticated status.
+     * A probe whose failure invalidated the transport, such as a helper operation that timed out
+     * or was interrupted, does fail the acquisition through the transport failure it reports, so
+     * a closed shell is never handed out as a verified one.</p>
+     *
+     * @throws IOException when the failed probe invalidated the shell transport
      */
-    private static void recordExitStatusProvenance(LibsuRootShell rootShell, int ownerProcessId) {
+    private static void recordExitStatusProvenance(LibsuRootShell rootShell, int ownerProcessId)
+            throws IOException {
         if (ownerProcessId <= 0) {
             return;
         }

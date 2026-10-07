@@ -48,8 +48,12 @@ final class LibsuRootShell implements RootShell {
     private static final int PARENT_PROCESS_FIELD_INDEX = 1;
     /** Source of the shell's own {@code /proc/<pid>/stat} line, read while the shell is alive. */
     private static final String SHELL_STAT_SOURCE = "/proc/$$/stat";
-    /** Upper bound for one helper operation, so a stalled shell can never hang a caller. */
-    private static final long OPERATION_TIMEOUT_MILLIS = 15_000;
+    /**
+     * Upper bound for one helper operation, so a stalled shell can never hang a caller. This is
+     * the bound every production transport uses; transports that need a tighter bound are
+     * constructed with an explicit value.
+     */
+    static final long OPERATION_TIMEOUT_MILLIS = 15_000;
 
     private static final ExecutorService OPERATION_EXECUTOR =
             Executors.newCachedThreadPool(new ThreadFactory() {
@@ -68,6 +72,8 @@ final class LibsuRootShell implements RootShell {
 
     private boolean exitStatusProvenanceRecorded;
     private boolean exitStatusBelongsToLaunchedProcess;
+    /** Set when a failed helper operation tore this transport down, such as on a timeout. */
+    private volatile boolean transportInvalidatedByFailedOperation;
 
     LibsuRootShell(Shell shell, Process process) {
         this(shell, process, OPERATION_TIMEOUT_MILLIS);
@@ -147,13 +153,17 @@ final class LibsuRootShell implements RootShell {
      * detached client may report on its own.</p>
      *
      * <p>The question can be answered only while the client is alive, so the answer is recorded
-     * here and read later through {@link #exitStatusBelongsToLaunchedProcess()}. Failing to
-     * determine it is not an acquisition failure; it only means the status stays
-     * unattributable.</p>
+     * here and read later through {@link #exitStatusBelongsToLaunchedProcess()}. An unreadable
+     * answer alone never fails the acquisition; it only means the status stays unattributable.
+     * A probe that invalidated the transport while failing, such as a helper operation that
+     * timed out or was interrupted and tore the transport down, does fail the acquisition: a
+     * closed transport must never be handed out as a verified shell.</p>
      *
      * @param ownerProcessId process identifier of the application process that owns this transport
+     * @throws IOException when the failure that made the answer unreadable also invalidated the
+     *                     transport
      */
-    void determineExitStatusProvenance(int ownerProcessId) {
+    void determineExitStatusProvenance(int ownerProcessId) throws IOException {
         synchronized (this) {
             if (exitStatusProvenanceRecorded) {
                 return;
@@ -163,6 +173,9 @@ final class LibsuRootShell implements RootShell {
                 int parentPid = parentProcessId();
                 exitStatusBelongsToLaunchedProcess = parentPid > 0 && parentPid == ownerProcessId;
             } catch (IOException | RuntimeException unprovable) {
+                if (transportInvalidatedByFailedOperation) {
+                    throw unprovable;
+                }
                 exitStatusBelongsToLaunchedProcess = false;
             }
         }
@@ -286,8 +299,13 @@ final class LibsuRootShell implements RootShell {
      * an abandoned transport. A failure of that teardown itself is swallowed: the caller has to
      * receive the timeout or interruption that actually ended the operation, because the failure
      * of one helper operation must never be reported as something else.</p>
+     *
+     * <p>The transport is marked invalidated before the cleanup runs, so
+     * {@link #determineExitStatusProvenance(int)} can tell an answer that merely stayed
+     * unreadable apart from a probe whose failure closed the transport.</p>
      */
     private void closeAfterFailedOperation() {
+        transportInvalidatedByFailedOperation = true;
         try {
             close();
         } catch (RuntimeException ignored) {

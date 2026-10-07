@@ -492,6 +492,37 @@ public class LibsuRootShellTest {
     }
 
     @Test
+    public void provenanceProbeThatInvalidatesTheTransportFailsInsteadOfStayingSilent()
+            throws Exception {
+        CountDownLatch provenanceGate = new CountDownLatch(1);
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(
+                ScriptedLibsuShell.ATTACHED_STAT_LINE, null, provenanceGate, true
+        );
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
+        LibsuRootShell transport = new LibsuRootShell(shell, process, 50);
+
+        try {
+            transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+            fail("a probe that tore the transport down must not report an unprovable answer");
+        } catch (IOException expected) {
+            assertTrue(
+                    "the timeout that invalidated the transport must surface unchanged",
+                    expected.getMessage().contains("timed out")
+            );
+        } finally {
+            provenanceGate.countDown();
+        }
+
+        assertFalse(transport.exitStatusBelongsToLaunchedProcess());
+        assertEquals("the invalidated transport must be closed", 1, shell.closeAttempts());
+        assertEquals(
+                "a failed libsu close must destroy the transport process",
+                1,
+                process.destroyCount()
+        );
+    }
+
+    @Test
     public void provenanceIsRecordedOnceWhileTheClientIsStillAlive() throws Exception {
         ScriptedLibsuShell shell = new ScriptedLibsuShell(
                 ScriptedLibsuShell.DETACHED_STAT_LINE, null

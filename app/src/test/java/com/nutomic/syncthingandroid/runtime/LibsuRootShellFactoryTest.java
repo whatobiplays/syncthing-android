@@ -16,11 +16,13 @@ import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
@@ -374,9 +376,11 @@ public class LibsuRootShellFactoryTest {
 
     @Test
     public void unreadableProvenanceNeverFailsAVerifiedAcquisition() {
+        DestroyCountingProcess process = new DestroyCountingProcess();
+
         RootShell acquired = new LibsuRootShellFactory().acquire(
                 60_000,
-                new DestroyCountingProcess(),
+                process,
                 (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
                         null, new IllegalStateException("the transport died")
                 ),
@@ -384,6 +388,113 @@ public class LibsuRootShellFactoryTest {
         );
 
         assertFalse(acquired.exitStatusBelongsToLaunchedProcess());
+        assertEquals(
+                "an unprovable answer must leave the verified transport untouched",
+                0,
+                process.destroyCount()
+        );
+    }
+
+    @Test
+    public void provenanceProbeThatStallsPastItsDeadlineFailsAcquisition() {
+        CountDownLatch provenanceGate = new CountDownLatch(1);
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(
+                ScriptedLibsuShell.ATTACHED_STAT_LINE, null, provenanceGate, true
+        );
+        DestroyCountingProcess process = new DestroyCountingProcess();
+
+        try {
+            new LibsuRootShellFactory(new String[] {"su"}, 50).acquire(
+                    60_000,
+                    process,
+                    (transportProcess, timeoutSeconds) -> shell,
+                    ScriptedLibsuShell.OWNER_PROCESS_ID
+            );
+            fail("a transport the provenance probe invalidated must not be handed out");
+        } catch (RootTransportException expected) {
+            assertEquals(RootFailure.ROOT_TRANSPORT_FAILED, expected.failure());
+            assertTrue(
+                    "the helper timeout that invalidated the transport stays the primary cause",
+                    expected.getCause() instanceof IOException
+            );
+            assertTrue(expected.getCause().getMessage().contains("timed out"));
+        } finally {
+            provenanceGate.countDown();
+        }
+
+        assertEquals("the verified shell reached exactly one provenance probe", 1, shell.statReads());
+        assertTrue(
+                "the invalidated transport must be torn down through the wrapper",
+                shell.closeAttempts() >= 1
+        );
+        assertTrue(
+                "the privileged transport process must be released",
+                process.destroyCount() >= 1
+        );
+    }
+
+    @Test
+    public void interruptedProvenanceProbeFailsAcquisition() throws Exception {
+        CountDownLatch provenanceGate = new CountDownLatch(1);
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(
+                ScriptedLibsuShell.ATTACHED_STAT_LINE, null, provenanceGate, true
+        );
+        DestroyCountingProcess process = new DestroyCountingProcess();
+        AtomicReference<Throwable> outcome = new AtomicReference<>();
+
+        Thread acquirer = new Thread(
+                () -> {
+                    try {
+                        new LibsuRootShellFactory(new String[] {"su"}, 30_000).acquire(
+                                60_000,
+                                process,
+                                (transportProcess, timeoutSeconds) -> shell,
+                                ScriptedLibsuShell.OWNER_PROCESS_ID
+                        );
+                    } catch (Throwable thrown) {
+                        outcome.set(thrown);
+                    }
+                },
+                "interrupted-provenance-acquirer"
+        );
+        acquirer.start();
+        boolean finishedWhileTheProbeWasStalled;
+        try {
+            assertTrue(
+                    "the provenance probe must start before the caller is interrupted",
+                    shell.awaitProvenanceProbeStarted()
+            );
+            acquirer.interrupt();
+            acquirer.join(TimeUnit.SECONDS.toMillis(5));
+            finishedWhileTheProbeWasStalled = !acquirer.isAlive();
+        } finally {
+            // The stalled probe is released only after the interruption has been handled, so a
+            // completed helper result can never race the interrupt the test is asserting on.
+            provenanceGate.countDown();
+            acquirer.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertTrue(
+                "the interrupted acquisition must fail before the stalled probe is released",
+                finishedWhileTheProbeWasStalled
+        );
+        assertFalse("the acquisition must have finished", acquirer.isAlive());
+        Throwable thrown = outcome.get();
+        assertTrue(
+                "a transport the provenance probe invalidated must not be handed out",
+                thrown instanceof RootTransportException
+        );
+        assertEquals(
+                RootFailure.ROOT_TRANSPORT_FAILED,
+                ((RootTransportException) thrown).failure()
+        );
+        assertTrue(
+                "the interruption that invalidated the transport stays the primary cause",
+                thrown.getCause() instanceof IOException
+        );
+        assertTrue(thrown.getCause().getMessage().contains("interrupted"));
+        assertTrue(shell.closeAttempts() >= 1);
+        assertTrue(process.destroyCount() >= 1);
     }
 
     private static RootShell acquireOverTransport(Process process, Shell shell) {
