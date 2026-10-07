@@ -64,6 +64,21 @@ final class LibsuRootShellFactory implements RootShellFactory {
      */
     RootShell acquire(long timeoutMillis, Process process, ShellBuilder shellBuilder)
             throws RootTransportException {
+        return acquire(timeoutMillis, process, shellBuilder, ownerProcessIdOrUnprovable());
+    }
+
+    /**
+     * Acquires a verified root shell and records its exit status provenance.
+     *
+     * <p>The owner process identifier is supplied explicitly so the provenance rule can be
+     * exercised without the Android process state, which is unavailable to JVM unit tests.</p>
+     */
+    RootShell acquire(
+            long timeoutMillis,
+            Process process,
+            ShellBuilder shellBuilder,
+            int ownerProcessId
+    ) throws RootTransportException {
         Objects.requireNonNull(process);
         Objects.requireNonNull(shellBuilder);
         Shell shell;
@@ -92,6 +107,7 @@ final class LibsuRootShellFactory implements RootShellFactory {
         try {
             requireRootShellStatus(shell.getStatus(), Shell.ROOT_SHELL, Shell.NON_ROOT_SHELL);
             requireRootUser(rootShell.currentUid());
+            recordExitStatusProvenance(rootShell, ownerProcessId);
             return rootShell;
         } catch (RootTransportException e) {
             closeQuietly(rootShell);
@@ -106,7 +122,35 @@ final class LibsuRootShellFactory implements RootShellFactory {
         }
     }
 
-    /** Builds the libsu shell that wraps one already-started root transport process. */
+    /**
+     * Records whether the transport's exit status may be attributed to the launched process.
+     *
+     * <p>The probe runs while the transport client is still alive and never fails an acquisition
+     * that already verified UID 0: an unreadable answer leaves the status unattributable, and the
+     * exit verification then reports a typed result instead of an unauthenticated status.</p>
+     */
+    private static void recordExitStatusProvenance(LibsuRootShell rootShell, int ownerProcessId) {
+        if (ownerProcessId <= 0) {
+            return;
+        }
+        rootShell.determineExitStatusProvenance(ownerProcessId);
+    }
+
+    /**
+     * Returns the identifier of the application process that owns the transport.
+     *
+     * <p>An identifier the platform cannot report leaves the exit status unattributable, which is
+     * the conservative answer for a transport whose relationship to the launched process cannot be
+     * proven.</p>
+     */
+    private static int ownerProcessIdOrUnprovable() {
+        try {
+            return android.os.Process.myPid();
+        } catch (RuntimeException unavailable) {
+            return 0;
+        }
+    }
+
     interface ShellBuilder {
         Shell build(Process process, long internalTimeoutSeconds);
     }
@@ -187,6 +231,7 @@ final class LibsuRootShellFactory implements RootShellFactory {
         }
     }
 
+    /** Builds the libsu shell that wraps one already-started root transport process. */
     private static Shell buildLibsuShell(Process process, long internalTimeoutSeconds) {
         return Shell.Builder.create()
                 .setTimeout(internalTimeoutSeconds)

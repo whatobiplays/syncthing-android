@@ -1,6 +1,7 @@
 package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -320,6 +321,69 @@ public class LibsuRootShellFactoryTest {
                 1,
                 process.destroyCount()
         );
+    }
+
+    @Test
+    public void acquisitionRecordsTheExitStatusProvenanceOfTheVerifiedShell() {
+        RootShell attached = new LibsuRootShellFactory().acquire(
+                60_000,
+                new DestroyCountingProcess(),
+                (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
+                        ScriptedLibsuShell.ATTACHED_STAT_LINE, null
+                ),
+                ScriptedLibsuShell.OWNER_PROCESS_ID
+        );
+        RootShell detached = new LibsuRootShellFactory().acquire(
+                60_000,
+                new DestroyCountingProcess(),
+                (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
+                        ScriptedLibsuShell.DETACHED_STAT_LINE, null
+                ),
+                ScriptedLibsuShell.OWNER_PROCESS_ID
+        );
+
+        assertTrue(
+                "an attached client hands its own status to the launched process",
+                attached.exitStatusBelongsToLaunchedProcess()
+        );
+        assertFalse(
+                "a detached client can never authenticate the launched status",
+                detached.exitStatusBelongsToLaunchedProcess()
+        );
+    }
+
+    @Test
+    public void acquisitionWithoutAnOwnerIdentifierNeverRunsTheProvenanceProbe() {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(
+                ScriptedLibsuShell.ATTACHED_STAT_LINE, null
+        );
+
+        RootShell acquired = new LibsuRootShellFactory().acquire(
+                60_000,
+                new DestroyCountingProcess(),
+                (transportProcess, timeoutSeconds) -> shell,
+                0
+        );
+
+        assertFalse(
+                "an identifier the platform cannot report leaves the status unattributable",
+                acquired.exitStatusBelongsToLaunchedProcess()
+        );
+        assertEquals("no probe may run without an owner identifier", 0, shell.statReads());
+    }
+
+    @Test
+    public void unreadableProvenanceNeverFailsAVerifiedAcquisition() {
+        RootShell acquired = new LibsuRootShellFactory().acquire(
+                60_000,
+                new DestroyCountingProcess(),
+                (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
+                        null, new IllegalStateException("the transport died")
+                ),
+                ScriptedLibsuShell.OWNER_PROCESS_ID
+        );
+
+        assertFalse(acquired.exitStatusBelongsToLaunchedProcess());
     }
 
     private static RootShell acquireOverTransport(Process process, Shell shell) {

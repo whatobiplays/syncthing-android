@@ -432,10 +432,14 @@ final class FakeRootTransport {
         private boolean closed;
         private boolean ranLaunchScript;
         private Entry transport;
+        private final boolean exitStatusBelongsToLaunchedProcess;
 
         Shell(Device device, int index) {
             this.device = Objects.requireNonNull(device);
             this.index = index;
+            // A real transport answers this once, while its client is alive, and the answer is
+            // immutable afterwards; the surrogate records it the same way at acquisition.
+            this.exitStatusBelongsToLaunchedProcess = !device.transportClientExitedEarly;
         }
 
         /** Records one command-like operation this shell ran, for role-based test evidence. */
@@ -608,6 +612,13 @@ final class FakeRootTransport {
             }
             launched.exited.await();
             return launched.exitCode;
+        }
+
+        @Override
+        public boolean exitStatusBelongsToLaunchedProcess() {
+            // A detached client keeps its own process, so the status it reports describes that
+            // client and never the launched execution.
+            return exitStatusBelongsToLaunchedProcess;
         }
 
         @Override

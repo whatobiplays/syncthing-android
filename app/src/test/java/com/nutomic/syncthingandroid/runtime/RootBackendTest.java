@@ -732,6 +732,73 @@ public class RootBackendTest {
             fixture.close();
         }
     }
+    /**
+     * Output written after a failed exit verification still reaches the shared log.
+     *
+     * <p>A failed verification is not process exit: the launched process may still be alive and may
+     * still write, so the serve log pump has to keep draining instead of treating the failure as
+     * the end of the run's output. If the pump stopped there, the settlement that runs once a later
+     * operation proves the exit would delete a spool whose remaining bytes never reached the shared
+     * log.</p>
+     */
+    @Test
+    public void serveOutputWrittenAfterAFailedVerificationStillReachesTheSharedLog()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            PrivilegeBackend.Execution execution =
+                    fixture.backend.start(SyncthingCommand.SERVE, environment());
+            String script = onlyLaunchScript(fixture);
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, script));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+
+            writeText(new File(spoolDirectory, "output"), "output before the failure\n");
+            RootTransportException unverified = assertThrows(
+                    "a failed verification never reports an exit",
+                    RootTransportException.class,
+                    execution::await
+            );
+            assertEquals(
+                    "the typed verification failure stays attached",
+                    RootFailure.EXECUTION_VERIFICATION_FAILED,
+                    unverified.failure()
+            );
+            // A pump that stopped at the failure has certainly finished by now, while a pump that
+            // keeps draining the possibly live run still watches the spool.
+            Thread.sleep(500);
+            writeText(
+                    new File(spoolDirectory, "output"),
+                    "output before the failure\noutput after the failure\n"
+            );
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline
+                    && !readText(fixture.logFile).contains("output after the failure")) {
+                Thread.sleep(25);
+            }
+            assertTrue(
+                    "the pump keeps draining output written after the failure",
+                    readText(fixture.logFile).contains("output after the failure")
+            );
+
+            launched.exit(0);
+            assertThrows(
+                    "the later wait proves the exit without an authenticated status",
+                    ExecutionExitStatusUnavailableException.class,
+                    execution::await
+            );
+            assertEquals(
+                    "the drained output reaches the shared log exactly once",
+                    "output before the failure\noutput after the failure\n",
+                    readText(fixture.logFile)
+            );
+            assertFalse("the settled run removes its spool", spoolDirectory.exists());
+            assertTrue("no step signals the possibly live process", fixture.device.signals.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
 
     @Test
     public void failedServeReconciliationKeepsTheSpoolSoOutputIsNotLost() throws Exception {
@@ -2322,57 +2389,67 @@ public class RootBackendTest {
         }
     }
 
+    /**
+     * A detached transport whose exact process is still alive must never report an exit. The single
+     * bounded verification observes the recorded process, and the run reports a typed failure
+     * instead: it keeps the durable record, the run spool, and runtime admission, signals nothing,
+     * and an explicit later recovery settles it once the process really is gone.
+     */
     @Test
     public void localTransportExitDoesNotProveTheRootExecutionExited() throws Exception {
         Fixture fixture = new Fixture();
         try {
             DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
-            // The exit tracker starts together with the execution, so the detached transport this
-            // test models must already be in place: setting it after start() would race the
-            // tracker's first observation and would not reliably exercise a detached transport.
             fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
             SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
             File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
             FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
-
-            AtomicReference<Integer> exitCode = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
                 try {
-                    exitCode.set(execution.await());
-                } catch (Throwable t) {
-                    failure.set(t);
+                    execution.await();
+                } catch (Throwable reported) {
+                    failure.set(reported);
                 }
             });
             waiter.start();
-            waiter.join(300);
-
-            assertTrue("the daemon-side root execution is still alive", launched.alive);
+            waiter.join(10_000);
+            assertFalse("the single verification must finish the wait", waiter.isAlive());
+            Throwable reported = failure.get();
             assertTrue(
-                    "a dead local su client must not complete the execution wait",
-                    waiter.isAlive()
+                    "a live exact process never reports an exit: " + reported,
+                    reported instanceof ExecutionExitUnverifiedException
             );
             assertTrue(
-                    "the live execution keeps its run spool while its exact process is alive",
-                    spoolDirectory.exists()
+                    "the typed root failure stays attached as the cause",
+                    reported.getCause() instanceof RootTransportException
             );
-
-            // The tracker's verification session must have observed the live process before the
-            // process exits, so the detached surrogate below cannot depend on that timing. The
-            // launch protocol already read the run token while it confirmed the process, so the one
-            // extra read is the observation of the tracker's own first session.
-            long runTokenReads = countOperations(fixture.device, "readRunToken");
-            awaitOperationCount(fixture.device, "readRunToken", runTokenReads + 1);
-
-            launched.exit(3);
-            waiter.join(5_000);
-            assertFalse("the wait finishes once the exact root process exits", waiter.isAlive());
-            assertNull(failure.get());
             assertEquals(
-                    "a client that detached while the exact process was alive cannot supply the"
-                            + " trusted Syncthing exit code",
-                    Integer.valueOf(1),
-                    exitCode.get()
+                    RootFailure.EXECUTION_VERIFICATION_FAILED,
+                    ((RootTransportException) reported.getCause()).failure()
+            );
+            assertFalse("an unverified exit never proves the process gone", execution.exitProven());
+            assertTrue("the live execution keeps its run spool", spoolDirectory.exists());
+            assertTrue(
+                    "an unverified exit never signals a process",
+                    fixture.device.signals.isEmpty()
+            );
+            assertThrows(
+                    "an unverified exit keeps runtime admission",
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment())
+            );
+            launched.exit(3);
+            ExecutionOwnershipManager.RecoveryAssessment recovered =
+                    fixture.newBackend().recoverExecutions();
+            assertTrue(
+                    "an explicit recovery proves the old execution gone",
+                    recovered.mayLaunch()
+            );
+            assertTrue(
+                    "no recovery step signals without exact ownership",
+                    fixture.device.signals.isEmpty()
             );
         } finally {
             fixture.close();
@@ -2380,209 +2457,617 @@ public class RootBackendTest {
     }
 
     /**
-     * A verification session that died must be replaced, because a dead transport answers every
-     * later read with UNKNOWN: polling it forever would retain runtime admission even after the
-     * exact process exited and root authorization returned.
+     * The exit verification is one logical privileged operation, and the canonical root design
+     * gives it exactly one bounded reacquisition attempt. When root authorization is gone, the run
+     * reports the typed authorization loss and waits for nothing: no polling, no signal, no
+     * deleted evidence, and no released admission, so an explicit later recovery can reclassify
+     * the execution once authorization returns.
      */
     @Test
-    public void deadExitVerificationSessionIsReplacedUntilTheExitIsObserved() throws Exception {
+    public void unavailableRootGivesTheExitVerificationOneBoundedAttempt() throws Exception {
         Fixture fixture = new Fixture(250);
         try {
             DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
             fixture.device.transportClientExitedEarly = true;
-            fixture.device.activationPaused = new CountDownLatch(1);
-            fixture.device.activationRelease = new CountDownLatch(1);
-            // Only the exit tracker acquires root after the launch exec, so this predicate holds
-            // exactly the re-verification a detached transport needs.
-            fixture.device.pauseWhen = () -> fixture.device.hasLiveLaunchedProcess();
-
-            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
-            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
-            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
-
-            assertTrue(
-                    "the detached exit observation must wait for a bounded root session",
-                    fixture.device.activationPaused.await(5, TimeUnit.SECONDS)
-            );
-
-            // Every verification session from now on fails its first read and is torn down by that
-            // failure, exactly as a helper operation that timed out ends its transport.
-            fixture.device.failBootIdRead = true;
-            fixture.device.helperOperationFailureEndsTransport = true;
-
-            AtomicReference<Integer> exitCode = new AtomicReference<>();
-            AtomicReference<Throwable> failure = new AtomicReference<>();
-            Thread waiter = new Thread(() -> {
-                try {
-                    exitCode.set(execution.await());
-                } catch (Throwable t) {
-                    failure.set(t);
-                }
-            });
-            waiter.start();
-
-            launched.exit(3);
-            fixture.device.pauseWhen = null;
-            fixture.device.activationRelease.countDown();
-
-            // Sessions keep dying, so the exit stays unproven: the wait is neither finalized nor
-            // reported as a terminal failure, and nothing is signaled.
-            waiter.join(1_500);
-            assertNull("a dead session must not report a terminal failure", failure.get());
-            assertTrue("a dead session keeps the exit unproven", waiter.isAlive());
-            assertTrue("an unproven run keeps its run spool", spoolDirectory.exists());
-            assertTrue("an unproven run never signals a process", fixture.device.signals.isEmpty());
-
-            // Root authorization returns. A replacing session observes the exact process, which is
-            // already gone, so the wait finishes. A tracker that kept polling its dead session
-            // instead of replacing it never reaches this point.
-            fixture.device.failBootIdRead = false;
-
-            waiter.join(TimeUnit.SECONDS.toMillis(30));
-            assertFalse(
-                    "a dead verification session must be replaced, not polled forever",
-                    waiter.isAlive()
-            );
-            assertNull("a replaced session must not report a terminal failure", failure.get());
-            // The first verification attempt ended unreadable and dead, so the transport's status
-            // can no longer be told apart from one a detached client reported.
-            assertEquals(
-                    "an unauthenticated transport status is reported as an unverified exit",
-                    Integer.valueOf(1),
-                    exitCode.get()
-            );
-            assertFalse("a proven-gone run releases its run spool", spoolDirectory.exists());
-        } finally {
-            fixture.device.activationRelease.countDown();
-            fixture.close();
-        }
-    }
-
-    /**
-     * An execution whose exit cannot be re-verified keeps its runtime admission and retries until
-     * root authorization returns, instead of reporting a terminal verification failure that would
-     * strand admission for a process that may still be alive. The status the transport reported
-     * while no verification attempt could authenticate it never reaches the service policy.
-     */
-    @Test
-    public void detachedExitVerificationRetriesUntilRootAuthorizationReturns() throws Exception {
-        Fixture fixture = new Fixture(250);
-        try {
-            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
-            fixture.device.transportClientExitedEarly = true;
-            // A detached client can report any status; this one would ask the service policy to
-            // restart Syncthing if the execution reported it as its own exit.
             fixture.device.transportClientExitCode = 3;
             fixture.device.activationPaused = new CountDownLatch(1);
             fixture.device.activationRelease = new CountDownLatch(1);
             // Only the exit tracker acquires root after the launch exec, so this predicate holds
-            // exactly the re-verification a detached transport needs.
+            // exactly the verification of a detached transport.
             fixture.device.pauseWhen = () -> fixture.device.hasLiveLaunchedProcess();
-
             SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
             File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
             FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
-
             assertTrue(
-                    "the detached exit observation must wait for a bounded root session",
+                    "the detached exit observation must reach its single root attempt",
                     fixture.device.activationPaused.await(5, TimeUnit.SECONDS)
             );
-
-            AtomicReference<Integer> exitCode = new AtomicReference<>();
+            long attemptsReachedTheGate = fixture.device.acquisitions;
+            // Root authorization never returns for that attempt.
+            fixture.device.rootAvailable = false;
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
                 try {
-                    exitCode.set(execution.await());
-                } catch (Throwable t) {
-                    failure.set(t);
+                    execution.await();
+                } catch (Throwable reported) {
+                    failure.set(reported);
                 }
             });
             waiter.start();
-
-            // The bounded activation attempt times out and is retried: while the exact process may
-            // still be alive, nothing may be finalized and no failure may escape the wait.
-            waiter.join(1_000);
-            assertNull("an unverifiable exit must not escape the wait", failure.get());
-            assertTrue("an unverifiable exit keeps runtime admission", waiter.isAlive());
-            assertTrue("an unverifiable exit keeps its run spool", spoolDirectory.exists());
-            assertTrue(
-                    "an unverifiable exit never signals a process",
-                    fixture.device.signals.isEmpty()
-            );
-
-            // Root authorization returns. The exact process is gone before any attempt can observe
-            // it, so the execution is reported through the unverified-transport status: this exit
-            // was never observed while the transport could still be told to be attached.
-            launched.exit(3);
             fixture.device.pauseWhen = null;
             fixture.device.activationRelease.countDown();
-
-            waiter.join(TimeUnit.SECONDS.toMillis(20));
-            assertFalse("the wait finishes once the exact process is proven gone", waiter.isAlive());
-            assertNull("a retried verification must not report a terminal failure", failure.get());
-            assertEquals(
-                    "an unauthenticated transport status is reported as an unverified exit",
-                    Integer.valueOf(1),
-                    exitCode.get()
+            waiter.join(10_000);
+            assertFalse("a failed verification must finish the wait", waiter.isAlive());
+            Throwable reported = failure.get();
+            assertTrue(
+                    "root denial must surface a typed unverified failure: " + reported,
+                    reported instanceof ExecutionExitUnverifiedException
             );
             assertTrue(
-                    "an unauthenticated exit never signals a process",
+                    "the typed root failure stays attached as the cause",
+                    reported.getCause() instanceof RootTransportException
+            );
+            assertEquals(
+                    "authorization loss is reported while evidence may describe a live execution",
+                    RootFailure.ROOT_AUTHORIZATION_LOST,
+                    ((RootTransportException) reported.getCause()).failure()
+            );
+            assertEquals(
+                    "one logical verification operation gets exactly one bounded attempt",
+                    attemptsReachedTheGate,
+                    fixture.device.acquisitions
+            );
+            assertFalse("an unverified exit never proves the process gone", execution.exitProven());
+            assertTrue("an unverified exit keeps its durable record", fixture.recordFile().exists());
+            assertTrue("an unverified exit keeps its run spool", spoolDirectory.exists());
+            assertTrue(
+                    "an unverified exit never signals a process",
                     fixture.device.signals.isEmpty()
             );
-            assertFalse("a proven-gone run releases its run spool", spoolDirectory.exists());
+            assertThrows(
+                    "an unverified exit keeps runtime admission",
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment())
+            );
+            assertThrows(
+                    "recovery stays fail-closed while root stays unavailable",
+                    RootTransportException.class,
+                    () -> fixture.newBackend().recoverExecutions()
+            );
+            // Only the refused explicit recovery above may have acquired root since the single
+            // bounded attempt.
+            long acquisitionsAfterExplicitRecovery = fixture.device.acquisitions;
+            long observationsAfterFailure =
+                    countOperations(fixture.device, "listProcesses");
+            // Waiting past every period the previous design retried at must not acquire root, poll
+            // the process table, signal anything, or delete any durable state.
+            Thread.sleep(2_500);
+            assertEquals(
+                    "no automatic reacquisition may follow the single bounded attempt",
+                    acquisitionsAfterExplicitRecovery,
+                    fixture.device.acquisitions
+            );
+            assertEquals(
+                    "an unverified execution is never polled",
+                    observationsAfterFailure,
+                    countOperations(fixture.device, "listProcesses")
+            );
+            assertTrue("no retry may signal a process", fixture.device.signals.isEmpty());
+            assertTrue("no retry may delete the run spool", spoolDirectory.exists());
+            assertTrue("no retry may delete durable evidence", fixture.recordFile().exists());
+            // Root authorization returns, and the explicit recovery that was refused before now
+            // proves the old execution gone without signaling anything.
+            fixture.device.rootAvailable = true;
+            launched.exit(3);
+            ExecutionOwnershipManager.RecoveryAssessment recovered =
+                    fixture.newBackend().recoverExecutions();
+            assertTrue(
+                    "a later explicit recovery proves the old execution gone",
+                    recovered.mayLaunch()
+            );
+            assertTrue(
+                    "no recovery step signals without exact ownership",
+                    fixture.device.signals.isEmpty()
+            );
         } finally {
+            fixture.device.pauseWhen = null;
             fixture.device.activationRelease.countDown();
             fixture.close();
         }
     }
 
     /**
-     * A detached execution whose exact process is still present is observed at a growing delay, so
-     * the remaining lifetime of a long-running launch does not become a continuous scan of every
-     * kernel process.
+     * An exit verification that could not prove the exit is not terminal. A later explicit wait is
+     * a new privileged operation, so it gets exactly one bounded re-verification attempt: when root
+     * authorization is back and the recorded process is gone, that attempt settles the run,
+     * releases runtime admission, and reports the typed unauthenticated result instead of the
+     * earlier verification failure.
      */
     @Test
-    public void detachedExecutionIsObservedAtABoundedBackoff() throws Exception {
-        Fixture fixture = new Fixture();
+    public void explicitLaterWaitReverifiesAnUnprovenExitOnce() throws Exception {
+        Fixture fixture = new Fixture(250);
         try {
             DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
             fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            fixture.device.activationPaused = new CountDownLatch(1);
+            fixture.device.activationRelease = new CountDownLatch(1);
+            fixture.device.pauseWhen = () -> fixture.device.hasLiveLaunchedProcess();
             SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
             FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+            assertTrue(
+                    "the exit verification must reach its single root attempt",
+                    fixture.device.activationPaused.await(5, TimeUnit.SECONDS)
+            );
+            fixture.device.rootAvailable = false;
+            fixture.device.pauseWhen = null;
+            fixture.device.activationRelease.countDown();
 
+            assertThrows(
+                    "the failed verification is reported as the unverified outcome",
+                    ExecutionExitUnverifiedException.class,
+                    execution::await
+            );
+            assertFalse("no exit is proven by the failed verification", execution.exitProven());
+            assertTrue("an unproven exit keeps its run spool", spoolDirectory.exists());
+            assertThrows(
+                    "an unproven exit keeps runtime admission",
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment())
+            );
+
+            // Root authorization returns and the recorded process exits, so the next explicit wait
+            // is a new privileged operation that can prove the old execution gone.
+            fixture.device.rootAvailable = true;
+            launched.exit(3);
+            long attemptsReachedTheGate = fixture.device.acquisitions;
+
+            assertThrows(
+                    "the settled run reports the unattributable status instead of the old failure",
+                    ExecutionExitStatusUnavailableException.class,
+                    execution::await
+            );
+
+            assertTrue(
+                    "one explicit wait runs at most one re-verification attempt and the"
+                            + " settlement session that follows it, never a retry cycle",
+                    fixture.device.acquisitions <= attemptsReachedTheGate + 2
+            );
+            assertTrue("the re-verification proves the exit", execution.exitProven());
+            assertFalse(
+                    "a proven exit settles the run and reconciles its run spool",
+                    spoolDirectory.exists()
+            );
+            assertTrue(
+                    "no verification step signals without exact ownership",
+                    fixture.device.signals.isEmpty()
+            );
+            long acquisitionsAfterSettlement = fixture.device.acquisitions;
+            Thread.sleep(1_000);
+            assertEquals(
+                    "a settled verification never reacquires root on its own",
+                    acquisitionsAfterSettlement,
+                    fixture.device.acquisitions
+            );
+            SyncthingExecution replacement = runtime.start(
+                    SyncthingCommand.RESET_DATABASE, environment()
+            );
+            assertNotNull(
+                    "the settled exit released runtime admission",
+                    replacement.identity()
+            );
+        } finally {
+            fixture.device.pauseWhen = null;
+            fixture.device.activationRelease.countDown();
+            fixture.close();
+        }
+    }
+
+    /**
+     * A detached transport can report any status, and a status is Syncthing's own only while the
+     * transport proved that it stayed attached through the process exit. A client that exits with
+     * status 3 while the real root process exits separately must therefore never become a
+     * requested-restart signal for the service: the run reports an unverified completion instead.
+     */
+    @Test
+    public void detachedTransportStatusIsNeverTheSyncthingExitStatus() throws Exception {
+        Fixture fixture = new Fixture(250);
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            fixture.device.activationPaused = new CountDownLatch(1);
+            fixture.device.activationRelease = new CountDownLatch(1);
+            fixture.device.pauseWhen = () -> fixture.device.hasLiveLaunchedProcess();
+            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+            assertTrue(
+                    "the detached exit observation must reach its single root attempt",
+                    fixture.device.activationPaused.await(5, TimeUnit.SECONDS)
+            );
+            // The real root process exits before that verification can observe it.
+            launched.exit(3);
+            fixture.device.pauseWhen = null;
+            fixture.device.activationRelease.countDown();
             AtomicReference<Integer> exitCode = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
                 try {
                     exitCode.set(execution.await());
-                } catch (Throwable t) {
-                    failure.set(t);
+                } catch (Throwable reported) {
+                    failure.set(reported);
                 }
             });
             waiter.start();
-
-            // The launch is complete, so every later observation belongs to the exit tracker.
-            long observationsBefore = countOperations(fixture.device, "listProcesses");
-            awaitOperationCount(fixture.device, "listProcesses", observationsBefore + 1);
-            long windowStart = countOperations(fixture.device, "listProcesses");
-            Thread.sleep(1_000);
-            long observations = countOperations(fixture.device, "listProcesses") - windowStart;
-
-            assertTrue(
-                    "a detached execution must back off instead of scanning every 100 ms; "
-                            + observations + " observations in one second",
-                    observations <= 6
-            );
-
-            launched.exit(3);
-            waiter.join(TimeUnit.SECONDS.toMillis(5));
-            assertFalse("the wait finishes once the exact process is proven gone", waiter.isAlive());
-            assertNull("a polled exit must not report a terminal failure", failure.get());
-            assertEquals(
-                    "a process that outlived its transport is reported as an unverified exit",
-                    Integer.valueOf(1),
+            waiter.join(10_000);
+            assertFalse("the wait finishes with the typed result", waiter.isAlive());
+            assertNull(
+                    "the client status must never be reported as Syncthing's exit status",
                     exitCode.get()
             );
+            assertTrue(
+                    "a proven-gone execution without an attributable status is a typed result: "
+                            + failure.get(),
+                    failure.get() instanceof ExecutionExitStatusUnavailableException
+            );
+            assertTrue("the exact process was proven gone", execution.exitProven());
+            assertTrue(
+                    "an unauthenticated exit never signals a process",
+                    fixture.device.signals.isEmpty()
+            );
+            assertFalse(
+                    "a proven exit settles the run and reconciles its spool",
+                    spoolDirectory.exists()
+            );
+            // A proven exit releases runtime admission, and the replacement launch reclassifies the
+            // retained record before it creates anything.
+            SyncthingExecution replacement =
+                    runtime.start(SyncthingCommand.RESET_DATABASE, environment());
+            assertNotNull(
+                    "a proven-gone execution permits a replacement launch",
+                    replacement.identity()
+            );
+            assertTrue(
+                    "no replacement step signals without exact ownership",
+                    fixture.device.signals.isEmpty()
+            );
+        } finally {
+            fixture.device.pauseWhen = null;
+            fixture.device.activationRelease.countDown();
+            fixture.close();
+        }
+    }
+
+    /**
+     * The attached transport contract is the one case where the awaited status is Syncthing's own:
+     * the local client is replaced by the launched process, so the run reports the real exit status
+     * unchanged and the ordinary service policy keeps working.
+     */
+    @Test
+    public void attachedTransportKeepsTheAuthenticatedSyncthingExitStatus() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+            launched.exit(3);
+            assertEquals(
+                    "an attached transport reports the real Syncthing status",
+                    3,
+                    execution.await()
+            );
+            assertTrue("the attached run proves the process exit", execution.exitProven());
+            assertFalse(
+                    "a proven-gone run releases its run spool",
+                    spoolDirectory.exists()
+            );
+            assertTrue("a completed run signals nothing", fixture.device.signals.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
+     * One exit verification attempt must never be observable as a completed exit while it runs.
+     *
+     * <p>An unverified exit is recorded as a typed failure, and every later caller runs one new
+     * bounded re-verification attempt of its own. The tracker publishes each attempt as one
+     * immutable result under its monitor, so concurrent waiters either report the recorded failure
+     * or the outcome of a completed attempt - never a fabricated successful exit while the recorded
+     * process may still be alive.</p>
+     */
+    @Test
+    public void concurrentWaitersReportTheReverificationOutcomeWithoutAFabricatedExit()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+
+            // The first wait consumes the tracker's own outcome; it proves nothing about the exit.
+            assertThrows(ExecutionExitUnverifiedException.class, execution::await);
+
+            // Hold the next root session open: that is the session the first concurrent waiter's
+            // re-verification attempt runs in.
+            fixture.device.gateShellsFrom = fixture.device.acquisitions + 1;
+            fixture.device.gateShellsUpTo = fixture.device.gateShellsFrom;
+            fixture.device.gatedShellEntered = new CountDownLatch(1);
+            fixture.device.gatedShellRelease = new CountDownLatch(1);
+
+            AtomicReference<Throwable>[] failures = new AtomicReference[3];
+            Thread[] waiters = new Thread[3];
+            for (int index = 0; index < waiters.length; index++) {
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                failures[index] = failure;
+                waiters[index] = new Thread(() -> {
+                    try {
+                        execution.await();
+                        failure.set(new AssertionError("a waiter reported an exit code"));
+                    } catch (Throwable caught) {
+                        failure.set(caught);
+                    }
+                }, "exit-waiter-" + index);
+                waiters[index].start();
+            }
+
+            assertTrue(
+                    "the re-verification must run",
+                    fixture.device.gatedShellEntered.await(5, TimeUnit.SECONDS)
+            );
+            for (Thread waiter : waiters) {
+                assertTrue(
+                        "no waiter may pass a re-verification that is still running",
+                        waiter.isAlive()
+                );
+            }
+
+            // The recorded process exits while the attempt still runs, so the attempt itself proves
+            // the exit and becomes the outcome every waiter has to report.
+            launched.exit(3);
+            fixture.device.gatedShellRelease.countDown();
+            for (Thread waiter : waiters) {
+                waiter.join(TimeUnit.SECONDS.toMillis(10));
+                assertFalse("every waiter must finish", waiter.isAlive());
+            }
+            for (AtomicReference<Throwable> failure : failures) {
+                Throwable caught = failure.get();
+                assertTrue(
+                        "a proven exit without an attributed status is reported as such: " + caught,
+                        caught instanceof ExecutionExitStatusUnavailableException
+                );
+            }
+            assertTrue("the completed attempt proves the process exit", execution.exitProven());
+            assertTrue("no waiter signals a process", fixture.device.signals.isEmpty());
+            assertFalse(
+                    "the proven exit releases the run spool",
+                    spoolDirectory.exists()
+            );
+        } finally {
+            if (fixture.device.gatedShellRelease != null) {
+                fixture.device.gatedShellRelease.countDown();
+            }
+            fixture.close();
+        }
+    }
+
+    /**
+     * An execution whose caller stopped waiting must not strand runtime admission or its resources.
+     *
+     * <p>The runtime keeps a handed-off execution until an exact-ownership operation proves the
+     * recorded process exited. The step that clears the durable record - the step the service's
+     * bounded shutdown worker performs after it proved the exit - then settles the execution's local
+     * resources and releases the admission slot, so the next invocation can be admitted.</p>
+     */
+    @Test
+    public void handedOffExecutionSettlesOnceTheExactProofClearsIt() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            SyncthingExecution execution = runtime.start(SyncthingCommand.SERVE, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+
+            assertThrows(ExecutionExitUnverifiedException.class, execution::await);
+            runtime.handOffExecutionSettlement(execution);
+            assertThrows(
+                    "a handed-off execution keeps runtime admission",
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.RESET_DATABASE, environment())
+            );
+            assertTrue("a handed-off execution keeps its run spool", spoolDirectory.exists());
+
+            // The bounded exact-ownership shutdown of the service proves the exit and then clears
+            // the durable record with the identity it proved.
+            launched.exit(137);
+            assertTrue(
+                    "the clearing operation removes the exactly proven record",
+                    runtime.clearAfterExit(execution.identity())
+            );
+
+            assertTrue("the settled execution proves its exit", execution.exitProven());
+            assertFalse(
+                    "a settled execution releases its run spool",
+                    spoolDirectory.exists()
+            );
+            assertTrue("a settled execution signals nothing", fixture.device.signals.isEmpty());
+            SyncthingExecution replacement =
+                    runtime.start(SyncthingCommand.RESET_DATABASE, environment());
+            assertNotNull(
+                    "a settled execution releases runtime admission",
+                    replacement.identity()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
+     * A launch-permitting recovery settles a handed-off execution too.
+     *
+     * <p>Recovery that reports a launchable state proved that no owned execution remains, so an
+     * execution whose caller handed its settlement to recovery releases its admission slot in the
+     * same operation. Without that step a stranded one-shot - which no service stop ever tracks -
+     * would keep the runtime refusing every later invocation until the application restarts.</p>
+     */
+    @Test
+    public void launchPermittingRecoverySettlesAHandedOffExecution() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            SyncthingExecution execution =
+                    runtime.start(SyncthingCommand.DEVICE_ID, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+            FakeRootTransport.Entry launched = fixture.device.onlyLiveProcess();
+
+            assertThrows(ExecutionExitUnverifiedException.class, execution::await);
+            runtime.handOffExecutionSettlement(execution);
+            assertTrue("a handed-off execution keeps its run spool", spoolDirectory.exists());
+
+            launched.exit(0);
+            ExecutionOwnershipManager.RecoveryAssessment assessment =
+                    runtime.recoverExecutions();
+
+            assertTrue("the gone execution may be replaced", assessment.mayLaunch());
+            assertTrue("recovery settles the handed-off execution", execution.exitProven());
+            assertFalse(
+                    "a settled execution releases its run spool",
+                    spoolDirectory.exists()
+            );
+            assertTrue("a settled execution signals nothing", fixture.device.signals.isEmpty());
+            SyncthingExecution replacement =
+                    runtime.start(SyncthingCommand.GENERATE, environment());
+            assertNotNull(
+                    "a settled execution releases runtime admission",
+                    replacement.identity()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+    /**
+     * A launch-permitting assessment settles only the execution it was measured against.
+     *
+     * <p>An execution that starts after a launch-permitting recovery assessment returned - and
+     * that hands off its own settlement after its exit verification failed - belongs to a launch
+     * the assessment never classified. Settling that newer execution would release its admission
+     * while its process may still be alive, so the settlement stays bound to the handle the
+     * assessment covered.</p>
+     */
+    @Test
+    public void newerHandedOffExecutionKeepsItsAdmissionAgainstAStaleAssessment() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            AtomicReference<SyncthingExecution> newerExecution = new AtomicReference<>();
+            AtomicReference<File> newerSpool = new AtomicReference<>();
+            AtomicBoolean interleaved = new AtomicBoolean();
+            runtime.recoveryAssessmentReturnedHookForTesting = () -> {
+                if (!interleaved.compareAndSet(false, true)) {
+                    return;
+                }
+                try {
+                    fixture.device.transportClientExitedEarly = true;
+                    fixture.device.transportClientExitCode = 3;
+                    SyncthingExecution started =
+                            runtime.start(SyncthingCommand.DEVICE_ID, environment());
+                    newerExecution.set(started);
+                    newerSpool.set(new File(
+                            spoolDirectoryOf(fixture, onlyLaunchScript(fixture))
+                    ));
+                    assertThrows(ExecutionExitUnverifiedException.class, started::await);
+                    runtime.handOffExecutionSettlement(started);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            };
+
+            ExecutionOwnershipManager.RecoveryAssessment assessment = runtime.recoverExecutions();
+
+            assertTrue("the empty installation may be replaced", assessment.mayLaunch());
+            SyncthingExecution newer = newerExecution.get();
+            assertNotNull("the interleaving hook ran the newer launch", newer);
+            assertFalse(
+                    "an unclassified newer execution is never settled by an earlier assessment",
+                    newer.exitProven()
+            );
+            assertTrue("its run spool stays owned", newerSpool.get().exists());
+            assertThrows(
+                    "its admission stays held until an exact-ownership proof",
+                    ExecutionAdmissionException.class,
+                    () -> runtime.start(SyncthingCommand.GENERATE, environment())
+            );
+            assertTrue("no step signals the possibly live process", fixture.device.signals.isEmpty());
+
+            fixture.device.onlyLiveProcess().exit(3);
+            ExecutionOwnershipManager.RecoveryAssessment settled = runtime.recoverExecutions();
+
+            assertTrue("the later exact-ownership proof settles the newer run", settled.mayLaunch());
+            assertTrue("the newer execution proves its exit", newer.exitProven());
+            assertFalse("the settled run releases its spool", newerSpool.get().exists());
+            assertNotNull(
+                    "the settled run releases runtime admission",
+                    runtime.start(SyncthingCommand.GENERATE, environment()).identity()
+            );
+            assertTrue("no step signals without exact ownership", fixture.device.signals.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    /**
+     * A one-shot whose process exited before its identity could be captured is proven gone by the
+     * launch protocol itself. When the transport cannot attribute its status, the run reports the
+     * typed unauthenticated result, settles the proven exit, and never turns the transport status
+     * into an exit code the service policy could classify.
+     */
+    @Test
+    public void identityLessExecutionSettlesWithoutAnAuthenticatedStatus() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(fixture.backend);
+            fixture.device.transportClientExitedEarly = true;
+            fixture.device.transportClientExitCode = 3;
+            // The launched process exits before the creation confirmation can capture its
+            // identity, so the handle this backend returns has nothing to verify against.
+            fixture.device.afterProcessSpawned = () ->
+                    fixture.device.exit(fixture.device.onlyLiveProcess(), 3);
+
+            SyncthingExecution execution = runtime.start(SyncthingCommand.DEVICE_ID, environment());
+            File spoolDirectory = new File(spoolDirectoryOf(fixture, onlyLaunchScript(fixture)));
+
+            assertNull(
+                    "a process that exited before the capture leaves no identity",
+                    execution.identity()
+            );
+            assertThrows(
+                    "an unattributable status is reported as a typed result, never as an exit code",
+                    ExecutionExitStatusUnavailableException.class,
+                    execution::await
+            );
+            assertTrue("the launch protocol itself proved the process gone", execution.exitProven());
+            assertFalse(
+                    "a proven-gone run settles its run spool instead of stranding it",
+                    spoolDirectory.exists()
+            );
+            assertTrue("settling a proven exit never signals a process", fixture.device.signals.isEmpty());
+
+            fixture.device.afterProcessSpawned = null;
+            fixture.device.transportClientExitedEarly = false;
+            SyncthingExecution replacement = runtime.start(SyncthingCommand.DEVICE_ID, environment());
+            assertNotNull("the proven exit released runtime admission", replacement.identity());
+            fixture.device.exit(fixture.device.onlyLiveProcess(), 0);
+            assertEquals(0, replacement.await());
         } finally {
             fixture.close();
         }

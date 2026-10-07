@@ -50,6 +50,19 @@ public final class DefaultSyncthingRuntime
     private final PrivilegeBackend backend;
     private final AdmissionGate admission = new AdmissionGate();
     private final LaunchPermitAcquirer launchPermitAcquirer;
+    /** Guards the admitted execution handle the runtime keeps for a later recovery settlement. */
+    private final Object settlementLock = new Object();
+    /** Handle of the admitted execution, kept while it still owns runtime admission. */
+    private SyncthingExecution admittedExecution;
+    /** Whether the admitted execution's caller handed its settlement to runtime recovery. */
+    private boolean settlementHandedOff;
+    /**
+     * Test seam invoked after a launch-permitting recovery assessment returned and before the
+     * handed-off execution that assessment was measured against settles, so a test can prove that
+     * an execution which starts and hands off its own settlement during that interval keeps its
+     * admission. Production code leaves it {@code null}.
+     */
+    Runnable recoveryAssessmentReturnedHookForTesting;
 
     public DefaultSyncthingRuntime(PrivilegeBackend backend) {
         this(backend, OwnedExecutionShutdown::acquireLaunchPermit);
@@ -252,7 +265,7 @@ public final class DefaultSyncthingRuntime
                     // that release, so it never keeps process-start quiescence blocked.
                     PrivilegeBackend.Execution execution = preparation.start(permit::close);
                     started = true;
-                    return new SyncthingExecution(execution, admission::release);
+                    return retainAdmittedExecution(execution);
                 }
             } finally {
                 if (!started) preparation.discard();
@@ -262,6 +275,112 @@ public final class DefaultSyncthingRuntime
             admission.release();
             throw e;
         }
+    }
+
+    /**
+     * Hands one admitted execution to its caller while the runtime keeps a reference to it.
+     *
+     * <p>An execution whose caller stops waiting while its process may still be alive cannot be
+     * settled by that caller. The runtime keeps the handle until an exact-ownership operation
+     * proves the recorded process gone, so the execution's local resources and the runtime
+     * admission it owns are released at the one point where releasing them is safe.</p>
+     */
+    private SyncthingExecution retainAdmittedExecution(PrivilegeBackend.Execution execution) {
+        SyncthingExecution handle = new SyncthingExecution(execution, this::releaseAdmission);
+        synchronized (settlementLock) {
+            admittedExecution = handle;
+            settlementHandedOff = false;
+        }
+        return handle;
+    }
+
+    /**
+     * Releases the single admission slot and forgets the handle that owned it.
+     *
+     * <p>Only the admitted execution releases admission, and a new invocation cannot be admitted
+     * before this release, so clearing the retained handle here can never discard a newer
+     * execution.</p>
+     */
+    private void releaseAdmission() {
+        synchronized (settlementLock) {
+            admittedExecution = null;
+            settlementHandedOff = false;
+        }
+        admission.release();
+    }
+
+    /**
+     * Hands an execution's settlement to runtime recovery after its caller stopped waiting.
+     *
+     * <p>A caller that can no longer wait for the launched process - because exit verification
+     * failed while the process may still be alive - must not settle the execution and must not
+     * release its admission. The runtime keeps both until an exact-ownership operation proves the
+     * recorded process exited; {@link #clearAfterExit(ExecutionIdentity)} and a launch-permitting
+     * {@link #recoverExecutions()} are the operations that carry that proof.</p>
+     */
+    public void handOffExecutionSettlement(SyncthingExecution execution) {
+        synchronized (settlementLock) {
+            if (admittedExecution == execution) {
+                settlementHandedOff = true;
+            }
+        }
+    }
+
+    /**
+     * Settles the handed-off execution once an exact-ownership operation proved its process gone.
+     *
+     * @param provenIdentity identity whose exact exit was just proven, or {@code null} when the
+     *     caller proved that no owned execution remains at all
+     */
+    private void settleHandedOffExecution(ExecutionIdentity provenIdentity) {
+        SyncthingExecution handle;
+        synchronized (settlementLock) {
+            handle = admittedExecution;
+            if (handle == null || !settlementHandedOff) {
+                return;
+            }
+            if (provenIdentity != null) {
+                ExecutionIdentity admitted = handle.identity();
+                if (admitted == null || !admitted.matches(provenIdentity)) {
+                    return;
+                }
+            }
+        }
+        handle.settleAfterProvenExit();
+    }
+
+    /** Reports the execution that currently owns runtime admission, or {@code null} when the
+     * slot is free. */
+    private SyncthingExecution admittedExecutionHandle() {
+        synchronized (settlementLock) {
+            return admittedExecution;
+        }
+    }
+
+    /**
+     * Settles the handed-off execution one launch-permitting assessment was measured against.
+     *
+     * <p>The assessment proves that the execution it classified exited, so only the handle that
+     * held admission while it ran may settle here. Matching the handle by instance - instead of
+     * settling whichever execution currently holds admission - keeps the proof bound to the
+     * execution it covers: a later execution that reached failed exit verification and handed off
+     * its own settlement during the assessment keeps its admission until an exact-ownership
+     * operation proves that execution's process gone, so no overlapping launch can be admitted
+     * against a possibly live process.</p>
+     *
+     * @param assessedExecution handle that held admission when the assessment started; ignored
+     *     when it is not (or no longer) the handed-off admitted execution
+     */
+    private void settleAssessedHandedOffExecution(SyncthingExecution assessedExecution) {
+        if (assessedExecution == null) {
+            return;
+        }
+        synchronized (settlementLock) {
+            if (admittedExecution != assessedExecution || !settlementHandedOff) {
+                return;
+            }
+        }
+        assessedExecution.settleAfterProvenExit();
     }
 
     /**
@@ -288,7 +407,20 @@ public final class DefaultSyncthingRuntime
                     "Execution recovery was interrupted while waiting for process creation", e
             );
         }
-        return backend.recoverExecutions();
+        SyncthingExecution assessedExecution = admittedExecutionHandle();
+        ExecutionOwnershipManager.RecoveryAssessment assessment = backend.recoverExecutions();
+        if (assessment.mayLaunch()) {
+            if (recoveryAssessmentReturnedHookForTesting != null) {
+                recoveryAssessmentReturnedHookForTesting.run();
+            }
+            // Recovery proved that no owned execution remains, so an execution whose caller
+            // handed settlement to recovery settles here, without any further acquisition. The
+            // settlement is bound to the handle the assessment was measured against: a handle
+            // admitted afterwards belongs to an execution this assessment never classified, so it
+            // keeps its admission until an exact-ownership proof covers it.
+            settleAssessedHandedOffExecution(assessedExecution);
+        }
+        return assessment;
     }
 
     @Override
@@ -304,9 +436,19 @@ public final class DefaultSyncthingRuntime
         return backend.observe(identity);
     }
 
-    /** Removes durable ownership evidence after the exact process exit has been proven. */
+    /**
+     * Removes durable ownership evidence after the exact process exit has been proven.
+     *
+     * <p>A handed-off execution with the same identity settles in the same step: the caller just
+     * proved that this execution's process exited, so its local resources and the runtime
+     * admission it still owns are released here.</p>
+     */
     public boolean clearAfterExit(ExecutionIdentity identity) throws IOException {
-        return backend.clearAfterExit(identity);
+        try {
+            return backend.clearAfterExit(identity);
+        } finally {
+            settleHandedOffExecution(identity);
+        }
     }
 
     public ConfigStorage configStorage() {

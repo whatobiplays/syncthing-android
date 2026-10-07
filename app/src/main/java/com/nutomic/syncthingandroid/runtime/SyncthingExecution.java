@@ -22,6 +22,8 @@ public final class SyncthingExecution {
     private final Runnable releaseAdmission;
     private final AtomicBoolean released = new AtomicBoolean(false);
     private final AtomicBoolean exitObserved = new AtomicBoolean(false);
+    /** Claims the single external settlement a handed-off execution may receive. */
+    private final AtomicBoolean settledAfterProvenExit = new AtomicBoolean(false);
 
     SyncthingExecution(PrivilegeBackend.Execution execution, Runnable releaseAdmission) {
         this.execution = execution;
@@ -82,6 +84,28 @@ public final class SyncthingExecution {
                 release();
             }
             throw interrupted;
+        } catch (ExecutionExitStatusUnavailableException unavailable) {
+            // The bundled execution never supplied an authenticated status. Admission is released
+            // only when the process exit itself was proven; an exit that could not be verified at
+            // all keeps the admission, because the launched process may still be alive.
+            if (execution.exitProven()) {
+                exitObserved.set(true);
+                release();
+            }
+            throw unavailable;
+        } catch (RootTransportException unverified) {
+            // A backend whose exit verification failed reports its own typed failure. Above this
+            // seam the outcome is mode-neutral: the launched process may still be alive, so the
+            // execution is not finalized here, admission is released only when the backend proved
+            // the exit anyway, and the backend cause stays attached for diagnostics. A later
+            // explicit wait on this execution gets one bounded re-verification attempt of its own.
+            if (execution.exitProven()) {
+                exitObserved.set(true);
+                release();
+            }
+            throw new ExecutionExitUnverifiedException(
+                    "The launched execution exit could not be verified", unverified
+            );
         }
     }
 
@@ -107,8 +131,47 @@ public final class SyncthingExecution {
         execution.destroy();
     }
 
+    /**
+     * Reports whether the backend proved that the launched process exited.
+     *
+     * <p>This is what tells the two unavailable-exit outcomes apart: a proven exit means the child
+     * is gone and only its status stayed unauthenticated, while an unproven exit means the child
+     * may still be running.</p>
+     */
+    public boolean exitProven() {
+        return execution.exitProven();
+    }
+
     public ExecutionIdentity identity() {
         return execution.identity();
+    }
+
+    /**
+     * Settles this execution after an external operation proved that its process exited.
+     *
+     * <p>This is the settlement path for an execution whose caller stopped waiting - because exit
+     * verification failed while the launched process may still have been alive - and whose runtime
+     * then kept it until an exact-ownership operation proved the recorded process gone. The
+     * settlement itself never signals the process and never acquires root, because that proof
+     * already happened outside this handle; the execution's local resources are released and
+     * runtime admission is freed only once they are.</p>
+     *
+     * <p>Settles exactly once, and tolerates a later {@link #await()} reporting the already
+     * recorded outcome.</p>
+     */
+    void settleAfterProvenExit() {
+        if (!settledAfterProvenExit.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            execution.settleAfterProvenExit();
+        } catch (RuntimeException ignored) {
+            // The exact process is already proven gone, so a failure while releasing local
+            // resources must not keep runtime admission. The backend reports its own diagnostics.
+        } finally {
+            exitObserved.set(true);
+            release();
+        }
     }
 
     private void release() {

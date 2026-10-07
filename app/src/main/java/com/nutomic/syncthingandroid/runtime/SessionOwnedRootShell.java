@@ -61,6 +61,17 @@ final class SessionOwnedRootShell implements RootShell {
         return sessionShell.awaitExit();
     }
 
+    /**
+     * Reports the provenance the underlying transport recorded during acquisition.
+     *
+     * <p>A session-owned shell only ever serves helper operations, so this value is never used for
+     * an exit decision; it answers because every root shell exposes the transport contract.</p>
+     */
+    @Override
+    public boolean exitStatusBelongsToLaunchedProcess() {
+        return sessionShell.exitStatusBelongsToLaunchedProcess();
+    }
+
     @Override
     public String readBootId() throws IOException {
         return sessionShell.readBootId();

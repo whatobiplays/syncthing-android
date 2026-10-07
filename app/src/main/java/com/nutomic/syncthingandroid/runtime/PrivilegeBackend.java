@@ -185,6 +185,20 @@ public interface PrivilegeBackend {
 
         void destroy();
 
+        /**
+         * Releases this execution's local resources after an external operation proved its process
+         * exited.
+         *
+         * <p>A caller that stops waiting after a failed exit verification leaves its execution to
+         * recovery: only an exact-ownership operation may settle a process that may still be
+         * alive, and it calls this method once it proved the recorded process gone. An
+         * implementation must never signal the process and must never perform a privileged
+         * acquisition here - the exact proof already happened outside this handle - and must
+         * tolerate being called after the execution already settled its own exit.</p>
+         */
+        default void settleAfterProvenExit() {
+        }
+
         default ExecutionIdentity identity() {
             return null;
         }

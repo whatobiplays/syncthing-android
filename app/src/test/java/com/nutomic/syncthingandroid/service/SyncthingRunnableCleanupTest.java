@@ -380,4 +380,44 @@ public class SyncthingRunnableCleanupTest {
                 .gogc(100)
                 .build();
     }
+
+    @Test
+    public void unauthenticatedExitNeverCarriesAnExitCodeTheRestartPolicyCouldClassify() {
+        ExecutionIdentity identity = new ExecutionIdentity(
+                41, 9001, "boot-a", "/data/app/lib/libsyncthingnative.so", "run-a"
+        );
+
+        SyncthingRunnable.LifecycleOutcome provenGone =
+                SyncthingRunnable.LifecycleOutcome.exitUnverified(identity, true);
+        SyncthingRunnable.LifecycleOutcome unverified =
+                SyncthingRunnable.LifecycleOutcome.exitUnverified(identity, false);
+
+        assertEquals(
+                SyncthingRunnable.LifecycleOutcome.Type.EXIT_UNVERIFIED,
+                provenGone.type()
+        );
+        assertEquals(
+                SyncthingRunnable.LifecycleOutcome.Type.EXIT_UNVERIFIED,
+                unverified.type()
+        );
+        assertSame(identity, provenGone.identity());
+        assertTrue(
+                "a proven exit still reports the launched child gone",
+                provenGone.exitObserved()
+        );
+        assertFalse(
+                "an unverified exit never claims the launched child is gone",
+                unverified.exitObserved()
+        );
+        assertTrue(provenGone.executionCreated());
+        assertEquals(
+                "the unverified outcome never carries a status the exit policy could classify",
+                -1,
+                provenGone.exitCode()
+        );
+        assertEquals(-1, unverified.exitCode());
+        assertFalse(provenGone.provesNoExecutionExit());
+        assertFalse(unverified.provesNoExecutionExit());
+        assertNull(provenGone.recoveryAssessment());
+    }
 }

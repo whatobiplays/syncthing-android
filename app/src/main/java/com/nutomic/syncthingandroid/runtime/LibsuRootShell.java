@@ -43,6 +43,11 @@ final class LibsuRootShell implements RootShell {
     private static final String BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
     /** Fields before {@code starttime} in {@code /proc/<pid>/stat}, counted after the comm field. */
     private static final int START_TIME_FIELD_INDEX = 19;
+
+    /** Field index of the parent process identifier inside one {@code /proc/<pid>/stat} line. */
+    private static final int PARENT_PROCESS_FIELD_INDEX = 1;
+    /** Source of the shell's own {@code /proc/<pid>/stat} line, read while the shell is alive. */
+    private static final String SHELL_STAT_SOURCE = "/proc/$$/stat";
     /** Upper bound for one helper operation, so a stalled shell can never hang a caller. */
     private static final long OPERATION_TIMEOUT_MILLIS = 15_000;
 
@@ -60,6 +65,9 @@ final class LibsuRootShell implements RootShell {
     private final Process process;
     private final long operationTimeoutMillis;
     private int shellPid;
+
+    private boolean exitStatusProvenanceRecorded;
+    private boolean exitStatusBelongsToLaunchedProcess;
 
     LibsuRootShell(Shell shell, Process process) {
         this(shell, process, OPERATION_TIMEOUT_MILLIS);
@@ -124,6 +132,68 @@ final class LibsuRootShell implements RootShell {
             }
             throw new IOException("Could not read the root shell process identifier");
         }
+    }
+
+    /**
+     * Determines once, while the shell is still alive, whether this transport's exit status can be
+     * attributed to the process that the terminal {@code exec} creates.
+     *
+     * <p>The audited launch script replaces the shell process with the bundled binary, so the
+     * status the transport reports is Syncthing's own status only while the local client process
+     * is the shell itself. The shell reports its parent process: a shell whose parent is the
+     * owning application process is that client, because a directly attached {@code su} client is
+     * replaced by the shell it drives. Every other relationship, and every unreadable answer,
+     * leaves the status unattributable, so callers fail closed instead of trusting a status that a
+     * detached client may report on its own.</p>
+     *
+     * <p>The question can be answered only while the client is alive, so the answer is recorded
+     * here and read later through {@link #exitStatusBelongsToLaunchedProcess()}. Failing to
+     * determine it is not an acquisition failure; it only means the status stays
+     * unattributable.</p>
+     *
+     * @param ownerProcessId process identifier of the application process that owns this transport
+     */
+    void determineExitStatusProvenance(int ownerProcessId) {
+        synchronized (this) {
+            if (exitStatusProvenanceRecorded) {
+                return;
+            }
+            exitStatusProvenanceRecorded = true;
+            try {
+                int parentPid = parentProcessId();
+                exitStatusBelongsToLaunchedProcess = parentPid > 0 && parentPid == ownerProcessId;
+            } catch (IOException | RuntimeException unprovable) {
+                exitStatusBelongsToLaunchedProcess = false;
+            }
+        }
+    }
+
+    @Override
+    public boolean exitStatusBelongsToLaunchedProcess() {
+        synchronized (this) {
+            return exitStatusBelongsToLaunchedProcess;
+        }
+    }
+
+    /**
+     * Reads the parent process identifier of the shell process.
+     *
+     * <p>The answer identifies whether the shell is the direct child of the owning application
+     * process, which is the case exactly when the local transport client was replaced by the shell
+     * it drives.</p>
+     *
+     * @throws IOException when the shell cannot answer
+     */
+    int parentProcessId() throws IOException {
+        List<String> output = runCommand("cat " + SHELL_STAT_SOURCE);
+        if (output.isEmpty()) {
+            throw new IOException("Could not read the shell status entry");
+        }
+        int parentPid = parseParentProcessId(output.get(0));
+        if (parentPid <= 0) {
+            throw new IOException("Could not read the shell parent process identifier");
+        }
+        return parentPid;
     }
 
     @Override
@@ -344,6 +414,28 @@ final class LibsuRootShell implements RootShell {
         } catch (NumberFormatException notANumber) {
             return 0;
         }
+    }
+
+    /**
+     * Extracts the parent process identifier from one {@code /proc/<pid>/stat} line.
+     *
+     * <p>The second field is the executable name in parentheses and may contain spaces, so the
+     * parse drops everything up to the last closing parenthesis before reading the parent field.
+     * An unreadable or malformed line reports {@code 0}, which callers treat as unprovable.</p>
+     */
+    static int parseParentProcessId(String statLine) {
+        if (statLine == null) {
+            return 0;
+        }
+        int closingParenthesis = statLine.lastIndexOf(')');
+        if (closingParenthesis < 0) {
+            return 0;
+        }
+        String[] fields = statLine.substring(closingParenthesis + 1).trim().split("\s+");
+        if (fields.length <= PARENT_PROCESS_FIELD_INDEX) {
+            return 0;
+        }
+        return parsePositiveInt(fields[PARENT_PROCESS_FIELD_INDEX]);
     }
 
     /** Finds the private run token inside one NUL-separated environment listing. */

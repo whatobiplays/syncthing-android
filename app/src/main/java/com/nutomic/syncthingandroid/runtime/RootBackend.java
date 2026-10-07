@@ -72,9 +72,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <h2>Exit status</h2>
  *
  * <p>The audited launch script replaces the root shell with the bundled binary, so the process the
- * transport observes <em>is</em> the Syncthing process. The exit status the transport observes is
- * therefore Syncthing's own status, and the backend reports it unchanged so the existing service
- * policy - including the requested-restart status - keeps working.</p>
+ * transport observes <em>is</em> the Syncthing process. The backend reports that status unchanged
+ * so the existing service policy - including the requested-restart status - keeps working, but only
+ * while the transport proved during acquisition that its awaited status belongs to the launched
+ * process. When the transport client detached, the exit of the exact recorded process is still
+ * verified against durable evidence, and the run then reports
+ * {@link ExecutionExitStatusUnavailableException} instead of an unauthenticated status.</p>
  */
 public final class RootBackend implements PrivilegeBackend {
     /** Bounded root activation deadline required by the canonical superuser design. */
@@ -1076,46 +1079,55 @@ public final class RootBackend implements PrivilegeBackend {
     }
 
     /**
-     * Completes one execution's exit observation after its local transport ended.
+     * Verifies, after the dedicated launch transport ended, that the launched execution exited.
      *
-     * <p>The transport's own status is the execution's status only while that transport stayed
-     * attached through the process's exit, which a daemon-backed root manager is not required to
-     * do: its local client can disappear while the exact process keeps running. Attachment cannot
-     * be observed after the fact, so the tracker propagates the transport status only when the
-     * verification attempt that begins at the transport's end immediately observes the exact
-     * process gone. Every other outcome - unavailable authorization, an unreadable observation, a
-     * replaced session, or a process that is present because it outlived the transport - leaves
-     * the status unauthenticated, and the execution is reported through the unverified-transport
-     * status instead. The residual of that rule is a process that exits within the latency of the
-     * first attempt after its client detached: no later inspection can tell that apart from an
-     * attached exit, and the window cannot be closed without holding a privileged session for the
-     * lifetime of the execution.</p>
+     * <p>A root transport can outlive its usefulness: a daemon-backed root manager may let the
+     * local {@code su} client exit while the UID-0 process keeps running, and the status such a
+     * client reports then describes the client instead of Syncthing. This tracker therefore keeps
+     * two facts apart. Exact process exit is proven only by the ownership manager observing the
+     * recorded kernel identity as gone; the exit status is authenticated only when the transport
+     * itself proved, during acquisition, that its awaited status belongs to the launched
+     * process.</p>
      *
-     * <p>Verification is retried, not failed, while root authorization is unavailable or the
-     * recorded process cannot be inspected: an execution that cannot be verified yet keeps runtime
-     * admission, durable record, run spool, and transport until its exact process is proven gone,
-     * so an unprovable exit can never release a replacement launch. Every attempt is bounded, each
-     * observation runs as one operation-scoped helper session that is closed again before the wait
-     * that follows it, and nothing here signals a process.</p>
+     * <p>The canonical root design allows the next privileged operation one bounded reacquisition
+     * attempt and forbids polling for root authorization, so the tracker runs at most one
+     * operation-scoped helper session. When that single attempt cannot prove the exact process
+     * gone, because root is denied, unavailable, timed out, unreadable, or because the recorded
+     * process is still present, the run reports a typed failure instead of an exit code. The
+     * failure keeps the runtime admission, the durable record, and the run spool, signals nothing,
+     * and leaves the state ready for an explicit later recovery operation to reclassify the
+     * execution.</p>
      */
     private final class RootProcessExitTracker implements Runnable {
-        /** Reported when the transport's status does not authenticate the execution's own exit. */
-        private static final int UNVERIFIED_TRANSPORT_EXIT_CODE = 1;
-        /** First delay between observations while the recorded process is still present. */
-        private static final long EXACT_EXIT_POLL_MILLIS = 100;
-        /** Upper bound of that delay, so a detached execution is observed at a bounded cadence. */
-        private static final long EXACT_EXIT_POLL_MAX_MILLIS = 5_000;
-        /** First delay before an exit observation that could not be made is retried. */
-        private static final long VERIFICATION_RETRY_MILLIS = 1_000;
-        /** Upper bound of that delay, so an unavailable root request is not repeated endlessly. */
-        private static final long VERIFICATION_RETRY_MAX_MILLIS = 30_000;
+        /**
+         * One immutable verification outcome.
+         *
+         * <p>The tracker publishes an outcome as one value, so a concurrent waiter can never
+         * observe a verification attempt that is still running as a completed exit.</p>
+         */
+        private final class Outcome {
+            final boolean exitProven;
+            final int exitCode;
+            final RuntimeException failure;
+
+            Outcome(boolean exitProven, int exitCode, RuntimeException failure) {
+                this.exitProven = exitProven;
+                this.exitCode = exitCode;
+                this.failure = failure;
+            }
+        }
 
         private final RootShell transport;
         private final ExecutionIdentity identity;
         private final CountDownLatch terminal = new CountDownLatch(1);
-        private volatile boolean exactExitProven;
-        private volatile RuntimeException failure;
-        private volatile int exitCode;
+        /** Latest outcome, replaced only by a whole new verification attempt. */
+        private volatile Outcome outcome;
+        /** Status the transport reported when its own client process ended. */
+        private volatile int transportExitCode;
+        /** Whether that status belongs to the launched process, fixed while the client lived. */
+        private volatile boolean transportStatusBelongsToExecution;
+        /** Whether the verification the tracker thread ran has already been reported. */
+        private boolean initialVerificationReported;
         private Thread thread;
 
         RootProcessExitTracker(RootShell transport, ExecutionIdentity identity) {
@@ -1129,107 +1141,160 @@ public final class RootBackend implements PrivilegeBackend {
             thread.start();
         }
 
-        /** Output readers stop only when exact exit is proven or exit verification itself failed. */
-        boolean outputEnded() {
-            return exactExitProven || failure != null;
+        /**
+         * Reports whether the exact launched process is proven gone, whether or not its exit status
+         * could be authenticated.
+         */
+        boolean exactExitProven() {
+            Outcome recorded = outcome;
+            return recorded != null && recorded.exitProven;
         }
 
+        /**
+         * Reports whether an operation-scoped output reader has to stop waiting for more output.
+         *
+         * <p>A one-shot reader consumes this run's output tail before it waits for the exit, so the
+         * tail has to end once this tracker has produced its answer - a proven exit or the typed
+         * failure of one bounded verification attempt - because the operation reports that answer
+         * instead of blocking for a further privileged attempt it is not allowed to make. The serve
+         * log pump therefore does not use this signal: a long-running run keeps draining until its
+         * process is proven exited.</p>
+         */
+        boolean outputEnded() {
+            return outcome != null;
+        }
+
+        /**
+         * Reports this run's outcome to one explicit caller.
+         *
+         * <p>The first caller reports the outcome the tracker thread recorded. Every later caller
+         * runs one new logical privileged operation with its own single bounded reacquisition
+         * attempt, because the canonical root design forbids polling for authorization but allows
+         * an explicit later operation to reclassify the execution.</p>
+         *
+         * <p>Waiting and re-verifying hold this tracker's monitor while they read or replace the
+         * recorded outcome, so no waiter can ever see a still-running verification attempt as a
+         * completed exit.</p>
+         *
+         * @throws ExecutionExitStatusUnavailableException when the exit was proven without an
+         *     authenticated status
+         * @throws RootTransportException when the single bounded attempt could not prove the exit
+         */
         int awaitExit() throws InterruptedException {
             terminal.await();
-            if (failure != null) {
-                throw failure;
+            synchronized (this) {
+                if (initialVerificationReported) {
+                    reverifyUnverifiedExit();
+                } else {
+                    initialVerificationReported = true;
+                }
+                Outcome reported = outcome;
+                if (reported.failure != null) {
+                    throw reported.failure;
+                }
+                return reported.exitCode;
             }
-            return exitCode;
+        }
+
+        /**
+         * Runs one bounded re-verification attempt for an exit an earlier attempt could not prove.
+         *
+         * <p>Must be called while holding this tracker's monitor. Only an exit that was never
+         * proven can become proven later; a proven exit - including one whose status stayed
+         * unattributable - keeps its recorded outcome, so an unauthenticated status can never be
+         * reinterpreted as a real one. The replacement outcome is published as one value, so no
+         * reader can observe the attempt between its start and its result.</p>
+         */
+        private void reverifyUnverifiedExit() {
+            Outcome recorded = outcome;
+            if (recorded.exitProven || recorded.failure == null) {
+                return;
+            }
+            outcome = verifyExit(transportExitCode, transportStatusBelongsToExecution);
         }
 
         @Override
         public void run() {
             try {
-                int transportExitCode = transport.awaitExit();
-                if (identity == null) {
-                    // This handle is created only after creation confirmation already proved the
-                    // launched process gone, so no further identity check is available or needed.
-                    exitCode = transportExitCode;
-                    exactExitProven = true;
-                    return;
-                }
-
-                // The transport stayed attached through the process's exit only if the exact
-                // process was already gone when the transport ended, and only the observation made
-                // by the attempt that begins here can confirm that state. A failed attempt, an
-                // unreadable read, a replaced session, or a process that is still present all mean
-                // the process may have outlived its detached client, and none of them can be told
-                // apart from that later on.
-                boolean transportStatusUntrusted = false;
-                long retryDelayMillis = VERIFICATION_RETRY_MILLIS;
-                long pollDelayMillis = EXACT_EXIT_POLL_MILLIS;
-                while (true) {
-                    ExecutionOwnershipManager.Observation observation;
-                    try {
-                        // Each observation is one bounded, operation-scoped helper operation, so no
-                        // privileged session survives into the wait that follows it.
-                        observation = withHelperSession(
-                                ownershipManager -> ownershipManager.observe(identity)
-                        );
-                    } catch (RootTransportException unverifiable) {
-                        // Fail closed without failing permanently. Root authorization can be
-                        // unavailable exactly when the local transport ends - denied, absent, or
-                        // simply slower than the bounded activation window - and it can return, so
-                        // an unproven exit keeps admission, durable record, spool, and transport
-                        // and retries instead of stranding the runtime behind a terminal failure.
-                        logWarning("Root exit verification still needs root authorization",
-                                unverifiable);
-                        transportStatusUntrusted = true;
-                        Thread.sleep(retryDelayMillis);
-                        retryDelayMillis = Math.min(
-                                retryDelayMillis * 2,
-                                VERIFICATION_RETRY_MAX_MILLIS
-                        );
-                        continue;
-                    } catch (IOException unreadable) {
-                        // A session that could not carry the observation proves nothing about the
-                        // process, so the exit stays unproven and its status unauthenticated.
-                        logWarning("Root exit verification could not observe the execution",
-                                unreadable);
-                        transportStatusUntrusted = true;
-                        Thread.sleep(retryDelayMillis);
-                        retryDelayMillis = Math.min(
-                                retryDelayMillis * 2,
-                                VERIFICATION_RETRY_MAX_MILLIS
-                        );
-                        continue;
-                    }
-                    if (observation == ExecutionOwnershipManager.Observation.EXITED) {
-                        exitCode = transportStatusUntrusted
-                                ? UNVERIFIED_TRANSPORT_EXIT_CODE
-                                : transportExitCode;
-                        exactExitProven = true;
-                        return;
-                    }
-                    // Still owned, no longer provably ours, or unreadable: either way this
-                    // observation cannot authenticate the transport's status, because a process
-                    // that outlived a detached client looks the same here.
-                    transportStatusUntrusted = true;
-                    Thread.sleep(pollDelayMillis);
-                    // Back off, so an execution whose process stays alive for hours is not observed
-                    // continuously for that whole lifetime.
-                    pollDelayMillis = Math.min(
-                            pollDelayMillis * 2,
-                            EXACT_EXIT_POLL_MAX_MILLIS
-                    );
-                }
+                transportExitCode = transport.awaitExit();
+                transportStatusBelongsToExecution = transport.exitStatusBelongsToLaunchedProcess();
+                outcome = verifyExit(transportExitCode, transportStatusBelongsToExecution);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                failure = new RootTransportException(
+                outcome = new Outcome(false, 0, new RootTransportException(
                         RootFailure.ROOT_TRANSPORT_FAILED,
                         "Root execution exit verification was interrupted",
                         e
-                );
+                ));
             } catch (RuntimeException e) {
-                failure = e;
+                outcome = new Outcome(false, 0, e);
             } finally {
                 terminal.countDown();
             }
+        }
+
+        /**
+         * Runs one bounded exit verification and reports what it could prove.
+         *
+         * <p>One call is one logical privileged operation: it either observes the recorded process
+         * gone through a single operation-scoped helper session, or reports the typed failure that
+         * prevented the observation. Nothing here retries and nothing here signals.</p>
+         */
+        private Outcome verifyExit(int transportExitCode, boolean statusBelongsToExecution) {
+            if (identity == null) {
+                // This handle is created only after creation confirmation already proved the
+                // launched process gone, so the exit is proven here and no further identity check
+                // is available or needed. Only the status still depends on whether the transport
+                // proved that the status it reports belongs to the launched process.
+                return statusBelongsToExecution
+                        ? new Outcome(true, transportExitCode, null)
+                        : new Outcome(true, 0, unauthenticatedExit(transportExitCode));
+            }
+            ExecutionOwnershipManager.Observation observation;
+            try {
+                observation = withHelperSession(
+                        ownershipManager -> ownershipManager.observe(identity)
+                );
+            } catch (RootTransportException rootUnavailable) {
+                return new Outcome(false, 0, exitVerificationUnavailable(rootUnavailable));
+            } catch (IOException unreadable) {
+                return new Outcome(false, 0, exitVerificationUnavailable(unreadable));
+            }
+            if (observation != ExecutionOwnershipManager.Observation.EXITED) {
+                return new Outcome(false, 0, new RootTransportException(
+                        RootFailure.EXECUTION_VERIFICATION_FAILED,
+                        "The recorded root execution was still observable as " + observation
+                                + " after its transport ended, so its exit cannot be verified"
+                                + " without polling for root authorization"
+                ));
+            }
+            return statusBelongsToExecution
+                    ? new Outcome(true, transportExitCode, null)
+                    : new Outcome(true, 0, unauthenticatedExit(transportExitCode));
+        }
+
+        /**
+         * Reports the typed result of a run whose process exit was proven while the transport could
+         * not prove that the status it reported belongs to the launched process.
+         */
+        private ExecutionExitStatusUnavailableException unauthenticatedExit(int transportExitCode) {
+            return new ExecutionExitStatusUnavailableException(
+                    "The exact root execution exited, but the status " + transportExitCode
+                            + " reported by its local transport client cannot be attributed to it"
+            );
+        }
+
+        /**
+         * Reports the single bounded exit verification attempt that could not be carried out, while
+         * durable evidence may still describe a live execution.
+         */
+        private RootTransportException exitVerificationUnavailable(Throwable cause) {
+            return new RootTransportException(
+                    RootFailure.ROOT_AUTHORIZATION_LOST,
+                    "Root capability is unavailable while the recorded execution may still be alive,"
+                            + " so its exit could not be verified",
+                    cause
+            );
         }
     }
 
@@ -1253,8 +1318,15 @@ public final class RootBackend implements PrivilegeBackend {
         private final AtomicBoolean launchShellClosed = new AtomicBoolean();
         /** Whether this execution's process exit has already been proven. */
         private final AtomicBoolean exitProven = new AtomicBoolean();
-        /** Exit status that was captured once, when the process exit was proven. */
+        /** Exit status captured once, when the process exit was proven. */
         private volatile int provenExitCode;
+        /**
+         * Set when the exact process exit is proven while its status cannot be attributed to it.
+         *
+         * <p>The handle then settles like any proven exit and still never reports an exit code, so
+         * no caller can feed an unattributed status into the ordinary Syncthing policy.</p>
+         */
+        private volatile ExecutionExitStatusUnavailableException exitStatusUnavailable;
         /** Whether the proven-exit settlement of this execution has already been started. */
         private final AtomicBoolean finalizationSettled = new AtomicBoolean();
         /** Counts down once the proven-exit settlement of this execution completed. */
@@ -1291,7 +1363,7 @@ public final class RootBackend implements PrivilegeBackend {
                         RootServeLogWriter.forRunDirectory(
                                 spool.directory(), logFile, logTemporaryDirectory
                         ),
-                        exitTracker::outputEnded,
+                        this::outputCannotGrowAnymore,
                         RootServeLogPump.POLL_MILLIS,
                         error -> logWarning("Could not reconcile root serve output", error)
                 );
@@ -1305,6 +1377,20 @@ public final class RootBackend implements PrivilegeBackend {
                 this.stdout = openOutputTail(spool);
                 this.exitTracker.start();
             }
+        }
+
+        /**
+         * Reports whether this run can no longer append output to its spool.
+         *
+         * <p>The serve log pump follows this run for as long as it may still produce output. A
+         * failed exit verification does not end that: the launched process may still be alive and
+         * may still write, so the pump keeps draining until the exact process is proven exited or
+         * an exact-ownership operation settles the run. Stopping the drain at a failed
+         * verification would let the settlement delete a spool whose remaining bytes never
+         * reached the shared log.</p>
+         */
+        private boolean outputCannotGrowAnymore() {
+            return exitProven.get() || exitTracker.exactExitProven();
         }
 
         /**
@@ -1416,23 +1502,41 @@ public final class RootBackend implements PrivilegeBackend {
                 // The local su client is only transport state. The exit tracker waits for
                 // that client and then independently proves the exact durable execution is gone
                 // before this handle may finalize its record or spool.
-                provenExitCode = exitTracker.awaitExit();
+                try {
+                    provenExitCode = exitTracker.awaitExit();
+                } catch (ExecutionExitStatusUnavailableException unavailable) {
+                    if (!exitTracker.exactExitProven()) {
+                        // The recorded process may still be alive, so nothing is finalized,
+                        // nothing is released, and nothing is signaled. A later explicit recovery
+                        // owns the decision.
+                        throw unavailable;
+                    }
+                    // The process exit itself is proven, so this run settles exactly like any
+                    // proven exit and still never reports an unattributed status as an exit code.
+                    exitStatusUnavailable = unavailable;
+                }
                 // From here on the process is proven gone, so every remaining step has to complete
                 // even when the caller interrupts the join below: an interrupted wait must not
                 // strand the durable record, the spool ownership, or the transport of an execution
                 // that exited.
                 exitProven.set(true);
             }
+            int settledExitCode;
             if (finalizationSettled.compareAndSet(false, true)) {
-                return settleProvenExit();
+                settledExitCode = settleProvenExit(true);
+            } else {
+                // A repeated await - for example the cleanup retry in SyncthingRunnable after an
+                // interrupted wait - waits until the settlement an earlier await already started
+                // has finished and then reports the same result. It never repeats the durable
+                // cleanup and never revisits the earlier decision to keep this run's spool for a
+                // later reconciliation.
+                finalizationFinished.await();
+                settledExitCode = provenExitCode;
             }
-            // A repeated await - for example the cleanup retry in SyncthingRunnable after an
-            // interrupted wait - waits until the settlement an earlier await already started has
-            // finished and then returns the same proven exit status. It never repeats the durable
-            // cleanup and never revisits the earlier decision to keep this run's spool for a later
-            // reconciliation.
-            finalizationFinished.await();
-            return provenExitCode;
+            if (exitStatusUnavailable != null) {
+                throw exitStatusUnavailable;
+            }
+            return settledExitCode;
         }
 
         /**
@@ -1443,11 +1547,14 @@ public final class RootBackend implements PrivilegeBackend {
          * dedicated launch shell. A spool whose output did not reach the shared log is retained for
          * a later reconciliation instead of being discarded together with its output.</p>
          *
+         * @param clearDurableRecord whether this settlement also removes the execution's durable
+         *     record; an external exact-ownership operation that already settled the record passes
+         *     {@code false} so the settlement never acquires root a second time
          * @return the proven exit status
          * @throws InterruptedException when the caller was interrupted while the serve log pump
          *     drained; the settlement itself has completed by then
          */
-        private int settleProvenExit() throws InterruptedException {
+        private int settleProvenExit(boolean clearDurableRecord) throws InterruptedException {
             boolean interruptedWhileJoining = false;
             try {
                 if (serveLogPump != null) {
@@ -1477,7 +1584,7 @@ public final class RootBackend implements PrivilegeBackend {
                 }
             } finally {
                 try {
-                    finishProvenExit();
+                    finishProvenExit(clearDurableRecord);
                 } finally {
                     finalizationFinished.countDown();
                 }
@@ -1499,9 +1606,12 @@ public final class RootBackend implements PrivilegeBackend {
          * reconciliation instead of being discarded together with its output. That retention is
          * sticky: once this execution has kept its spool for recovery, no later await may delete
          * it.</p>
+         *
+         * @param clearDurableRecord whether this settlement also removes the execution's durable
+         *     record; see {@link #settleProvenExit(boolean)}
          */
-        private void finishProvenExit() {
-            if (identity != null) {
+        private void finishProvenExit(boolean clearDurableRecord) {
+            if (clearDurableRecord && identity != null) {
                 try {
                     clearAfterExit(identity);
                 } catch (IOException | RuntimeException e) {
@@ -1531,9 +1641,44 @@ public final class RootBackend implements PrivilegeBackend {
             closeLaunchShellAfterExit();
         }
 
+        /**
+         * Settles this execution after an external exact-ownership operation proved it exited.
+         *
+         * <p>An execution whose caller stopped waiting after a failed exit verification may still
+         * have been running. Only an exact-ownership recovery operation may settle such an
+         * execution, and it proved the recorded process gone before calling this method. The
+         * settlement therefore never verifies, signals, or acquires root again: it releases exactly
+         * the local resources this invocation still owns, through the same single proven-exit
+         * settlement a completed wait runs.</p>
+         *
+         * <p>No authenticated exit status exists on this path, so the handle records the typed
+         * unauthenticated-exit result: a repeated wait must report that the exit was proven without
+         * a status instead of inventing one.</p>
+         */
+        @Override
+        public void settleAfterProvenExit() {
+            exitProven.set(true);
+            if (!finalizationSettled.compareAndSet(false, true)) {
+                // The execution already settled its own exit and reported the authenticated
+                // outcome; an external settlement must not replace it.
+                return;
+            }
+            exitStatusUnavailable = new ExecutionExitStatusUnavailableException(
+                    "The exact root execution exit was proven by an external ownership operation,"
+                            + " so no authenticated Syncthing exit status is available"
+            );
+            try {
+                settleProvenExit(false);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (RuntimeException e) {
+                logWarning("Could not settle an externally verified root execution", e);
+            }
+        }
+
         @Override
         public boolean exitProven() {
-            return exitProven.get();
+            return exitProven.get() || exitTracker.exactExitProven();
         }
 
         /** Closes the dedicated launch shell exactly once, after its process is proven exited. */

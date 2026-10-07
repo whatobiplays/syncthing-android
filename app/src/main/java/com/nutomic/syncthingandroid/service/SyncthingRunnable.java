@@ -20,6 +20,8 @@ import com.nutomic.syncthingandroid.R;
 import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
+import com.nutomic.syncthingandroid.runtime.ExecutionExitStatusUnavailableException;
+import com.nutomic.syncthingandroid.runtime.ExecutionExitUnverifiedException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
@@ -75,6 +77,7 @@ public class SyncthingRunnable implements Runnable {
             EXECUTION_STARTED,
             IDENTITY_UNAVAILABLE,
             EXECUTION_EXITED,
+            EXIT_UNVERIFIED,
             RECOVERY_BLOCKED,
             GUI_PORT_UNAVAILABLE,
             LAUNCH_CANCELLED,
@@ -118,6 +121,19 @@ public class SyncthingRunnable implements Runnable {
         static LifecycleOutcome exited(ExecutionIdentity identity, int exitCode) {
             return new LifecycleOutcome(
                     Type.EXECUTION_EXITED, identity, exitCode, true, true, null
+            );
+        }
+
+        /**
+         * Reports an execution that ended without an authenticated Syncthing exit status.
+         *
+         * <p>{@code exitProven} is true when the backend proved the launched process gone and only
+         * the exit status stayed unauthenticated; it is false when the exit could not be verified
+         * at all, so the launched process may still be alive.</p>
+         */
+        static LifecycleOutcome exitUnverified(ExecutionIdentity identity, boolean exitProven) {
+            return new LifecycleOutcome(
+                    Type.EXIT_UNVERIFIED, identity, -1, true, exitProven, null
             );
         }
 
@@ -349,6 +365,9 @@ public class SyncthingRunnable implements Runnable {
         boolean executionExitObserved = false;
         boolean aborted = false;
         boolean launchCancelled = false;
+        ExecutionExitStatusUnavailableException exitStatusUnavailable = null;
+        ExecutionExitUnverifiedException exitUnverified = null;
+        boolean exitVerifiedGone = false;
         try {
             // Android 11 blocks local discovery if we did not acquire MulticastLock.
             WifiManager wifi = (WifiManager) mContext.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -452,6 +471,17 @@ public class SyncthingRunnable implements Runnable {
         } catch (LifecycleLaunchPermit.CancelledException e) {
             if (!mWaitForAdmission) throw e;
             launchCancelled = true;
+        } catch (ExecutionExitStatusUnavailableException unavailable) {
+            // The bundled process never supplied an authenticated exit status. The value is kept
+            // away from the restart and crash policy below, which must never see a status the
+            // backend could not attribute to Syncthing.
+            exitStatusUnavailable = unavailable;
+            exitVerifiedGone = execution != null && execution.exitProven();
+        } catch (ExecutionExitUnverifiedException unverified) {
+            // The exit verification itself failed, so the launched process may still be alive.
+            // The lifecycle reports the typed unverified outcome and keeps the owned execution
+            // instead of running the restart or crash policy on a status that does not exist.
+            exitUnverified = unverified;
         } catch (IOException | InterruptedException e) {
             aborted = true;
             Log.e(TAG, "Failed to execute syncthing binary or read output", e);
@@ -474,13 +504,36 @@ public class SyncthingRunnable implements Runnable {
                             interrupted = true;
                         }
                     }
-                    while (!executionExitObserved) {
+                    // A run that already received a typed exit outcome never waits again: a
+                    // repeated wait would be a second privileged verification operation for the
+                    // same run, and the typed outcome already carries the failure to the service.
+                    while (!executionExitObserved && exitStatusUnavailable == null
+                            && exitUnverified == null) {
                         try {
                             exitCode = execution.await();
                             executionExitObserved = true;
                         } catch (InterruptedException e) {
                             interrupted = true;
+                        } catch (ExecutionExitStatusUnavailableException unavailable) {
+                            // The unauthenticated outcome is sticky, so a repeated wait reports it
+                            // again instead of being reinterpreted as a real exit.
+                            exitStatusUnavailable = unavailable;
+                            exitVerifiedGone = execution.exitProven();
+                            break;
+                        } catch (ExecutionExitUnverifiedException unverified) {
+                            // An unverified exit is not retried here: polling for the exit would
+                            // defeat the bounded reacquisition rule, and the lifecycle outcome
+                            // below carries the failure to the service instead.
+                            exitUnverified = unverified;
+                            break;
                         }
+                    }
+                    if (exitUnverified != null) {
+                        // The runnable stops waiting even though the launched process may still be
+                        // alive, so the execution's settlement belongs to runtime recovery now: the
+                        // runtime keeps its admission and the run's resources until an exact-ownership
+                        // operation proves the exit.
+                        mRuntime.handOffExecutionSettlement(execution);
                     }
                     if (interrupted) Thread.currentThread().interrupt();
                 }
@@ -488,6 +541,19 @@ public class SyncthingRunnable implements Runnable {
                     publishLifecycleOutcome(
                             LifecycleOutcome.exited(execution.identity(), exitCode)
                     );
+                }
+                if (mWaitForAdmission && exitStatusUnavailable != null) {
+                    publishLifecycleOutcome(LifecycleOutcome.exitUnverified(
+                            execution.identity(), exitVerifiedGone
+                    ));
+                }
+                if (mWaitForAdmission && exitUnverified != null) {
+                    // The exit could not be verified at all, so the launched process may still be
+                    // alive: the service keeps the owned execution and only an exact-ownership
+                    // shutdown may replace it later.
+                    publishLifecycleOutcome(LifecycleOutcome.exitUnverified(
+                            execution.identity(), false
+                    ));
                 }
             }
             if (mWaitForAdmission && execution == null) {
@@ -497,6 +563,15 @@ public class SyncthingRunnable implements Runnable {
             }
         }
 
+        if (!mWaitForAdmission && exitStatusUnavailable != null) {
+            // A one-shot caller owns its own failure reporting, so it sees the typed result.
+            throw exitStatusUnavailable;
+        }
+        if (!mWaitForAdmission && exitUnverified != null) {
+            // The one-shot caller sees the mode-neutral unverified failure, with the backend
+            // failure that caused it attached.
+            throw exitUnverified;
+        }
         if (!mWaitForAdmission && executionExitObserved) {
             execution.requireIdentityForSuccessfulOneShotResult();
         }

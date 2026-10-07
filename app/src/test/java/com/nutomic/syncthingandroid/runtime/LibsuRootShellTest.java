@@ -428,4 +428,80 @@ public class LibsuRootShellTest {
             throw new IllegalStateException("the transport process cannot be destroyed");
         }
     }
+
+    @Test
+    public void parsesTheParentProcessIdentifierOfAStatLine() {
+        assertEquals(
+                4242,
+                LibsuRootShell.parseParentProcessId(ScriptedLibsuShell.ATTACHED_STAT_LINE)
+        );
+        assertEquals(
+                "the executable name may contain spaces and parentheses",
+                4242,
+                LibsuRootShell.parseParentProcessId("77 (we)ird (name) S 4242 77 77")
+        );
+    }
+
+    @Test
+    public void reportsAnUnprovableParentProcessIdentifierAsZero() {
+        assertEquals(0, LibsuRootShell.parseParentProcessId(null));
+        assertEquals(0, LibsuRootShell.parseParentProcessId("not a stat line"));
+        assertEquals(0, LibsuRootShell.parseParentProcessId("77 (sh) S"));
+        assertEquals(0, LibsuRootShell.parseParentProcessId("77 (sh) S zero 77 77"));
+        assertEquals(0, LibsuRootShell.parseParentProcessId("77 (sh) S 0 77 77"));
+    }
+
+    @Test
+    public void provenanceIsProvenOnlyForAShellThatIsTheClientItself() throws Exception {
+        LibsuRootShell attached = new LibsuRootShell(
+                new ScriptedLibsuShell(ScriptedLibsuShell.ATTACHED_STAT_LINE, null),
+                new DestroyRecordingProcess(),
+                1_000
+        );
+        attached.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+
+        assertTrue(
+                "a client that the shell replaced owns every status the shell reports",
+                attached.exitStatusBelongsToLaunchedProcess()
+        );
+
+        LibsuRootShell detached = new LibsuRootShell(
+                new ScriptedLibsuShell(ScriptedLibsuShell.DETACHED_STAT_LINE, null),
+                new DestroyRecordingProcess(),
+                1_000
+        );
+        detached.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+
+        assertFalse(
+                "a shell that outlived its client never owns the status that client reports",
+                detached.exitStatusBelongsToLaunchedProcess()
+        );
+    }
+
+    @Test
+    public void unreadableProvenanceStaysUnprovableInsteadOfFailingTheShell() throws Exception {
+        LibsuRootShell transport = new LibsuRootShell(
+                new ScriptedLibsuShell(null, new IllegalStateException("the transport died")),
+                new DestroyRecordingProcess(),
+                1_000
+        );
+
+        transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+
+        assertFalse(transport.exitStatusBelongsToLaunchedProcess());
+    }
+
+    @Test
+    public void provenanceIsRecordedOnceWhileTheClientIsStillAlive() throws Exception {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(
+                ScriptedLibsuShell.DETACHED_STAT_LINE, null
+        );
+        LibsuRootShell transport = new LibsuRootShell(shell, new DestroyRecordingProcess(), 1_000);
+
+        transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+        transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+
+        assertFalse(transport.exitStatusBelongsToLaunchedProcess());
+        assertEquals("the shell is asked exactly once", 1, shell.statReads());
+    }
 }

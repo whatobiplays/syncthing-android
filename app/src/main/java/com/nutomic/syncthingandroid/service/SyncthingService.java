@@ -863,6 +863,9 @@ public class SyncthingService extends Service {
                 clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
                 if (mShutdownInProgress && outcome.exitObserved()) checkShutdownRecovery();
                 break;
+            case EXIT_UNVERIFIED:
+                handleExitUnverified(outcome);
+                break;
             case RECOVERY_BLOCKED:
                 handleRecoveryBlocked(outcome.recoveryAssessment());
                 break;
@@ -1026,6 +1029,67 @@ public class SyncthingService extends Service {
         }
         if (mStartupReadiness != null) mStartupReadiness.cancel();
         shutdown(State.ERROR, null, true);
+    }
+
+    /**
+     * Handles an execution that ended without an authenticated Syncthing exit status.
+     *
+     * <p>The run never reaches the restart or crash policy in this case, because no authenticated
+     * status exists to classify. A proven exit means the child is gone and only its status stayed
+     * unavailable; an unproven exit means the launched process may still be alive, so the durable
+     * handle is kept and only an exact-ownership shutdown may replace it later.</p>
+     */
+    private void handleExitUnverified(SyncthingRunnable.LifecycleOutcome outcome) {
+        mLastExecutionExitProven = outcome.exitObserved();
+        if (outcome.exitObserved() && sameExecution(mOwnedExecution, outcome.identity())) {
+            mOwnedExecution = null;
+        }
+        UnverifiedExitResolutionPolicy.Resolution resolution =
+                UnverifiedExitResolutionPolicy.resolution(
+                        mShutdownInProgress,
+                        outcome.exitObserved(),
+                        mShutdownWorkerStarted || mShutdownRecoveryCheckStarted,
+                        mShutdownExitProven
+                );
+        if (resolution == UnverifiedExitResolutionPolicy.Resolution.ACCOUNT_PROVEN_EXIT) {
+            mShutdownExitProven = true;
+            clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+            checkShutdownRecovery();
+            return;
+        }
+        if (resolution == UnverifiedExitResolutionPolicy.Resolution.AWAIT_SHUTDOWN) {
+            // The shutdown resolves this execution through its own exact-ownership steps: the
+            // bounded shutdown worker proves or refutes the exit independently of the failed
+            // verification, and the post-shutdown recovery check reclassifies what remains. Keep
+            // that machinery - and the restart it may be completing - in charge instead of
+            // reporting the unverified wait as a failed restart. A shutdown that already proved
+            // the exit may still be waiting for the lifecycle thread to terminate before its
+            // recovery check can start, so asking for that check here guarantees the deferred
+            // resolution runs even though this wait published no proven exit.
+            clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+            checkShutdownRecovery();
+            return;
+        }
+        mShutdownStartIntent.clear();
+        if (mStartupReadiness != null) {
+            mStartupReadiness.cancel();
+            mStartupReadiness = null;
+        }
+        cancelStartupRequests();
+        mRestApi = null;
+        mRecoveryRestApi = null;
+        clearWorkerHandlesWhenStopped(mSyncthingRunnableThread);
+        synchronized (mStateLock) {
+            onServiceStateChange(State.ERROR);
+        }
+        if (mNotificationHandler != null) {
+            mNotificationHandler.showCrashedNotification(
+                    R.string.notification_crash_title,
+                    outcome.exitObserved()
+                            ? "Syncthing exited without an authenticated exit status"
+                            : "Syncthing exit could not be verified; the process may still be running"
+            );
+        }
     }
 
     private void handleRecoveryBlocked(

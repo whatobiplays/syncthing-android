@@ -34,7 +34,9 @@ public enum RootFailure {
     ROOT_AUTHORIZATION_LOST,
     /**
      * A launched process could not be proven to be the exact execution this backend started, and
-     * the process had not already exited. The unverified process is left untouched.
+     * the process had not already exited. The same cause covers a recorded execution that is still
+     * present after its transport ended, because its exit can then no longer be observed without
+     * polling for root authorization. The unverified process is left untouched.
      */
     EXECUTION_VERIFICATION_FAILED,
     /**

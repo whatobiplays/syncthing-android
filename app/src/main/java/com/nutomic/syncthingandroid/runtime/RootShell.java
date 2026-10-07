@@ -11,13 +11,12 @@ import java.util.List;
  * operation-scoped helper or the dedicated launch shell of exactly one bundled Syncthing
  * invocation, and it is never shared between the two roles.</p>
  *
- * <p>The dedicated launch shell is a raw launch transport. The activation boundary captures
- * its immutable kernel identity through {@link #pid()}, {@link #listProcesses()} and
- * {@link #readBootId()} while that boundary establishes and verifies the shell, before any
- * caller designates the shell as the launch transport. After designation the shell performs
- * exactly one audited terminal {@link #execTerminalScript(String)} and no helper or
- * process-metadata operation; the remaining lifecycle operations ({@link #hasExited()},
- * {@link #awaitExit()} and {@link #close()}) never run a command.</p>
+ * <p>Before a shell is designated as a launch transport, the activation boundary captures its
+ * immutable kernel identity through {@link #pid()}, {@link #listProcesses()} and
+ * {@link #readBootId()}. After the designation the shell performs exactly one audited terminal
+ * {@link #execTerminalScript(String)} and no helper or process-metadata operation; the remaining
+ * lifecycle operations ({@link #hasExited()}, {@link #awaitExit()} and {@link #close()}) never run
+ * a command.</p>
  *
  * <p>{@link #execTerminalScript(String)} transports raw launch text and is restricted to the
  * audited typed launch path inside this package. It must never become a general command API for
@@ -52,11 +51,11 @@ interface RootShell extends AutoCloseable {
     }
 
     /**
-     * Lists every process entry visible to a UID-0 shell.
+     * Lists the process entries visible to this UID-0 shell.
      *
-     * <p>This is a helper-session operation. The activation boundary reads the list once while
-     * it captures the identity of a dedicated launch transport, and the transport runs no
-     * process listing after designation.</p>
+     * <p>This is a helper-session operation. The activation boundary reads the list once while it
+     * captures the identity of the dedicated launch transport, and that transport runs no process
+     * listing after the designation.</p>
      */
     List<ProcessEntry> listProcesses() throws IOException;
 
@@ -70,13 +69,13 @@ interface RootShell extends AutoCloseable {
     /**
      * Returns the kernel process identifier of this shell's own transport process.
      *
-     * <p>The identifier names the process that a launch script replaces by {@code exec}, so durable
-     * pre-delivery state can be matched against the live process after an application restart. It
-     * is a transport identity accessor, not a command surface: implementations answer it from
-     * their own process state and never from caller-supplied text.</p>
+     * <p>The identifier names the process that the launch script replaces by {@code exec}, so the
+     * durable pre-delivery state can be matched against the live process after an application
+     * restart. This is a transport identity accessor, not a command surface: implementations
+     * answer it from their own process state and never from caller-supplied text.</p>
      *
-     * <p>Only the activation boundary calls this on a dedicated launch transport, and only
-     * before that transport is designated, so a launch shell answers it during activation or
+     * <p>Only the activation boundary calls this on the dedicated launch transport, and only
+     * before the transport is designated, so a launch shell answers it during activation or
      * never.</p>
      *
      * @throws IOException when the shell cannot report its process identifier
@@ -84,7 +83,7 @@ interface RootShell extends AutoCloseable {
     int pid() throws IOException;
 
     /**
-     * Sends one signal to a target the ownership manager has verified.
+     * Sends one signal that the target ownership manager has verified.
      *
      * @return {@code true} when the kernel accepted the signal delivery request
      */
@@ -93,8 +92,8 @@ interface RootShell extends AutoCloseable {
     /**
      * Writes the single audited launch script to this shell's standard input.
      *
-     * <p>The script ends in a terminal {@code exec} of the bundled binary. After a successful call
-     * the shell process belongs to Syncthing, so the shell must not be reused, written to, or
+     * <p>The script ends in the terminal {@code exec} of the bundled binary. After a successful
+     * call the shell process belongs to Syncthing, so the shell must not be reused, written to, or
      * closed while that process may still be alive.</p>
      */
     void execTerminalScript(String script) throws IOException;
@@ -103,26 +102,44 @@ interface RootShell extends AutoCloseable {
      * Reports whether this shell transport's underlying client process terminated.
      *
      * <p>This is transport state, not exact execution ownership evidence. Daemon-backed root
-     * managers may keep the UID-0 process alive after their local {@code su} client disappears, so
-     * callers must independently verify an owned launch before treating this as process exit.</p>
+     * managers may keep the UID-0 process alive after the local {@code su} client disappears, so
+     * callers must verify the owned launch independently before treating this as a process
+     * exit.</p>
      */
     boolean hasExited();
 
     /**
      * Blocks until this shell transport's underlying client process terminates.
      *
-     * <p>The returned status is the launched process status only while the transport stayed
-     * attached through that process's exit. Exact execution state must be verified separately
-     * before cleanup or lifecycle finalization.</p>
+     * <p>The returned status is the launched process's status only while the transport stayed
+     * attached through the process's exit; {@link #exitStatusBelongsToLaunchedProcess()} reports
+     * whether that is the case. Exact execution state must be verified separately before any
+     * cleanup or lifecycle finalization.</p>
      */
     int awaitExit() throws InterruptedException;
+
+    /**
+     * Reports whether {@link #awaitExit()}'s status is the launched process's own status.
+     *
+     * <p>Only a transport whose local client process is replaced by the shell it drives can
+     * attribute the exit status to the launched process: the terminal {@code exec} then turns that
+     * client into the bundled process, so the awaited status is Syncthing's own status. A transport
+     * whose local client stays a separate process, or that cannot prove the relationship, must
+     * report {@code false}: the status then describes the client and may be reported even while
+     * the UID-0 process keeps running.</p>
+     *
+     * <p>The value is determined inside the transport boundary while the shell is still alive and
+     * is immutable afterwards, so it can be read after the client has exited. It never authorizes
+     * cleanup or signaling by itself.</p>
+     */
+    boolean exitStatusBelongsToLaunchedProcess();
 
     /**
      * Reads the kernel boot identifier that scopes durable process identity.
      *
      * <p>This is a helper-session operation. The activation boundary reads it once while it
-     * captures the identity of a dedicated launch transport, and the transport runs no
-     * boot identifier read after designation.</p>
+     * captures the identity of the dedicated launch transport, and that transport runs no boot
+     * identifier read after the designation.</p>
      */
     String readBootId() throws IOException;
 
