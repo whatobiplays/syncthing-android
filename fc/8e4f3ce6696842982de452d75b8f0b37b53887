@@ -1,0 +1,23 @@
+app/src/test/java/com/nutomic/syncthingandroid/runtime/RootBackendTest.java
+  s_7995548deb2efc::t_0ac67cbcebe5d4 538,560-564,566-567,2018-2020,2294-2590,3302-3329
+app/src/main/java/com/nutomic/syncthingandroid/runtime/RootBackend.java
+  s_7995548deb2efc::t_caa7fc06a8535e 554-557,573,575,577-579,653,655-657,659-663,665-668,670-681,693-697,817-826,1078-1235,1251,1284,1286,1294,1302-1306,1318,1320,1322,1357-1358,1368,1381-1383,1416-1419
+app/src/test/java/com/nutomic/syncthingandroid/runtime/FakeRootTransport.java
+  s_7995548deb2efc::t_c6bb50f83a7416 12,106-107,115-120,123,343-358,488,506,589-593,606-608,618,624-635
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc8e4f3ce6696842982de452d75b8f0b37b53887",
+  "prompts": {},
+  "sessions": {
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
