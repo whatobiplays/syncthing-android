@@ -1,0 +1,31 @@
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShell.java
+  s_7995548deb2efc::t_acae1396120f7a 158-160,163,175,315-334
+  s_7995548deb2efc::t_d7e9294261fb7e 335-336
+app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactoryTest.java
+  s_7995548deb2efc::t_67a7b1253c4fa0 379,385,390,398-429
+  s_7995548deb2efc::t_e6f55e7429d8b5 430-431
+app/src/test/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellTest.java
+  s_7995548deb2efc::t_3be1995703becf 518
+  s_7995548deb2efc::t_d7fdfbc8912caf 519-520,533
+  s_7995548deb2efc::t_67a7b1253c4fa0 483,485-486,493-517,521-532
+app/src/test/java/com/nutomic/syncthingandroid/runtime/ScriptedLibsuShell.java
+  s_7995548deb2efc::t_c223b9b6a2f145 23-26,45-47,96-113,116,186-189,193-195,199,202,232,246
+app/src/main/java/com/nutomic/syncthingandroid/runtime/LibsuRootShellFactory.java
+  s_7995548deb2efc::t_acae1396120f7a 144-146,148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "76249c6f3b349461b330991e78b97af5d8d9389f",
+  "prompts": {},
+  "sessions": {
+    "s_7995548deb2efc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10867-2353-78a0-b300-309c703462a9",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
