@@ -150,6 +150,22 @@ final class CertificateVerificationState {
     }
 
     /**
+     * Terminates failure recovery when the shutdown required for rollback cannot be proven safe.
+     *
+     * <p>No file rollback runs here: the old execution may still be live. The workflow does become
+     * terminal and reports failure exactly once so callers never remain stuck waiting for a
+     * continuation that shutdown discarded.</p>
+     */
+    boolean failFailureRecoveryShutdown(Runnable notifyFailure) {
+        if (mPhase != Phase.FAILURE_RECOVERY) return false;
+        mAutomaticContinuationAllowed = false;
+        mPendingStartResolution = false;
+        mPhase = Phase.FINISHED;
+        notifyFailure.run();
+        return true;
+    }
+
+    /**
      * Creates the post-shutdown recovery action for a genuine verification failure.
      *
      * <p>Restart permission and Run Conditions are checked when the action executes, after the

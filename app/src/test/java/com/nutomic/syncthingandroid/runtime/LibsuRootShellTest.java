@@ -250,6 +250,17 @@ public class LibsuRootShellTest {
         );
     }
 
+    @Test
+    public void processListScriptCannotFailBecauseTheLastProcEntryVanished() {
+        String script = LibsuRootShell.processListScript();
+
+        assertTrue(
+                "process enumeration must force a successful aggregate shell status after the"
+                        + " per-process best-effort reads",
+                script.trim().endsWith("true")
+        );
+    }
+
     /**
      * A libsu shell double whose close always fails, either with the declared I/O failure or
      * with an unchecked state error, and whose jobs block until they are cancelled, so the

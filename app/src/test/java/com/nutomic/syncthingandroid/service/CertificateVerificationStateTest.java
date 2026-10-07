@@ -303,6 +303,26 @@ public class CertificateVerificationStateTest {
         }
     }
 
+    @Test
+    public void shutdownFailureTerminatesCertificateRecoveryAndNotifiesOnce() {
+        CertificateVerificationState state = new CertificateVerificationState();
+        state.beginVerification();
+        state.onStarting();
+        assertEquals(
+                CertificateVerificationState.Outcome.FAILURE,
+                state.onVerificationResult(false)
+        );
+        AtomicInteger notifications = new AtomicInteger();
+
+        assertTrue(state.failFailureRecoveryShutdown(notifications::incrementAndGet));
+        assertFalse(state.isWorkflowActive());
+        assertFalse(state.automaticContinuationAllowed());
+        assertEquals(1, notifications.get());
+
+        assertFalse(state.failFailureRecoveryShutdown(notifications::incrementAndGet));
+        assertEquals("terminal failure is reported only once", 1, notifications.get());
+    }
+
     private static void assertFailureRollsBack(CertificateFiles files,
                                                CertificateVerificationState state,
                                                CertificateVerificationState.Outcome outcome,

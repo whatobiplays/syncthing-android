@@ -1,8 +1,9 @@
 package com.nutomic.syncthingandroid.runtime;
 
+import com.nutomic.syncthingandroid.service.SyncthingLogFile;
+
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -30,7 +31,10 @@ final class ExecutionOutputLog {
      * when the execution's output belongs there.
      *
      * <p>The stream is always drained to its end, whether or not bytes are saved, so an execution
-     * can never stall behind an unread stream.</p>
+     * can never stall behind an unread stream. Saved output goes through
+     * {@link SyncthingLogFile#append(File, byte[])} for each line instead of holding one file
+     * descriptor for the lifetime of the execution. The log therefore cannot be rotated out from
+     * under an active writer.</p>
      *
      * @param sharedLogFile durable log that receives the saved lines
      * @param execution execution whose output is drained
@@ -62,25 +66,13 @@ final class ExecutionOutputLog {
     ) {
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(output, StandardCharsets.UTF_8))) {
-            FileOutputStream sharedLog = null;
-            try {
+            String line;
+            while ((line = reader.readLine()) != null) {
                 if (saveToSharedLog) {
-                    // Appending, creating the file on demand, is available on every supported API
-                    // level, unlike the java.nio.file helpers.
-                    sharedLog = new FileOutputStream(sharedLogFile, true);
-                }
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (sharedLog != null) {
-                        sharedLog.write((line + "\n").getBytes(StandardCharsets.UTF_8));
-                    }
-                }
-                if (sharedLog != null) {
-                    sharedLog.flush();
-                }
-            } finally {
-                if (sharedLog != null) {
-                    sharedLog.close();
+                    SyncthingLogFile.append(
+                            sharedLogFile,
+                            (line + "\n").getBytes(StandardCharsets.UTF_8)
+                    );
                 }
             }
         } catch (IOException e) {

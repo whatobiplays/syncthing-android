@@ -249,6 +249,7 @@ public final class OwnedExecutionShutdown {
         Outcome ownership = currentOwnership(identity, control);
         if (ownership != null) return ownership;
 
+        Outcome ownershipAfterRequestRegistration = null;
         RestShutdownRequest request = null;
         RequestLease requestLease = null;
         boolean requestRegistered = false;
@@ -264,17 +265,31 @@ public final class OwnedExecutionShutdown {
                 request.setTerminalListener(preparedLease::observeTerminal);
                 if (registerPendingRequest(requestLease)) {
                     requestRegistered = true;
-                    try {
-                        if (!request.send()) {
-                            requestLease.observeTerminal();
-                            request = null;
-                            requestLease = null;
-                            requestRegistered = false;
+
+                    // Preparing the HTTP request can take long enough for the execution we verified
+                    // above to exit. The registered lease now excludes every replacement launch,
+                    // so this is the last safe point to re-verify the exact owner before the
+                    // endpoint-scoped request can become deliverable. If A is already gone or no
+                    // longer ours, never let a request prepared for A reach a later execution B.
+                    ownershipAfterRequestRegistration = currentOwnership(identity, control);
+                    if (ownershipAfterRequestRegistration != null) {
+                        requestLease.observeTerminal();
+                        request = null;
+                        requestLease = null;
+                        requestRegistered = false;
+                    } else {
+                        try {
+                            if (!request.send()) {
+                                requestLease.observeTerminal();
+                                request = null;
+                                requestLease = null;
+                                requestRegistered = false;
+                            }
+                        } catch (RuntimeException | Error uncertainDelivery) {
+                            // Keep the lease: Volley may have accepted the request before failing.
+                            // Continue bounded exact-owner shutdown; only terminal observation can
+                            // release replacement launch after uncertain delivery.
                         }
-                    } catch (RuntimeException | Error uncertainDelivery) {
-                        // Keep the lease: Volley may have accepted the request before failing.
-                        // Continue bounded exact-owner shutdown; only terminal observation can
-                        // release replacement launch after uncertain delivery.
                     }
                 } else {
                     // A process start owns the short launch boundary, or the prepared request is
@@ -290,28 +305,34 @@ public final class OwnedExecutionShutdown {
         }
         Outcome result;
         try {
-            Outcome afterRest = waitThenCheck(identity, REST_SHUTDOWN_WAIT_MS, control, waiter);
-            if (afterRest != null) {
-                result = afterRest;
+            if (ownershipAfterRequestRegistration != null) {
+                result = ownershipAfterRequestRegistration;
             } else {
-                Outcome sigint = signalAndWait(
-                        identity,
-                        ExecutionOwnershipManager.Signal.SIGINT,
-                        SIGINT_WAIT_MS,
-                        control,
-                        waiter
+                Outcome afterRest = waitThenCheck(
+                        identity, REST_SHUTDOWN_WAIT_MS, control, waiter
                 );
-                if (sigint != null && sigint != Outcome.SIGNAL_FAILED) {
-                    result = sigint;
+                if (afterRest != null) {
+                    result = afterRest;
                 } else {
-                    Outcome sigkill = signalAndWait(
+                    Outcome sigint = signalAndWait(
                             identity,
-                            ExecutionOwnershipManager.Signal.SIGKILL,
-                            SIGKILL_WAIT_MS,
+                            ExecutionOwnershipManager.Signal.SIGINT,
+                            SIGINT_WAIT_MS,
                             control,
                             waiter
                     );
-                    result = sigkill == null ? Outcome.EXIT_NOT_PROVEN : sigkill;
+                    if (sigint != null && sigint != Outcome.SIGNAL_FAILED) {
+                        result = sigint;
+                    } else {
+                        Outcome sigkill = signalAndWait(
+                                identity,
+                                ExecutionOwnershipManager.Signal.SIGKILL,
+                                SIGKILL_WAIT_MS,
+                                control,
+                                waiter
+                        );
+                        result = sigkill == null ? Outcome.EXIT_NOT_PROVEN : sigkill;
+                    }
                 }
             }
         } catch (InterruptedException interrupted) {

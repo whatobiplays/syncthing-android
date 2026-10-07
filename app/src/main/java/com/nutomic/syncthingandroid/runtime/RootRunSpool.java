@@ -422,7 +422,18 @@ final class RootRunSpool {
 
     /** Opens the blocking reader that streams this run's output as the process writes it. */
     InputStream openOutputTail(RootShell shell) throws IOException {
-        return new SpoolTailInputStream(outputFile(), shell::hasExited, OUTPUT_POLL_MILLIS);
+        return openOutputTail(shell::hasExited);
+    }
+
+    /**
+     * Opens the blocking reader with an execution-level liveness source.
+     *
+     * <p>Root transports whose local {@code su} client is only a proxy must use exact execution
+     * liveness here instead of client-process liveness, otherwise a dead proxy can truncate output
+     * while the UID-0 Syncthing process is still running.</p>
+     */
+    InputStream openOutputTail(SpoolTailInputStream.Liveness liveness) throws IOException {
+        return new SpoolTailInputStream(outputFile(), liveness, OUTPUT_POLL_MILLIS);
     }
 
     /**

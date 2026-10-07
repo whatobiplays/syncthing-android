@@ -16,7 +16,6 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 
 import com.google.common.base.Charsets;
-import com.google.common.io.Files;
 import com.nutomic.syncthingandroid.R;
 import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
@@ -596,7 +595,10 @@ public class SyncthingRunnable implements Runnable {
                     }
                     */
                     // Always output SynchtingNative's output to "syncthing.log".
-                    Files.append(line + "\n", mSyncthingLogFile, Charsets.UTF_8);
+                    SyncthingLogFile.append(
+                            mSyncthingLogFile,
+                            (line + "\n").getBytes(Charsets.UTF_8)
+                    );
                 }
             } catch (IOException e) {
                 Log.w(TAG, "Failed to read Syncthing's command line output", e);

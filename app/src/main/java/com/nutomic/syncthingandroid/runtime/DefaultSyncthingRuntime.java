@@ -209,11 +209,11 @@ public final class DefaultSyncthingRuntime
                     == ExecutionOwnershipManager.Classification.OWNED_EXECUTION) {
                 if (recoveryHandler == null
                         || !recoveryHandler.stopOwnedExecution(recovery.ownedExecution())) {
-                    throw new ExecutionRecoveryException(recovery);
+                    throw recoveryBlocked(recovery, launchCheck);
                 }
                 recovery = backend.recoverExecutions();
             }
-            if (!recovery.mayLaunch()) throw new ExecutionRecoveryException(recovery);
+            if (!recovery.mayLaunch()) throw recoveryBlocked(recovery, launchCheck);
 
             // Preparation - rooted activation above all - is slow, can prompt, and can fail, so it
             // runs before the process-start reservation is taken and never holds that reservation.
@@ -221,15 +221,7 @@ public final class DefaultSyncthingRuntime
             try {
                 preparation = backend.prepareLaunch(command, environment);
             } catch (ExecutionRecoveryException preparationBlocked) {
-                // A preparation-time recovery classification is the same non-launchable verdict
-                // as the final classification under the reservation, so it has to settle the
-                // lifecycle permit the same way. Without this, a concurrent STOP could revoke a
-                // permit that the worker would have settled as recovery-blocked, and the launch
-                // would report cancellation instead of the recovery failure that decided the
-                // outcome. A revocation that already won stays the reported outcome, because
-                // commitRecoveryBlocked() then throws CancelledException.
-                if (launchCheck != null) launchCheck.commitRecoveryBlocked();
-                throw preparationBlocked;
+                throw recoveryBlocked(preparationBlocked.assessment(), launchCheck);
             }
             boolean started = false;
             try {
@@ -243,8 +235,7 @@ public final class DefaultSyncthingRuntime
                     ExecutionOwnershipManager.RecoveryAssessment finalRecovery =
                             preparation.classifyLaunch();
                     if (!finalRecovery.mayLaunch()) {
-                        if (launchCheck != null) launchCheck.commitRecoveryBlocked();
-                        throw new ExecutionRecoveryException(finalRecovery);
+                        throw recoveryBlocked(finalRecovery, launchCheck);
                     }
                     // Every slow or fallible step already ran during preparation, so the committed
                     // launch check sits directly in front of process creation. A check that refuses
@@ -271,6 +262,21 @@ public final class DefaultSyncthingRuntime
             admission.release();
             throw e;
         }
+    }
+
+    /**
+     * Settles every non-launchable recovery verdict against lifecycle cancellation before the
+     * verdict can escape the runtime. A STOP that already revoked the launch therefore remains the
+     * terminal outcome at the initial, preparation, and final recovery boundaries alike.
+     */
+    private static ExecutionRecoveryException recoveryBlocked(
+            ExecutionOwnershipManager.RecoveryAssessment recovery,
+            LifecycleLaunchCheck launchCheck
+    ) {
+        if (launchCheck != null) {
+            launchCheck.commitRecoveryBlocked();
+        }
+        return new ExecutionRecoveryException(recovery);
     }
 
     public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {

@@ -258,6 +258,8 @@ public class SyncthingService extends Service {
     @Nullable
     private Runnable mAfterShutdown;
     @Nullable
+    private Runnable mAfterShutdownFailure;
+    @Nullable
     private ActionRestartContinuation mActionRestartContinuation;
     @Nullable
     private ActionResetDeltasContinuation mActionResetDeltasContinuation;
@@ -1497,9 +1499,29 @@ public class SyncthingService extends Service {
             boolean duringStartup,
             boolean mutationBeforeDeferredCompletion
     ) {
+        shutdown(
+                newState,
+                afterShutdown,
+                duringStartup,
+                mutationBeforeDeferredCompletion,
+                null
+        );
+    }
+
+    private void shutdown(
+            State newState,
+            @Nullable Runnable afterShutdown,
+            boolean duringStartup,
+            boolean mutationBeforeDeferredCompletion,
+            @Nullable Runnable afterShutdownFailure
+    ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mHandler.post(() -> shutdown(
-                    newState, afterShutdown, duringStartup, mutationBeforeDeferredCompletion
+                    newState,
+                    afterShutdown,
+                    duringStartup,
+                    mutationBeforeDeferredCompletion,
+                    afterShutdownFailure
             ));
             return;
         }
@@ -1508,7 +1530,13 @@ public class SyncthingService extends Service {
             mStartingShutdownDeferral.defer();
             Log.w(TAG, "Deferring shutdown until State.STARTING was left");
             mHandler.postDelayed(() -> {
-                shutdown(newState, afterShutdown, false, mutationBeforeDeferredCompletion);
+                shutdown(
+                        newState,
+                        afterShutdown,
+                        false,
+                        mutationBeforeDeferredCompletion,
+                        afterShutdownFailure
+                );
             }, 1000);
             return;
         }
@@ -1538,6 +1566,9 @@ public class SyncthingService extends Service {
                             afterShutdown, mAfterShutdown
                     )
                     : appendCompletion(mAfterShutdown, afterShutdown);
+            mAfterShutdownFailure = appendCompletion(
+                    mAfterShutdownFailure, afterShutdownFailure
+            );
             if (mShutdownRestApi == null) mShutdownRestApi = restApi;
             return;
         }
@@ -1549,6 +1580,7 @@ public class SyncthingService extends Service {
         mShutdownRecoveryCheckStarted = false;
         mShutdownRestApi = restApi;
         mAfterShutdown = afterShutdown;
+        mAfterShutdownFailure = afterShutdownFailure;
 
         if (mOwnedExecution != null) {
             startShutdownWorker(mOwnedExecution, restApi);
@@ -1602,6 +1634,7 @@ public class SyncthingService extends Service {
                 () -> mAfterShutdown = null,
                 this::cancelActionResetDeltasContinuation
         );
+        runShutdownFailureContinuation();
         mShutdownRestApi = null;
         failFileMutationBarrier();
         synchronized (mStateLock) {
@@ -1616,9 +1649,26 @@ public class SyncthingService extends Service {
         }
     }
 
+    /** Runs and clears work that must terminally resolve if shutdown itself fails. */
+    private void runShutdownFailureContinuation() {
+        Runnable failure = mAfterShutdownFailure;
+        mAfterShutdownFailure = null;
+        if (failure == null) return;
+        try {
+            failure.run();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Shutdown failure continuation failed", e);
+        }
+    }
+
     /** Reclassifies after exit so no callback can mutate state while another candidate remains. */
     private void checkShutdownRecovery() {
-        if (!mShutdownInProgress || !mShutdownExitProven || mShutdownRecoveryCheckStarted) return;
+        if (!mShutdownInProgress
+                || !mShutdownExitProven
+                || mShutdownWorkerStarted
+                || mShutdownRecoveryCheckStarted) {
+            return;
+        }
         Thread lifecycleThread = mSyncthingRunnableThread;
         boolean started = LifecycleShutdownBarrier.runWhenReady(
                 mShutdownExitProven,
@@ -1693,6 +1743,7 @@ public class SyncthingService extends Service {
                     () -> mAfterShutdown = null,
                     this::cancelActionResetDeltasContinuation
             );
+            runShutdownFailureContinuation();
             mShutdownRestApi = null;
             failFileMutationBarrier();
             synchronized (mStateLock) {
@@ -1710,6 +1761,7 @@ public class SyncthingService extends Service {
 
         Runnable completion = mAfterShutdown;
         mAfterShutdown = null;
+        mAfterShutdownFailure = null;
         mShutdownRestApi = null;
         mShutdownInProgress = false;
         mShutdownRecoveryCheckStarted = false;
@@ -2533,7 +2585,14 @@ public class SyncthingService extends Service {
                     },
                     () -> mLastDeterminedShouldRun,
                     () -> launchStartupTask(SyncthingCommand.SERVE),
-                    () -> onServiceStateChange(State.DISABLED),
+                    () -> {
+                        // An explicit STOP can suppress certificate recovery's relaunch while a
+                        // later Run Conditions transition creates a generic deferred start. Clear
+                        // that generic intent at the exact remain-stopped decision so
+                        // runShutdownCompletion cannot bypass the certificate workflow's STOP.
+                        mShutdownStartIntent.clear();
+                        onServiceStateChange(State.DISABLED);
+                    },
                     () -> {
                         clearStopHandler.run();
                         listener.onResult(HttpsCertReplaceResult.FAILED,
@@ -2541,7 +2600,23 @@ public class SyncthingService extends Service {
                     }
             );
             if (hasServiceExecution()) {
-                shutdown(State.INIT, restoreAndRelaunch, true);
+                Runnable shutdownFailure = () -> verification.failFailureRecoveryShutdown(
+                        () -> {
+                            clearStopHandler.run();
+                            listener.onResult(
+                                    HttpsCertReplaceResult.FAILED,
+                                    "Could not prove Syncthing stopped; certificate recovery was"
+                                            + " not safe to complete."
+                            );
+                        }
+                );
+                shutdown(
+                        State.INIT,
+                        restoreAndRelaunch,
+                        true,
+                        false,
+                        shutdownFailure
+                );
             } else {
                 restoreAndRelaunch.run();
             }

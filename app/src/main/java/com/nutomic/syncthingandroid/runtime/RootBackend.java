@@ -551,9 +551,10 @@ public final class RootBackend implements PrivilegeBackend {
      * manager proved to be this launch's own process.
      *
      * <p>The candidate is signaled only after the ownership manager re-verifies it inside the
-     * preparation's own helper session. The wait for its exit is bounded by
-     * {@link #awaitExitWithinCleanupWindow(RootShell)}, so a process that outlives the signal cannot
-     * make cleanup hang. A candidate that cannot be identified, or whose exit is not proven inside
+     * preparation's own helper session. The wait for its exit is bounded by an
+     * exact-identity observation loop, so a local {@code su} client that disappears independently
+     * can never authorize cleanup of a daemon-side root process that is still alive. A candidate
+     * that cannot be identified, or whose exit is not proven inside
      * that window, keeps its shell, its evidence, and its run spool, so no unverified process is
      * touched and no evidence is destroyed.</p>
      */
@@ -569,16 +570,13 @@ public final class RootBackend implements PrivilegeBackend {
         } catch (IOException | RuntimeException e) {
             logWarning("Could not identify the unrecorded root launch", e);
         }
+        ExecutionOwnershipManager manager = ownershipManagerFor(helperShell);
         boolean signaled = launched != null
-                && ownershipManagerFor(helperShell).signalIfOwned(
-                        launched, ExecutionOwnershipManager.Signal.SIGKILL)
+                && manager.signalIfOwned(launched, ExecutionOwnershipManager.Signal.SIGKILL)
                 == ExecutionOwnershipManager.SignalAttempt.SIGNALED;
-        if (signaled) {
-            awaitExitWithinCleanupWindow(launchShell);
-        }
-        if (launchShell.hasExited()) {
-            // The possible execution is proven gone, so its transport and its evidence may be
-            // released and its run spool stops blocking a replacement launch.
+        if (signaled && awaitOwnedExitWithinCleanupWindow(manager, launched)) {
+            // Exact process identity, not the local transport client, proved the launched process
+            // gone. Only now may its transport and durable state be released.
             releaseProvenGoneLaunch(launchShell, spool);
         }
     }
@@ -652,21 +650,35 @@ public final class RootBackend implements PrivilegeBackend {
     }
 
     /**
-     * Waits for the launch transport's own process to exit inside the bounded post-signal window.
+     * Waits for one exactly owned process to be proven gone inside the bounded post-signal window.
      *
-     * <p>Failure cleanup must never wait without a bound: an accepted signal does not prove that the
-     * process ended, and an unbounded wait would leave a launch that can no longer reach its caller
-     * hanging forever. The wait observes only the launch transport's own liveness, so it runs no
-     * command and acquires no root shell, and it stops at a monotonic deadline derived from
-     * {@link OwnedExecutionShutdown#SIGKILL_WAIT_MS}. A caller interrupt is preserved and reported as
-     * "exit not proven", because a caller must never close a transport whose process state is
-     * unknown.</p>
+     * <p>The local {@code su} process is only transport state on daemon-backed root managers. It
+     * may disappear while the UID-0 execution continues, so cleanup authority comes only from a
+     * fresh exact-identity observation through the already-owned helper session.</p>
      *
-     * @return whether process exit was proven inside the bounded window
+     * <p>No observation is started once the window is exhausted. A single observation can still
+     * overrun it, because the transport bounds each helper operation with its own operation
+     * timeout and a timed-out operation ends that session: an unresponsive helper therefore delays
+     * the unproven-exit answer by at most one operation timeout, and the caller keeps its
+     * fail-closed outcome because a stopped helper yields no proof of exit.</p>
      */
-    private boolean awaitExitWithinCleanupWindow(RootShell shell) {
+    private boolean awaitOwnedExitWithinCleanupWindow(
+            ExecutionOwnershipManager manager,
+            ExecutionIdentity identity
+    ) {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(cleanupExitWaitMillis);
-        while (!shell.hasExited()) {
+        while (true) {
+            if (deadline - System.nanoTime() <= 0) {
+                // No budget left for another observation, so the exit stays unproven.
+                return false;
+            }
+            ExecutionOwnershipManager.Observation observation = manager.observe(identity);
+            if (observation == ExecutionOwnershipManager.Observation.EXITED) {
+                return true;
+            }
+            if (observation != ExecutionOwnershipManager.Observation.OWNED) {
+                return false;
+            }
             long remainingNanos = deadline - System.nanoTime();
             if (remainingNanos <= 0) {
                 return false;
@@ -678,10 +690,13 @@ public final class RootBackend implements PrivilegeBackend {
                 ));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return shell.hasExited();
+                if (deadline - System.nanoTime() <= 0) {
+                    return false;
+                }
+                return manager.observe(identity)
+                        == ExecutionOwnershipManager.Observation.EXITED;
             }
         }
-        return true;
     }
 
     /**
@@ -799,11 +814,16 @@ public final class RootBackend implements PrivilegeBackend {
             try {
                 return create(reservation);
             } catch (IOException | RuntimeException e) {
-                // A failed start returns no execution handle: the possible process, its durable
-                // evidence, and its transport stay untouched for ordinary exact-ownership
-                // recovery, so this preparation gives up only its in-process spool ownership.
-                // Everything a failed launch already proved gone released its own lease while it
-                // cleaned up.
+                // A failed start returns no execution handle, so this preparation must also give
+                // up its instance-local bookkeeping. Durable execution evidence remains the
+                // authority for later recovery; keeping these fields would permanently reject
+                // every later preparation even after the failed launch was proven gone.
+                if (preparedSpool == spool) {
+                    preparedSpool = null;
+                }
+                if (activeSpool == spool) {
+                    activeSpool = null;
+                }
                 spool.releaseLease();
                 throw e;
             } finally {
@@ -1055,6 +1075,164 @@ public final class RootBackend implements PrivilegeBackend {
         }
     }
 
+    /**
+     * Completes one execution's exit observation after its local transport ended.
+     *
+     * <p>The transport's own status is the execution's status only while that transport stayed
+     * attached through the process's exit, which a daemon-backed root manager is not required to
+     * do: its local client can disappear while the exact process keeps running. Attachment cannot
+     * be observed after the fact, so the tracker propagates the transport status only when the
+     * verification attempt that begins at the transport's end immediately observes the exact
+     * process gone. Every other outcome - unavailable authorization, an unreadable observation, a
+     * replaced session, or a process that is present because it outlived the transport - leaves
+     * the status unauthenticated, and the execution is reported through the unverified-transport
+     * status instead. The residual of that rule is a process that exits within the latency of the
+     * first attempt after its client detached: no later inspection can tell that apart from an
+     * attached exit, and the window cannot be closed without holding a privileged session for the
+     * lifetime of the execution.</p>
+     *
+     * <p>Verification is retried, not failed, while root authorization is unavailable or the
+     * recorded process cannot be inspected: an execution that cannot be verified yet keeps runtime
+     * admission, durable record, run spool, and transport until its exact process is proven gone,
+     * so an unprovable exit can never release a replacement launch. Every attempt is bounded, each
+     * observation runs as one operation-scoped helper session that is closed again before the wait
+     * that follows it, and nothing here signals a process.</p>
+     */
+    private final class RootProcessExitTracker implements Runnable {
+        /** Reported when the transport's status does not authenticate the execution's own exit. */
+        private static final int UNVERIFIED_TRANSPORT_EXIT_CODE = 1;
+        /** First delay between observations while the recorded process is still present. */
+        private static final long EXACT_EXIT_POLL_MILLIS = 100;
+        /** Upper bound of that delay, so a detached execution is observed at a bounded cadence. */
+        private static final long EXACT_EXIT_POLL_MAX_MILLIS = 5_000;
+        /** First delay before an exit observation that could not be made is retried. */
+        private static final long VERIFICATION_RETRY_MILLIS = 1_000;
+        /** Upper bound of that delay, so an unavailable root request is not repeated endlessly. */
+        private static final long VERIFICATION_RETRY_MAX_MILLIS = 30_000;
+
+        private final RootShell transport;
+        private final ExecutionIdentity identity;
+        private final CountDownLatch terminal = new CountDownLatch(1);
+        private volatile boolean exactExitProven;
+        private volatile RuntimeException failure;
+        private volatile int exitCode;
+        private Thread thread;
+
+        RootProcessExitTracker(RootShell transport, ExecutionIdentity identity) {
+            this.transport = Objects.requireNonNull(transport);
+            this.identity = identity;
+        }
+
+        void start() {
+            thread = new Thread(this, "root-process-exit");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        /** Output readers stop only when exact exit is proven or exit verification itself failed. */
+        boolean outputEnded() {
+            return exactExitProven || failure != null;
+        }
+
+        int awaitExit() throws InterruptedException {
+            terminal.await();
+            if (failure != null) {
+                throw failure;
+            }
+            return exitCode;
+        }
+
+        @Override
+        public void run() {
+            try {
+                int transportExitCode = transport.awaitExit();
+                if (identity == null) {
+                    // This handle is created only after creation confirmation already proved the
+                    // launched process gone, so no further identity check is available or needed.
+                    exitCode = transportExitCode;
+                    exactExitProven = true;
+                    return;
+                }
+
+                // The transport stayed attached through the process's exit only if the exact
+                // process was already gone when the transport ended, and only the observation made
+                // by the attempt that begins here can confirm that state. A failed attempt, an
+                // unreadable read, a replaced session, or a process that is still present all mean
+                // the process may have outlived its detached client, and none of them can be told
+                // apart from that later on.
+                boolean transportStatusUntrusted = false;
+                long retryDelayMillis = VERIFICATION_RETRY_MILLIS;
+                long pollDelayMillis = EXACT_EXIT_POLL_MILLIS;
+                while (true) {
+                    ExecutionOwnershipManager.Observation observation;
+                    try {
+                        // Each observation is one bounded, operation-scoped helper operation, so no
+                        // privileged session survives into the wait that follows it.
+                        observation = withHelperSession(
+                                ownershipManager -> ownershipManager.observe(identity)
+                        );
+                    } catch (RootTransportException unverifiable) {
+                        // Fail closed without failing permanently. Root authorization can be
+                        // unavailable exactly when the local transport ends - denied, absent, or
+                        // simply slower than the bounded activation window - and it can return, so
+                        // an unproven exit keeps admission, durable record, spool, and transport
+                        // and retries instead of stranding the runtime behind a terminal failure.
+                        logWarning("Root exit verification still needs root authorization",
+                                unverifiable);
+                        transportStatusUntrusted = true;
+                        Thread.sleep(retryDelayMillis);
+                        retryDelayMillis = Math.min(
+                                retryDelayMillis * 2,
+                                VERIFICATION_RETRY_MAX_MILLIS
+                        );
+                        continue;
+                    } catch (IOException unreadable) {
+                        // A session that could not carry the observation proves nothing about the
+                        // process, so the exit stays unproven and its status unauthenticated.
+                        logWarning("Root exit verification could not observe the execution",
+                                unreadable);
+                        transportStatusUntrusted = true;
+                        Thread.sleep(retryDelayMillis);
+                        retryDelayMillis = Math.min(
+                                retryDelayMillis * 2,
+                                VERIFICATION_RETRY_MAX_MILLIS
+                        );
+                        continue;
+                    }
+                    if (observation == ExecutionOwnershipManager.Observation.EXITED) {
+                        exitCode = transportStatusUntrusted
+                                ? UNVERIFIED_TRANSPORT_EXIT_CODE
+                                : transportExitCode;
+                        exactExitProven = true;
+                        return;
+                    }
+                    // Still owned, no longer provably ours, or unreadable: either way this
+                    // observation cannot authenticate the transport's status, because a process
+                    // that outlived a detached client looks the same here.
+                    transportStatusUntrusted = true;
+                    Thread.sleep(pollDelayMillis);
+                    // Back off, so an execution whose process stays alive for hours is not observed
+                    // continuously for that whole lifetime.
+                    pollDelayMillis = Math.min(
+                            pollDelayMillis * 2,
+                            EXACT_EXIT_POLL_MAX_MILLIS
+                    );
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failure = new RootTransportException(
+                        RootFailure.ROOT_TRANSPORT_FAILED,
+                        "Root execution exit verification was interrupted",
+                        e
+                );
+            } catch (RuntimeException e) {
+                failure = e;
+            } finally {
+                terminal.countDown();
+            }
+        }
+    }
+
     /** One admitted root Syncthing execution. */
     private final class RootProcessExecution implements Execution {
         private final RootShell shell;
@@ -1070,6 +1248,7 @@ public final class RootBackend implements PrivilegeBackend {
         private final boolean exitedBeforeIdentityCapture;
         private final RootRunSpool spool;
         private final RootServeLogPump serveLogPump;
+        private final RootProcessExitTracker exitTracker;
         private final InputStream stdout;
         private final AtomicBoolean launchShellClosed = new AtomicBoolean();
         /** Whether this execution's process exit has already been proven. */
@@ -1102,7 +1281,9 @@ public final class RootBackend implements PrivilegeBackend {
             this.identity = identity;
             this.exitedBeforeIdentityCapture = exitedBeforeIdentityCapture;
             this.spool = spool;
+            this.exitTracker = new RootProcessExitTracker(shell, identity);
             if (serveOutput) {
+                this.exitTracker.start();
                 // A long-running run owns its own output: one pump moves spool bytes into the
                 // shared log while the process runs and drains the rest after it exits. No caller
                 // receives the same bytes a second time.
@@ -1110,7 +1291,7 @@ public final class RootBackend implements PrivilegeBackend {
                         RootServeLogWriter.forRunDirectory(
                                 spool.directory(), logFile, logTemporaryDirectory
                         ),
-                        shell::hasExited,
+                        exitTracker::outputEnded,
                         RootServeLogPump.POLL_MILLIS,
                         error -> logWarning("Could not reconcile root serve output", error)
                 );
@@ -1118,7 +1299,11 @@ public final class RootBackend implements PrivilegeBackend {
                 this.stdout = new ByteArrayInputStream(new byte[0]);
             } else {
                 this.serveLogPump = null;
-                this.stdout = openOutputTail(spool, shell);
+                // Opening the one-shot tail can fail and has its own exact-owner cleanup. Do not
+                // start the independent exit tracker until that last fallible construction step
+                // succeeds, or both paths could race to inspect and settle the same failed launch.
+                this.stdout = openOutputTail(spool);
+                this.exitTracker.start();
             }
         }
 
@@ -1130,11 +1315,11 @@ public final class RootBackend implements PrivilegeBackend {
          * transport or deletes the run spool directly: it is settled through exact ownership, and
          * every unproven outcome leaves the possible execution untouched.</p>
          */
-        private InputStream openOutputTail(RootRunSpool runSpool, RootShell runShell) {
+        private InputStream openOutputTail(RootRunSpool runSpool) {
             try {
-                return runSpool.openOutputTail(runShell);
+                return runSpool.openOutputTail(exitTracker::outputEnded);
             } catch (IOException e) {
-                settleUnavailableOutputTail(runSpool, runShell);
+                settleUnavailableOutputTail(runSpool, shell);
                 throw new RootTransportException(
                         RootFailure.ROOT_TRANSPORT_FAILED,
                         "Could not open the root run output spool",
@@ -1169,8 +1354,8 @@ public final class RootBackend implements PrivilegeBackend {
          * Releases one confirmed execution whose output tail could not be opened.
          *
          * <p>The exactly recorded process is re-verified before it is signaled, and the transport,
-         * the durable record, and the spool are released only after its exit was proven inside the
-         * bounded window of {@link RootBackend#awaitExitWithinCleanupWindow(RootShell)}. A process
+         * the durable record, and the spool are released only after its exact identity was proven
+         * exited inside the bounded post-signal window. A process
          * that outlives that window keeps its transport, its evidence, and its spool, and this
          * operation reports the original output failure instead of waiting forever.</p>
          *
@@ -1180,8 +1365,8 @@ public final class RootBackend implements PrivilegeBackend {
                 RootRunSpool runSpool,
                 RootShell runShell
         ) {
+            ExecutionOwnershipManager manager = ownershipManagerFor(helperShell);
             try {
-                ExecutionOwnershipManager manager = ownershipManagerFor(helperShell);
                 if (manager.observe(identity) != ExecutionOwnershipManager.Observation.OWNED) {
                     return false;
                 }
@@ -1193,10 +1378,9 @@ public final class RootBackend implements PrivilegeBackend {
                 logWarning("Could not verify the launched root execution", e);
                 return false;
             }
-            awaitExitWithinCleanupWindow(runShell);
-            if (!runShell.hasExited()) {
-                // The exact process is still alive after a requested signal, so nothing may be
-                // closed or deleted; a later recovery keeps the complete durable state.
+            if (!awaitOwnedExitWithinCleanupWindow(manager, identity)) {
+                // Exact identity still has not proven exit after the bounded signal wait, so
+                // neither a dead local transport nor an accepted signal may authorize cleanup.
                 return false;
             }
             try {
@@ -1229,9 +1413,10 @@ public final class RootBackend implements PrivilegeBackend {
         @Override
         public int await() throws InterruptedException {
             if (!exitProven.get()) {
-                // The terminal exec replaced the root shell, so this is Syncthing's own exit
-                // status.
-                provenExitCode = shell.awaitExit();
+                // The local su client is only transport state. The exit tracker waits for
+                // that client and then independently proves the exact durable execution is gone
+                // before this handle may finalize its record or spool.
+                provenExitCode = exitTracker.awaitExit();
                 // From here on the process is proven gone, so every remaining step has to complete
                 // even when the caller interrupts the join below: an interrupted wait must not
                 // strand the durable record, the spool ownership, or the transport of an execution

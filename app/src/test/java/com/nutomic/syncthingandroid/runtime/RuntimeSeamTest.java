@@ -835,6 +835,38 @@ public class RuntimeSeamTest {
         assertEquals(2, backend.recoveryChecks);
     }
 
+    @Test
+    public void revocationDuringInitialRecoveryBeatsBlockedRecoverySettlement() throws Exception {
+        BlockedInitialRecoveryBackend backend = new BlockedInitialRecoveryBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<RuntimeException> launch = startCancellableLaunch(
+                    worker,
+                    runtime,
+                    true,
+                    permitLifecycleCheck(permit, new AtomicInteger())
+            );
+            assertTrue(
+                    "the launch must enter its initial recovery classification",
+                    backend.recoveryEntered.await(5, TimeUnit.SECONDS)
+            );
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+            backend.allowBlockedRecovery.countDown();
+
+            RuntimeException outcome = launch.get(5, TimeUnit.SECONDS);
+            assertTrue(
+                    "a STOP that already revoked startup must stay the terminal outcome: " + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException
+            );
+            assertEquals(0, backend.startCount);
+        } finally {
+            backend.allowBlockedRecovery.countDown();
+            worker.shutdownNow();
+        }
+    }
+
     /**
      * A recovery failure raised while the launch is being prepared must settle the lifecycle permit
      * exactly like the final classification taken under the process-start reservation, so a STOP
@@ -1859,6 +1891,24 @@ public class RuntimeSeamTest {
      * A backend whose launch preparation performs the recovery classification that forbids a
      * launch, exactly as both production backends do before they prepare root capability.
      */
+    private static final class BlockedInitialRecoveryBackend extends RecordingBackend {
+        private final CountDownLatch recoveryEntered = new CountDownLatch(1);
+        private final CountDownLatch allowBlockedRecovery = new CountDownLatch(1);
+        private final AtomicInteger calls = new AtomicInteger();
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            if (calls.getAndIncrement() == 0) {
+                recoveryEntered.countDown();
+                awaitLatch(allowBlockedRecovery);
+                return RecoveryAssessmentFixture.ambiguousMissingRecord();
+            }
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+    }
+
     private static final class BlockedPreparationBackend extends RecordingBackend {
         private final CountDownLatch preparationEntered = new CountDownLatch(1);
         private final CountDownLatch allowPreparationFailure = new CountDownLatch(1);

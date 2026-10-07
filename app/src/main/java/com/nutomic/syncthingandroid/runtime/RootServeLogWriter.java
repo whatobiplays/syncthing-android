@@ -84,8 +84,7 @@ final class RootServeLogWriter {
             throw new IOException("Could not create the directory of the shared Syncthing log");
         }
         long appended = 0;
-        try (RandomAccessFile source = new RandomAccessFile(outputFile, "r");
-             FileOutputStream log = new FileOutputStream(logFile, true)) {
+        try (RandomAccessFile source = new RandomAccessFile(outputFile, "r")) {
             source.seek(consumed);
             byte[] buffer = new byte[CHUNK_BYTES];
             while (consumed + appended < length) {
@@ -94,9 +93,7 @@ final class RootServeLogWriter {
                 if (read <= 0) {
                     break;
                 }
-                log.write(buffer, 0, read);
-                log.flush();
-                log.getFD().sync();
+                SyncthingLogFile.appendDurably(logFile, buffer, 0, read);
                 appended += read;
                 writeConsumedOffset(consumed + appended);
             }

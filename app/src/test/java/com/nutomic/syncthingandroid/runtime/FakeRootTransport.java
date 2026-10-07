@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -102,6 +103,8 @@ final class FakeRootTransport {
         boolean failBootIdRead;
         /** When true, reading a run token fails. */
         boolean failRunTokenRead;
+        /** When true, a failed helper operation ends its shell, as a real helper timeout does. */
+        boolean helperOperationFailureEndsTransport;
         /** When true, the kernel rejects every signal. */
         boolean rejectSignals;
         /**
@@ -109,9 +112,15 @@ final class FakeRootTransport {
          * models a process that outlives the bounded post-signal cleanup window.
          */
         boolean surviveSignals;
+        /**
+         * When true, the local su transport client is considered exited even though the daemon-side
+         * launched process remains alive. This models daemon-backed root transports such as Magisk.
+         */
+        boolean transportClientExitedEarly;
+        int transportClientExitCode = 125;
 
         /** Command-like operations each shell ran, as {@code "<shell index>:<operation>"}. */
-        final List<String> shellOperations = new ArrayList<>();
+        final List<String> shellOperations = new CopyOnWriteArrayList<>();
 
         int acquisitions;
         int shellCloses;
@@ -331,6 +340,22 @@ final class FakeRootTransport {
             return addProcess(executablePath, nextTicks++, runToken);
         }
 
+        /**
+         * Whether a launched bundled process is currently live, for test-only pause predicates.
+         *
+         * <p>Only a launched process carries a run token: a shell transport is a root shell
+         * process without one, and that distinction is what lets a test pause exactly the work
+         * that runs after the terminal exec.</p>
+         */
+        boolean hasLiveLaunchedProcess() {
+            for (Entry entry : processes.values()) {
+                if (entry.alive && entry.runToken != null) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /** Returns the only live bundled process, failing the test when that is not the state. */
         Entry onlyLiveProcess() {
             List<Entry> live = new ArrayList<>();
@@ -460,6 +485,7 @@ final class FakeRootTransport {
             recordOperation("listProcesses");
             awaitGate();
             if (device.failProcessListing) {
+                endTransportAfterFailedOperation();
                 throw new IOException("Simulated failure while listing processes");
             }
             List<ProcessEntry> entries = new ArrayList<>();
@@ -477,6 +503,7 @@ final class FakeRootTransport {
             recordOperation("readRunToken");
             awaitGate();
             if (device.failRunTokenRead) {
+                endTransportAfterFailedOperation();
                 throw new IOException("Simulated failure while reading a run token");
             }
             Entry entry = device.processes.get(pid);
@@ -559,7 +586,11 @@ final class FakeRootTransport {
                     Thread.currentThread().interrupt();
                 }
             }
-            return launched != null && !launched.alive;
+            if (closed) {
+                // Closing a transport ends it, exactly as the real root shell wrapper does.
+                return true;
+            }
+            return launched != null && (device.transportClientExitedEarly || !launched.alive);
         }
 
         /** Binds this shell to an existing process entry, as a launch shell is bound to its launch. */
@@ -572,6 +603,9 @@ final class FakeRootTransport {
             if (launched == null) {
                 throw new IllegalStateException("A helper shell has no launched process to await");
             }
+            if (device.transportClientExitedEarly) {
+                return device.transportClientExitCode;
+            }
             launched.exited.await();
             return launched.exitCode;
         }
@@ -581,9 +615,22 @@ final class FakeRootTransport {
             requireOpen();
             recordOperation("readBootId");
             if (device.failBootIdRead) {
+                endTransportAfterFailedOperation();
                 throw new IOException("Simulated failure while reading the boot identifier");
             }
             return Device.BOOT_ID;
+        }
+
+        /**
+         * Models the transport teardown a real helper operation does after it fails.
+         *
+         * <p>A real helper operation that times out closes its shell, so every later read on that
+         * transport fails and its owner has to acquire a replacement.</p>
+         */
+        private void endTransportAfterFailedOperation() {
+            if (device.helperOperationFailureEndsTransport) {
+                close();
+            }
         }
 
         @Override

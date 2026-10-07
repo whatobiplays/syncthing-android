@@ -154,6 +154,13 @@ final class LibsuRootShell implements RootShell {
         }
     }
 
+    /**
+     * Reports local {@code su} client termination only.
+     *
+     * <p>libsu may be backed by a root-manager daemon whose UID-0 child outlives this Java
+     * {@link Process}; RootBackend therefore treats this only as the trigger for exact process
+     * re-verification and never as cleanup authority by itself.</p>
+     */
     @Override
     public boolean hasExited() {
         try {
@@ -167,15 +174,12 @@ final class LibsuRootShell implements RootShell {
     }
 
     /**
-     * Waits for the root transport process and reports its exit status.
+     * Waits for the local {@code su} transport client and reports that client's exit status.
      *
-     * <p>The terminal launch script ends in {@code exec}, which replaces the shell process image
-     * with the bundled binary. From that point on the shell can no longer answer libsu jobs, so
-     * libsu's own job framing cannot report an exit status for this invocation; the only reliable
-     * observation left is the lifetime of the root transport process the application started and
-     * owns. Because the script replaced that process image, the status it exits with is the
-     * bundled binary's own status - including the requested-restart status the service policy
-     * distinguishes - so it is reported unchanged rather than translated.</p>
+     * <p>For a directly attached root shell this normally tracks the terminal {@code exec} and
+     * preserves Syncthing's exit status. Daemon-backed root managers can decouple the client from
+     * the UID-0 process, however, so RootBackend independently verifies the durable process
+     * identity before it treats this status as the execution's terminal result.</p>
      */
     @Override
     public int awaitExit() throws InterruptedException {
@@ -273,7 +277,8 @@ final class LibsuRootShell implements RootShell {
                 + "readlink \"$standroid_proc/exe\" 2>/dev/null\n"
                 + "echo " + STAT_MARKER + "\n"
                 + "cat \"$standroid_proc/stat\" 2>/dev/null\n"
-                + "done\n";
+                + "done\n"
+                + "true\n";
     }
 
     /**

@@ -99,13 +99,21 @@ interface RootShell extends AutoCloseable {
      */
     void execTerminalScript(String script) throws IOException;
 
-    /** Reports whether the underlying process already terminated. */
+    /**
+     * Reports whether this shell transport's underlying client process terminated.
+     *
+     * <p>This is transport state, not exact execution ownership evidence. Daemon-backed root
+     * managers may keep the UID-0 process alive after their local {@code su} client disappears, so
+     * callers must independently verify an owned launch before treating this as process exit.</p>
+     */
     boolean hasExited();
 
     /**
-     * Blocks until the underlying process terminates.
+     * Blocks until this shell transport's underlying client process terminates.
      *
-     * @return the exit status the kernel reported for the launched process
+     * <p>The returned status is the launched process status only while the transport stayed
+     * attached through that process's exit. Exact execution state must be verified separately
+     * before cleanup or lifecycle finalization.</p>
      */
     int awaitExit() throws InterruptedException;
 
