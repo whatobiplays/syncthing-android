@@ -376,23 +376,57 @@ public class LibsuRootShellFactoryTest {
 
     @Test
     public void unreadableProvenanceNeverFailsAVerifiedAcquisition() {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(null, null).failProvenanceCommand();
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         RootShell acquired = new LibsuRootShellFactory().acquire(
                 60_000,
                 process,
-                (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
-                        null, new IllegalStateException("the transport died")
-                ),
+                (transportProcess, timeoutSeconds) -> shell,
                 ScriptedLibsuShell.OWNER_PROCESS_ID
         );
 
         assertFalse(acquired.exitStatusBelongsToLaunchedProcess());
+        assertEquals("the provenance probe ran exactly once", 1, shell.statReads());
         assertEquals(
                 "an unprovable answer must leave the verified transport untouched",
                 0,
                 process.destroyCount()
         );
+    }
+
+    @Test
+    public void deadShellDuringTheProvenanceProbeFailsAcquisition() {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(null, null, null, true)
+                .dieDuringProvenanceProbe();
+        DestroyCountingProcess process = new DestroyCountingProcess();
+
+        try {
+            new LibsuRootShellFactory().acquire(
+                    60_000,
+                    process,
+                    (transportProcess, timeoutSeconds) -> shell,
+                    ScriptedLibsuShell.OWNER_PROCESS_ID
+            );
+            fail("a dead shell must not be returned as a successful acquisition");
+        } catch (RootTransportException expected) {
+            assertEquals(RootFailure.ROOT_TRANSPORT_FAILED, expected.failure());
+            assertTrue(
+                    "the failed command that revealed the dead shell stays the primary cause",
+                    expected.getCause() instanceof IOException
+            );
+            assertTrue(
+                    expected.getCause().getMessage().contains("The root shell command failed")
+            );
+        }
+
+        assertEquals("UID 0 was verified before the probe ran", 1, shell.statReads());
+        assertEquals(
+                "the dead transport must be torn down through the wrapper",
+                1,
+                shell.closeAttempts()
+        );
+        assertEquals("the privileged transport process must be released", 1, process.destroyCount());
     }
 
     @Test

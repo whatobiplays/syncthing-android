@@ -155,13 +155,12 @@ final class LibsuRootShell implements RootShell {
      * <p>The question can be answered only while the client is alive, so the answer is recorded
      * here and read later through {@link #exitStatusBelongsToLaunchedProcess()}. An unreadable
      * answer alone never fails the acquisition; it only means the status stays unattributable.
-     * A probe that invalidated the transport while failing, such as a helper operation that
-     * timed out or was interrupted and tore the transport down, does fail the acquisition: a
-     * closed transport must never be handed out as a verified shell.</p>
+     * A probe whose failure left the transport unusable, because our own teardown closed it or
+     * because the shell itself died while the probe ran, does fail the acquisition with the
+     * probe's own failure: a dead transport must never be handed out as a verified shell.</p>
      *
      * @param ownerProcessId process identifier of the application process that owns this transport
-     * @throws IOException when the failure that made the answer unreadable also invalidated the
-     *                     transport
+     * @throws IOException when the failed probe left the shell transport unusable
      */
     void determineExitStatusProvenance(int ownerProcessId) throws IOException {
         synchronized (this) {
@@ -173,7 +172,7 @@ final class LibsuRootShell implements RootShell {
                 int parentPid = parentProcessId();
                 exitStatusBelongsToLaunchedProcess = parentPid > 0 && parentPid == ownerProcessId;
             } catch (IOException | RuntimeException unprovable) {
-                if (transportInvalidatedByFailedOperation) {
+                if (!isTransportUsable()) {
                     throw unprovable;
                 }
                 exitStatusBelongsToLaunchedProcess = false;
@@ -310,6 +309,28 @@ final class LibsuRootShell implements RootShell {
             close();
         } catch (RuntimeException ignored) {
             // The primary timeout or interruption outcome outranks a teardown failure.
+        }
+    }
+
+    /**
+     * Reports whether this transport can still run helper operations after a failed probe.
+     *
+     * <p>A failed helper operation is only survivable while the shell behind the transport is
+     * still usable. Our own teardown marks the transport invalidated once it has closed a shell
+     * whose operation timed out or was interrupted. libsu additionally releases a shell whose
+     * process died and then answers the running job with a failed result instead of throwing, so
+     * the underlying shell's own liveness has to answer for that case. Asking {@link
+     * Shell#isAlive()} keeps the verdict tied to the real transport state, and libsu may itself
+     * observe and release a process it finds dead while answering.</p>
+     */
+    private boolean isTransportUsable() {
+        if (transportInvalidatedByFailedOperation) {
+            return false;
+        }
+        try {
+            return shell.isAlive();
+        } catch (RuntimeException unusable) {
+            return false;
         }
     }
 

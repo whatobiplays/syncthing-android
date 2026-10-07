@@ -141,11 +141,11 @@ final class LibsuRootShellFactory implements RootShellFactory {
      * <p>The probe runs while the transport client is still alive. An unreadable answer never
      * fails an acquisition that already verified UID 0: the status simply stays unattributable,
      * and the exit verification then reports a typed result instead of an unauthenticated status.
-     * A probe whose failure invalidated the transport, such as a helper operation that timed out
-     * or was interrupted, does fail the acquisition through the transport failure it reports, so
-     * a closed shell is never handed out as a verified one.</p>
+     * A probe whose failure left the transport unusable, because our own teardown closed it or
+     * because the shell died while the probe ran, does fail the acquisition through the transport
+     * failure it reports, so a dead or closed shell is never handed out as a verified one.</p>
      *
-     * @throws IOException when the failed probe invalidated the shell transport
+     * @throws IOException when the failed probe left the shell transport unusable
      */
     private static void recordExitStatusProvenance(LibsuRootShell rootShell, int ownerProcessId)
             throws IOException {

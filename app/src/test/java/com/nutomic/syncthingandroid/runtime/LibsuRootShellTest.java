@@ -480,15 +480,57 @@ public class LibsuRootShellTest {
 
     @Test
     public void unreadableProvenanceStaysUnprovableInsteadOfFailingTheShell() throws Exception {
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
         LibsuRootShell transport = new LibsuRootShell(
-                new ScriptedLibsuShell(null, new IllegalStateException("the transport died")),
-                new DestroyRecordingProcess(),
+                new ScriptedLibsuShell(null, new IllegalStateException("the probe command failed")),
+                process,
                 1_000
         );
 
         transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
 
         assertFalse(transport.exitStatusBelongsToLaunchedProcess());
+        assertEquals(
+                "a failed probe on a live shell must leave the transport untouched",
+                0,
+                process.destroyCount()
+        );
+    }
+
+    @Test
+    public void failedProvenanceCommandOnALiveShellStaysUnprovable() throws Exception {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(null, null).failProvenanceCommand();
+        DestroyRecordingProcess process = new DestroyRecordingProcess();
+        LibsuRootShell transport = new LibsuRootShell(shell, process, 1_000);
+
+        transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+
+        assertFalse(
+                "a command that failed on a live shell leaves the status unattributable",
+                transport.exitStatusBelongsToLaunchedProcess()
+        );
+        assertEquals("the live transport must not be closed", 0, shell.closeAttempts());
+        assertEquals("the live transport process must not be destroyed", 0, process.destroyCount());
+    }
+
+    @Test
+    public void deadShellDuringTheProvenanceProbeFailsInsteadOfStayingUnprovable() throws Exception {
+        ScriptedLibsuShell shell = new ScriptedLibsuShell(null, null).dieDuringProvenanceProbe();
+        LibsuRootShell transport =
+                new LibsuRootShell(shell, new DestroyRecordingProcess(), 1_000);
+
+        try {
+            transport.determineExitStatusProvenance(ScriptedLibsuShell.OWNER_PROCESS_ID);
+            fail("a dead shell must not be reported as a merely unprovable relationship");
+        } catch (IOException expected) {
+            assertTrue(
+                    "the failed command that revealed the dead shell must surface unchanged",
+                    expected.getMessage().contains("The root shell command failed")
+            );
+        }
+
+        assertFalse(transport.exitStatusBelongsToLaunchedProcess());
+        assertFalse("the probe must have observed the dead shell", shell.isAlive());
     }
 
     @Test

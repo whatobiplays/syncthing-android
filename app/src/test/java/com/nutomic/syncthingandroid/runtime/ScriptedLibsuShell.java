@@ -20,8 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * rule can be exercised without a device. The parent-process answer can be scripted to fail, and
  * every parent-process read is counted, so a test can prove that an unreadable answer stays
  * unprovable and that the relationship is recorded exactly once. The parent-process probe can
- * also be held on a latch the test releases, and the shell's close can be scripted to fail, so a
- * stalled provenance probe and its teardown can be exercised deterministically.</p>
+ * also be held on a latch the test releases, complete with a failed job result while the shell
+ * stays alive, or kill the shell and report libsu's not-executed result; the shell's close can be
+ * scripted to fail, so a stalled probe, a failed command, and a dead shell can each be exercised
+ * deterministically.</p>
  */
 final class ScriptedLibsuShell extends Shell {
     /** Application process identifier the scripted identity lines are written for. */
@@ -40,6 +42,9 @@ final class ScriptedLibsuShell extends Shell {
     private final AtomicInteger statReads = new AtomicInteger();
     private final AtomicInteger closeAttempts = new AtomicInteger();
     private final CountDownLatch provenanceProbeStarted = new CountDownLatch(1);
+    private int provenanceExitCode;
+    private boolean diesDuringProvenanceProbe;
+    private boolean shellDead;
 
     /**
      * Creates a verified root shell double.
@@ -88,9 +93,27 @@ final class ScriptedLibsuShell extends Shell {
         return statReads.get();
     }
 
+    /**
+     * Scripts the parent-process probe to complete with a failed job result while the shell stays
+     * alive, which is what a command that ran on a healthy transport without succeeding reports.
+     */
+    ScriptedLibsuShell failProvenanceCommand() {
+        provenanceExitCode = 1;
+        return this;
+    }
+
+    /**
+     * Scripts the parent-process probe to lose the shell and report the not-executed result that
+     * libsu produces when the shell process dies during a job.
+     */
+    ScriptedLibsuShell dieDuringProvenanceProbe() {
+        diesDuringProvenanceProbe = true;
+        return this;
+    }
+
     @Override
     public boolean isAlive() {
-        return true;
+        return !shellDead;
     }
 
     @Override
@@ -160,16 +183,23 @@ final class ScriptedLibsuShell extends Shell {
                 statReads.incrementAndGet();
                 provenanceProbeStarted.countDown();
                 awaitProvenanceGate();
+                if (diesDuringProvenanceProbe) {
+                    shellDead = true;
+                    return result(Shell.Result.JOB_NOT_EXECUTED);
+                }
                 if (statFailure != null) {
                     throw statFailure;
+                }
+                if (provenanceExitCode != 0) {
+                    return result(provenanceExitCode);
                 }
                 if (statLine != null) {
                     stdout.add(statLine);
                 }
-                return successfulResult();
+                return result(0);
             }
             stdout.add("0");
-            return successfulResult();
+            return result(0);
         }
 
         /** Holds the probe until the test releases the gate; a cancelled probe stays blocked. */
@@ -199,7 +229,7 @@ final class ScriptedLibsuShell extends Shell {
             throw new AssertionError("Helper probes are never enqueued");
         }
 
-        private Result successfulResult() {
+        private Result result(int code) {
             return new Result() {
                 @Override
                 public List<String> getOut() {
@@ -213,7 +243,7 @@ final class ScriptedLibsuShell extends Shell {
 
                 @Override
                 public int getCode() {
-                    return 0;
+                    return code;
                 }
             };
         }
