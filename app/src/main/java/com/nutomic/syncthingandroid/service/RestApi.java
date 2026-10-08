@@ -77,6 +77,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 import javax.inject.Inject;
 
@@ -176,7 +177,9 @@ public class RestApi {
     private int mLastOnlineDeviceCount = 0;
     private int mLastTotalSyncCompletion = -1;
 
-    private Boolean hasShutdown = false;
+    private volatile boolean hasShutdown = false;
+    /** Serializes shutdown with the final check-and-submit of background REST work. */
+    private final Object executorAdmission = new Object();
 
     private Gson mGson;
 
@@ -617,8 +620,10 @@ public class RestApi {
      * sending the returned request.
      */
     public OwnedExecutionShutdown.RestShutdownRequest prepareShutdown() {
-        hasShutdown = true;
-        executorService.shutdownNow();
+        synchronized (executorAdmission) {
+            hasShutdown = true;
+            executorService.shutdownNow();
+        }
         Util.killProcess("find");
         return PostRequest.singleAttemptShutdown(mContext, mUrl, mApiKey);
     }
@@ -1249,38 +1254,44 @@ public class RestApi {
         // Execute planned workloads.
         final Boolean finalPlanGetSyncConflictFiles = planGetSyncConflictFiles;
         final Boolean finalPlanOnFolderSyncCompleted = planOnFolderSyncCompleted;
-        if (hasShutdown || executorService.isShutdown()) {
-            // We are on the way to shutdown SynchtingNative.
-            return;
-        }
         if (!finalPlanGetSyncConflictFiles && !finalPlanOnFolderSyncCompleted) {
             // No work to do.
             return;
         }
 
-        executorService.execute(() -> {
-            if (hasShutdown) {
+        synchronized (executorAdmission) {
+            if (hasShutdown || executorService.isShutdown()) {
+                // We are on the way to shutdown SynchtingNative.
                 return;
             }
+            try {
+                executorService.execute(() -> {
+                    if (hasShutdown) {
+                        return;
+                    }
 
-            if (finalPlanGetSyncConflictFiles) {
-                // Check for ".sync-conflict-YYYYMMDD-HHMMSS-DEVICEI*" files.
-                mLocalCompletion.setDiscoveredConflictFiles(
-                        folderId,
-                        mRuntime.discoverConflicts(
-                                ConfiguredFolderReference.of(folder.id, folder.path)
-                        ).relativePaths().toArray(new String[0])
-                );
-            }
+                    if (finalPlanGetSyncConflictFiles) {
+                        // Check for ".sync-conflict-YYYYMMDD-HHMMSS-DEVICEI*" files.
+                        mLocalCompletion.setDiscoveredConflictFiles(
+                                folderId,
+                                mRuntime.discoverConflicts(
+                                        ConfiguredFolderReference.of(folder.id, folder.path)
+                                ).relativePaths().toArray(new String[0])
+                        );
+                    }
 
-            if (finalPlanOnFolderSyncCompleted) {
-                onFolderSyncCompleted(
-                        folder, 
-                        folderStatus.state, 
-                        deviceId
-                );
+                    if (finalPlanOnFolderSyncCompleted) {
+                        onFolderSyncCompleted(
+                                folder,
+                                folderStatus.state,
+                                deviceId
+                        );
+                    }
+                });
+            } catch (RejectedExecutionException shuttingDown) {
+                // Shutdown won executor admission; this stale callback has no work left to submit.
             }
-        });
+        }
     }
 
     public void onFolderSyncCompleted(final Folder folder, 

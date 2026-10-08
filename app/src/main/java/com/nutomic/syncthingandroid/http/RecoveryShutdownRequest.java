@@ -2,6 +2,8 @@ package com.nutomic.syncthingandroid.http;
 
 import android.content.Context;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 
 import com.android.volley.DefaultRetryPolicy;
 import com.android.volley.Request;
@@ -160,7 +162,12 @@ final class RecoveryShutdownRequest implements OwnedExecutionShutdown.RestShutdo
             try {
                 RequestQueue observedQueue = queue.get();
                 if (observedQueue != null && removed.compareAndSet(false, true)) {
-                    observedQueue.removeRequestEventListener(this);
+                    // Volley iterates its live listener list during request-event dispatch.
+                    // Defer removal until that dispatch frame has returned, otherwise removing this
+                    // listener from REQUEST_FINISHED invalidates the iterator.
+                    new Handler(Looper.getMainLooper()).post(
+                            () -> observedQueue.removeRequestEventListener(this)
+                    );
                 }
             } finally {
                 RecoveryShutdownRequest observedOwner = owner.get();

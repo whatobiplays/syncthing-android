@@ -511,6 +511,30 @@ public class OwnedExecutionShutdownTest {
         assertTrue(events.subList(sigintAttempt + 1, sigkillAttempt).contains("observe"));
     }
 
+    @Test
+    public void rechecksOwnershipAfterRequestAdmissionBeforeSendingRestShutdown() throws Exception {
+        RecordingControl control = new RecordingControl();
+        RecordingShutdownRequest request = new RecordingShutdownRequest(new ArrayList<>());
+
+        OwnedExecutionShutdown.Outcome result = OwnedExecutionShutdown.stop(
+                IDENTITY,
+                () -> {
+                    control.observation = ExecutionOwnershipManager.Observation.EXITED;
+                    return request;
+                },
+                control,
+                (identity, timeout, ignored) -> true
+        );
+
+        assertEquals(OwnedExecutionShutdown.Outcome.EXITED, result);
+        assertEquals(
+                "a REST request prepared for the old execution must never reach a replacement",
+                0,
+                request.sendCount
+        );
+        assertFalse(OwnedExecutionShutdown.hasUnquiescedRestShutdownRequests());
+    }
+
     private static final class RecordingControl
             implements OwnedExecutionShutdown.ExecutionControl {
         private final List<String> events = new ArrayList<>();

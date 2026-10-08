@@ -138,19 +138,28 @@ public class ExecutionOwnershipManagerTest {
         );
 
         InMemoryRecordStore missing = new InMemoryRecordStore(null);
-        assertPriorInstallCandidateBlocksLaunch(missing, previousInstall, null);
+        assertPriorInstallCandidateBlocksLaunch(
+                missing, previousInstall, null,
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION
+        );
 
         InMemoryRecordStore corrupt = new InMemoryRecordStore(null);
         corrupt.corrupt = true;
-        assertPriorInstallCandidateBlocksLaunch(corrupt, previousInstall, null);
+        assertPriorInstallCandidateBlocksLaunch(
+                corrupt, previousInstall, null,
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION
+        );
 
+        // The record names the expected bundled binary and the live process is the same kernel
+        // process, so the evidence describes a launch whose terminal exec has not happened yet.
         InMemoryRecordStore nonmatching = new InMemoryRecordStore(IDENTITY);
         ExecutionIdentity otherAtRecordedPid = new ExecutionIdentity(
                 IDENTITY.pid(), IDENTITY.processStartTimeTicks(), IDENTITY.bootId(),
                 "/data/app/other/lib/other.so", "run-other"
         );
         assertPriorInstallCandidateBlocksLaunch(
-                nonmatching, previousInstall, otherAtRecordedPid
+                nonmatching, previousInstall, otherAtRecordedPid,
+                ExecutionOwnershipManager.Classification.LAUNCH_IN_FLIGHT
         );
     }
 
@@ -344,6 +353,229 @@ public class ExecutionOwnershipManagerTest {
     }
 
     @Test
+    public void pendingLaunchProvenGoneRefreshesCandidatesBeforeAllowingReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(
+                new ExecutionIdentity(41, 9001, "boot-a", EXECUTABLE, "run-a")
+        );
+        FakeInspector inspector = new FakeInspector("boot-a");
+        ExecutionIdentity competing = new ExecutionIdentity(
+                42, 9002, "boot-a", "/data/app/old/lib/libsyncthingnative.so", "other"
+        );
+        inspector.setCandidateSnapshot(0, Collections.emptyList());
+        inspector.setCandidateSnapshot(1, Collections.singletonList(competing));
+        RecordingSignals signals = new RecordingSignals();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery =
+                manager(records, inspector, signals).recover();
+
+        assertEquals(
+                "a refreshed bundled candidate outranks the stale empty snapshot",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.PROCESS_GONE, recovery.recordEvidence());
+        assertEquals(
+                ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
+                recovery.candidateEvidence()
+        );
+        assertEquals(
+                ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence()
+        );
+        assertFalse(recovery.mayLaunch());
+        assertEquals("recovery rescans before any launchable absence", 2, inspector.candidateScanCount);
+        assertEquals(
+                "only the matching pre-delivery state is cleared",
+                ExecutionRecordStore.PendingLaunch.Status.NONE,
+                records.pendingLaunch.status()
+        );
+        assertTrue("candidate discovery never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
+    public void reusedPendingPidRefreshesCandidatesBeforeAllowingReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(
+                new ExecutionIdentity(41, 9001, "boot-a", EXECUTABLE, "run-a")
+        );
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(41, new ExecutionIdentity(41, 7777, "boot-a", "/system/bin/sh", "owner"));
+        ExecutionIdentity competing = new ExecutionIdentity(
+                43, 9003, "boot-a", "/data/app/old/lib/libsyncthingnative.so", "other"
+        );
+        inspector.setCandidateSnapshot(0, Collections.emptyList());
+        inspector.setCandidateSnapshot(1, Collections.singletonList(competing));
+        RecordingSignals signals = new RecordingSignals();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery =
+                manager(records, inspector, signals).recover();
+
+        assertEquals(
+                "a reused pid never turns the refreshed candidate into a launchable result",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.NONMATCHING, recovery.recordEvidence());
+        assertEquals(
+                ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
+                recovery.candidateEvidence()
+        );
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE, recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertEquals(2, inspector.candidateScanCount);
+        assertEquals(
+                ExecutionRecordStore.PendingLaunch.Status.NONE,
+                records.pendingLaunch.status()
+        );
+        assertTrue("a reused pid never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
+    public void pendingTransportAtTheBundledExecutableWithItsExactTokenIsOwned() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), IDENTITY);
+        RecordingSignals signals = new RecordingSignals();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery =
+                manager(records, inspector, signals).recover();
+
+        assertEquals(
+                ExecutionOwnershipManager.Classification.OWNED_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.VALID, recovery.recordEvidence());
+        assertEquals(
+                ExecutionOwnershipManager.CandidateEvidence.NONE,
+                recovery.candidateEvidence()
+        );
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE, recovery.inspectionEvidence());
+        assertSame(
+                "exact ownership is the recorded transport itself, never a fabricated identity",
+                IDENTITY,
+                recovery.ownedExecution()
+        );
+        assertFalse(recovery.mayLaunch());
+    }
+
+    @Test
+    public void pendingTransportWithADifferentRunTokenIsAmbiguousAndNeverSignaled() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        ExecutionIdentity foreignRun = new ExecutionIdentity(
+                IDENTITY.pid(),
+                IDENTITY.processStartTimeTicks(),
+                IDENTITY.bootId(),
+                EXECUTABLE,
+                "another-run-token"
+        );
+        inspector.set(IDENTITY.pid(), foreignRun);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(
+                "a pending transport that reached the bundled executable without its own run token "
+                        + "is never an owned execution",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.NONMATCHING, recovery.recordEvidence());
+        assertEquals(
+                ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
+                recovery.candidateEvidence()
+        );
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE, recovery.inspectionEvidence());
+        assertNull("no owned identity is fabricated from a mismatched run token", recovery.ownedExecution());
+        assertFalse("a mismatched run token never permits a replacement launch", recovery.mayLaunch());
+        assertEquals(
+                "the durable pre-delivery state stays pending until its transport is proven gone",
+                ExecutionRecordStore.PendingLaunch.Status.PENDING,
+                records.pendingLaunch.status()
+        );
+        assertEquals(
+                ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(foreignRun, ExecutionOwnershipManager.Signal.SIGKILL)
+        );
+        assertTrue("a mismatched run token never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
+    public void pendingTransportWithAnUnreadableRunTokenIsAmbiguousAndNeverSignaled() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        ExecutionIdentity unreadableToken = new ExecutionIdentity(
+                IDENTITY.pid(),
+                IDENTITY.processStartTimeTicks(),
+                IDENTITY.bootId(),
+                EXECUTABLE,
+                ""
+        );
+        inspector.set(IDENTITY.pid(), unreadableToken);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(
+                "an unreadable run token can never prove exact ownership",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.NONMATCHING, recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE, recovery.inspectionEvidence());
+        assertNull(recovery.ownedExecution());
+        assertFalse("an unreadable run token keeps replacement launches blocked", recovery.mayLaunch());
+        assertEquals(
+                ExecutionRecordStore.PendingLaunch.Status.PENDING,
+                records.pendingLaunch.status()
+        );
+        assertEquals(
+                ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(unreadableToken, ExecutionOwnershipManager.Signal.SIGKILL)
+        );
+        assertTrue("an unreadable run token never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
+    public void failedCandidateRefreshAfterPendingCleanupStaysFailClosed() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(
+                new ExecutionIdentity(41, 9001, "boot-a", EXECUTABLE, "run-a")
+        );
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(41, null);
+        inspector.failCandidateScanAt = 1;
+        RecordingSignals signals = new RecordingSignals();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery =
+                manager(records, inspector, signals).recover();
+
+        assertEquals(
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.PROCESS_GONE, recovery.recordEvidence());
+        assertEquals(
+                "an unreadable candidate refresh can never prove absence",
+                ExecutionOwnershipManager.CandidateEvidence.UNKNOWN,
+                recovery.candidateEvidence()
+        );
+        assertEquals(
+                ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence()
+        );
+        assertFalse(recovery.mayLaunch());
+        assertEquals(2, inspector.candidateScanCount);
+        assertTrue("a failed refresh never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
     public void unknownInspectionPreservesRecordAndBlocksRecoveryAndCleanup() throws Exception {
         InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
         FakeInspector inspector = new FakeInspector("boot-a");
@@ -493,16 +725,285 @@ public class ExecutionOwnershipManagerTest {
         assertSame(newer, records.record);
     }
 
+
+    @Test
+    public void preExecHandoffOfAnOwnedLaunchIsNeverLaunchableOrSignalable() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        ExecutionIdentity shellProcess = new ExecutionIdentity(
+                IDENTITY.pid(), IDENTITY.processStartTimeTicks(), IDENTITY.bootId(),
+                "/system/bin/sh", IDENTITY.runToken()
+        );
+        inspector.set(IDENTITY.pid(), shellProcess);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment result = manager.recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.LAUNCH_IN_FLIGHT,
+                result.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.VALID, result.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
+                result.candidateEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE,
+                result.inspectionEvidence());
+        assertNull(result.ownedExecution());
+        assertFalse(result.mayLaunch());
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(shellProcess, ExecutionOwnershipManager.Signal.SIGKILL));
+        assertTrue("an in-flight launch is never signaled", signals.sent.isEmpty());
+        assertSame("an in-flight launch keeps its evidence", IDENTITY, records.record);
+    }
+
+    @Test
+    public void launchConfirmationRecognizesEveryCreationState() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        inspector.set(IDENTITY.pid(), new ExecutionIdentity(
+                IDENTITY.pid(), IDENTITY.processStartTimeTicks(), IDENTITY.bootId(),
+                "/system/bin/sh", IDENTITY.runToken()
+        ));
+        ExecutionOwnershipManager.LaunchConfirmation handoff =
+                manager.confirmLaunch(IDENTITY.runToken());
+        assertEquals(ExecutionOwnershipManager.LaunchConfirmation.State.HANDOFF_IN_FLIGHT,
+                handoff.state());
+        assertTrue(handoff.recognized());
+        assertNull(handoff.identity());
+
+        inspector.set(IDENTITY.pid(), IDENTITY);
+        ExecutionOwnershipManager.LaunchConfirmation owned = manager.confirmLaunch(IDENTITY.runToken());
+        assertEquals(ExecutionOwnershipManager.LaunchConfirmation.State.OWNED, owned.state());
+        assertSame(IDENTITY, owned.identity());
+
+        inspector.set(IDENTITY.pid(), null);
+        assertEquals(ExecutionOwnershipManager.LaunchConfirmation.State.PROCESS_GONE,
+                manager.confirmLaunch(IDENTITY.runToken()).state());
+
+        inspector.setUnknown(IDENTITY.pid());
+        ExecutionOwnershipManager.LaunchConfirmation unknown =
+                manager.confirmLaunch(IDENTITY.runToken());
+        assertEquals(ExecutionOwnershipManager.LaunchConfirmation.State.UNRESOLVED, unknown.state());
+        assertFalse(unknown.recognized());
+        assertFalse(manager.confirmLaunch("another-run-token").recognized());
+    }
+
+    @Test
+    public void launchConfirmationRefusesEvidenceOfAnotherLaunch() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(new ExecutionIdentity(
+                IDENTITY.pid(), IDENTITY.processStartTimeTicks(), IDENTITY.bootId(),
+                "/data/app/other/lib/other.so", IDENTITY.runToken()
+        ));
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), IDENTITY);
+
+        ExecutionOwnershipManager.LaunchConfirmation confirmation = manager(
+                records, inspector, new RecordingSignals()
+        ).confirmLaunch(IDENTITY.runToken());
+
+        assertFalse(
+                "evidence naming another executable never confirms this launch",
+                confirmation.recognized()
+        );
+    }
+
     private static ExecutionOwnershipManager manager(
             ExecutionRecordStore records, FakeInspector inspector, RecordingSignals signals
     ) {
         return new ExecutionOwnershipManager(EXECUTABLE, records, inspector, signals);
     }
 
+    @Test
+    public void goneRecordCleanupThatThrowsBlocksReplacementAndSignals() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        records.deleteThrows = true;
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), null);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(
+                "obsolete evidence that cannot be removed may never become launchable",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.PROCESS_GONE, recovery.recordEvidence());
+        assertEquals(
+                "no candidate scan may prove absence while the stale record survives",
+                ExecutionOwnershipManager.CandidateEvidence.UNKNOWN,
+                recovery.candidateEvidence()
+        );
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertEquals(1, inspector.candidateScanCount);
+        assertTrue("the record stays for the next recovery attempt", records.hasRecord());
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
+        assertTrue("a failed cleanup never authorizes a signal", signals.sent.isEmpty());
+    }
+
+    @Test
+    public void goneRecordCleanupThatReportsNothingBlocksReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        records.deleteReportsNothing = true;
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), null);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(
+                "a cleanup that cannot prove removal fails closed",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.PROCESS_GONE, recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNKNOWN, recovery.candidateEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertTrue(records.hasRecord());
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
+        assertTrue(signals.sent.isEmpty());
+    }
+
+    @Test
+    public void bootMismatchCleanupFailureBlocksReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        records.deleteThrows = true;
+        FakeInspector inspector = new FakeInspector("boot-b");
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.BOOT_ID_MISMATCH,
+                recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.NOT_CHECKED,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertTrue(records.hasRecord());
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
+        assertTrue(signals.sent.isEmpty());
+    }
+
+    @Test
+    public void reusedPidCleanupFailureBlocksReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        records.deleteThrows = true;
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), new ExecutionIdentity(
+                IDENTITY.pid(), 7777, "boot-a", "/system/bin/sh", "other"
+        ));
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.NONMATCHING,
+                recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertTrue(records.hasRecord());
+        assertTrue(signals.sent.isEmpty());
+    }
+
+    @Test
+    public void pendingLaunchCleanupFailureBlocksReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(
+                new ExecutionIdentity(41, 9001, "boot-a", EXECUTABLE, "run-a")
+        );
+        records.deleteThrows = true;
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(41, null);
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(
+                "pre-delivery state that cannot be removed may never become launchable",
+                ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification()
+        );
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.PROCESS_GONE, recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNKNOWN, recovery.candidateEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.PROCESS_ABSENT,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertEquals(1, inspector.candidateScanCount);
+        assertEquals(
+                "the pre-delivery state stays for the next recovery attempt",
+                ExecutionRecordStore.PendingLaunch.Status.PENDING,
+                records.pendingLaunch.status()
+        );
+        assertEquals(ExecutionOwnershipManager.SignalAttempt.NOT_OWNED,
+                manager.signalIfOwned(IDENTITY, ExecutionOwnershipManager.Signal.SIGINT));
+        assertTrue(signals.sent.isEmpty());
+    }
+
+    @Test
+    public void reusedPendingPidCleanupFailureBlocksReplacement() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(null);
+        records.pendingLaunch = ExecutionRecordStore.PendingLaunch.pending(
+                new ExecutionIdentity(41, 9001, "boot-a", EXECUTABLE, "run-a")
+        );
+        records.deleteReportsNothing = true;
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(41, new ExecutionIdentity(41, 7777, "boot-a", "/system/bin/sh", "other"));
+        RecordingSignals signals = new RecordingSignals();
+        ExecutionOwnershipManager manager = manager(records, inspector, signals);
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery = manager.recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.RecordEvidence.NONMATCHING,
+                recovery.recordEvidence());
+        assertEquals(ExecutionOwnershipManager.InspectionEvidence.LIVE,
+                recovery.inspectionEvidence());
+        assertFalse(recovery.mayLaunch());
+        assertEquals(ExecutionRecordStore.PendingLaunch.Status.PENDING,
+                records.pendingLaunch.status());
+        assertTrue(signals.sent.isEmpty());
+    }
+
+    @Test
+    public void successfulCleanupStillPermitsLaunchAfterFreshEmptyScan() throws Exception {
+        InMemoryRecordStore records = new InMemoryRecordStore(IDENTITY);
+        FakeInspector inspector = new FakeInspector("boot-a");
+        inspector.set(IDENTITY.pid(), null);
+        RecordingSignals signals = new RecordingSignals();
+
+        ExecutionOwnershipManager.RecoveryAssessment recovery =
+                manager(records, inspector, signals).recover();
+
+        assertEquals(ExecutionOwnershipManager.Classification.RECORDED_PROCESS_GONE,
+                recovery.classification());
+        assertEquals(ExecutionOwnershipManager.CandidateEvidence.NONE, recovery.candidateEvidence());
+        assertTrue("proven removal keeps the existing launchable classification",
+                recovery.mayLaunch());
+        assertFalse(records.hasRecord());
+        assertTrue(signals.sent.isEmpty());
+    }
+
     private static void assertPriorInstallCandidateBlocksLaunch(
             InMemoryRecordStore records,
             ExecutionIdentity previousInstall,
-            ExecutionIdentity liveAtRecordedPid
+            ExecutionIdentity liveAtRecordedPid,
+            ExecutionOwnershipManager.Classification expectedClassification
     ) throws Exception {
         FakeInspector inspector = new FakeInspector("boot-a");
         inspector.add(previousInstall);
@@ -514,8 +1015,7 @@ public class ExecutionOwnershipManagerTest {
 
         ExecutionOwnershipManager.RecoveryAssessment result = manager.recover();
 
-        assertEquals(ExecutionOwnershipManager.Classification.AMBIGUOUS_EXECUTION,
-                result.classification());
+        assertEquals(expectedClassification, result.classification());
         assertEquals(ExecutionOwnershipManager.CandidateEvidence.UNOWNED_CANDIDATE,
                 result.candidateEvidence());
         assertFalse(result.mayLaunch());
@@ -528,6 +1028,17 @@ public class ExecutionOwnershipManagerTest {
         private ExecutionIdentity record;
         private boolean corrupt;
         private boolean readFailed;
+        /** Whether the durable store refuses to delete and reports an error. */
+        private boolean deleteThrows;
+        /** Whether the durable store reports that nothing matched the run token. */
+        private boolean deleteReportsNothing;
+        private ExecutionRecordStore.PendingLaunch pendingLaunch =
+                ExecutionRecordStore.PendingLaunch.none();
+
+        @Override
+        public PendingLaunch readPendingLaunch() {
+            return pendingLaunch;
+        }
 
         private InMemoryRecordStore(ExecutionIdentity record) {
             this.record = record;
@@ -549,7 +1060,19 @@ public class ExecutionOwnershipManagerTest {
 
         @Override
         public boolean deleteIfRunTokenMatches(String runToken) {
-            if (record == null || !record.runToken().equals(runToken)) return false;
+            if (deleteThrows) {
+                throw new IllegalStateException("the durable store cannot delete");
+            }
+            if (deleteReportsNothing) {
+                return false;
+            }
+            boolean cleared = false;
+            if (pendingLaunch.status() == PendingLaunch.Status.PENDING
+                    && pendingLaunch.transportIdentity().runToken().equals(runToken)) {
+                pendingLaunch = PendingLaunch.none();
+                cleared = true;
+            }
+            if (record == null || !record.runToken().equals(runToken)) return cleared;
             record = null;
             return true;
         }

@@ -836,6 +836,184 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void revocationDuringInitialRecoveryBeatsBlockedRecoverySettlement() throws Exception {
+        BlockedInitialRecoveryBackend backend = new BlockedInitialRecoveryBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<RuntimeException> launch = startCancellableLaunch(
+                    worker,
+                    runtime,
+                    true,
+                    permitLifecycleCheck(permit, new AtomicInteger())
+            );
+            assertTrue(
+                    "the launch must enter its initial recovery classification",
+                    backend.recoveryEntered.await(5, TimeUnit.SECONDS)
+            );
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+            backend.allowBlockedRecovery.countDown();
+
+            RuntimeException outcome = launch.get(5, TimeUnit.SECONDS);
+            assertTrue(
+                    "a STOP that already revoked startup must stay the terminal outcome: " + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException
+            );
+            assertEquals(0, backend.startCount);
+        } finally {
+            backend.allowBlockedRecovery.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    /**
+     * A recovery failure raised while the launch is being prepared must settle the lifecycle permit
+     * exactly like the final classification taken under the process-start reservation, so a STOP
+     * that arrives afterwards still reports the recovery failure instead of a cancellation.
+     */
+    @Test
+    public void preparationRecoveryBlockedSettlesTheServiceLifecyclePermit() throws Exception {
+        assertPreparationRecoveryBlockedSettlesThePermit(true);
+    }
+
+    /** The one-shot adapter settles a preparation-time recovery failure the same way. */
+    @Test
+    public void preparationRecoveryBlockedSettlesTheOneShotPermit() throws Exception {
+        assertPreparationRecoveryBlockedSettlesThePermit(false);
+    }
+
+    private void assertPreparationRecoveryBlockedSettlesThePermit(boolean serviceLifecycle)
+            throws Exception {
+        BlockedPreparationBackend backend = new BlockedPreparationBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        AtomicInteger finalLaunchChecks = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<RuntimeException> launch = startCancellableLaunch(
+                    worker, runtime, serviceLifecycle, permitLifecycleCheck(permit, finalLaunchChecks)
+            );
+            assertTrue(
+                    "the launch must reach backend preparation",
+                    backend.preparationEntered.await(5, TimeUnit.SECONDS)
+            );
+            backend.allowPreparationFailure.countDown();
+            RuntimeException outcome = launch.get(5, TimeUnit.SECONDS);
+            assertTrue(
+                    "a preparation-time recovery failure stays the reported outcome: " + outcome,
+                    outcome instanceof ExecutionRecoveryException
+            );
+            assertEquals(
+                    "a STOP after the settled recovery failure reports that failure, not a"
+                            + " cancellation",
+                    LifecycleLaunchPermit.State.RECOVERY_BLOCKED,
+                    permit.revoke()
+            );
+            assertEquals("no process is created", 0, backend.startCount);
+            assertEquals("the final launch check never runs", 0, finalLaunchChecks.get());
+        } finally {
+            backend.allowPreparationFailure.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    /**
+     * A STOP that revokes the lifecycle permit before preparation reports its recovery failure
+     * keeps cancellation as the reported outcome, exactly like the final settlement under the
+     * reservation.
+     */
+    @Test
+    public void revocationDuringPreparationBeatsTheServiceLifecycleSettlement() throws Exception {
+        assertRevocationDuringPreparationWins(true);
+    }
+
+    /** The one-shot adapter reports a revocation that already won the same way. */
+    @Test
+    public void revocationDuringPreparationBeatsTheOneShotSettlement() throws Exception {
+        assertRevocationDuringPreparationWins(false);
+    }
+
+    private void assertRevocationDuringPreparationWins(boolean serviceLifecycle) throws Exception {
+        BlockedPreparationBackend backend = new BlockedPreparationBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        LifecycleLaunchPermit permit = new LifecycleLaunchPermit();
+        AtomicInteger finalLaunchChecks = new AtomicInteger();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<RuntimeException> launch = startCancellableLaunch(
+                    worker, runtime, serviceLifecycle, permitLifecycleCheck(permit, finalLaunchChecks)
+            );
+            assertTrue(
+                    "the launch must reach backend preparation",
+                    backend.preparationEntered.await(5, TimeUnit.SECONDS)
+            );
+            assertEquals(LifecycleLaunchPermit.State.REVOKED, permit.revoke());
+            backend.allowPreparationFailure.countDown();
+            RuntimeException outcome = launch.get(5, TimeUnit.SECONDS);
+            assertTrue(
+                    "a revocation that already won stays the reported outcome: " + outcome,
+                    outcome instanceof LifecycleLaunchPermit.CancelledException
+            );
+            assertEquals("no process is created", 0, backend.startCount);
+            assertEquals("the final launch check never runs", 0, finalLaunchChecks.get());
+        } finally {
+            backend.allowPreparationFailure.countDown();
+            worker.shutdownNow();
+        }
+    }
+
+    private static Future<RuntimeException> startCancellableLaunch(
+            ExecutorService worker,
+            DefaultSyncthingRuntime runtime,
+            boolean serviceLifecycle,
+            DefaultSyncthingRuntime.LifecycleLaunchCheck launchCheck
+    ) {
+        return worker.submit(() -> {
+            try {
+                SyncthingExecution execution = serviceLifecycle
+                        ? runtime.startServiceLifecycle(
+                                SyncthingCommand.SERVE,
+                                normalModeEnvironment(),
+                                null,
+                                launchCheck
+                        )
+                        : runtime.startOneShotWithLifecycleCheck(
+                                SyncthingCommand.DEVICE_ID,
+                                normalModeEnvironment(),
+                                null,
+                                launchCheck
+                        );
+                execution.await();
+                return null;
+            } catch (RuntimeException outcome) {
+                return outcome;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("The launch was interrupted unexpectedly", interrupted);
+            }
+        });
+    }
+
+    private static DefaultSyncthingRuntime.LifecycleLaunchCheck permitLifecycleCheck(
+            LifecycleLaunchPermit permit,
+            AtomicInteger finalLaunchChecks
+    ) {
+        return new DefaultSyncthingRuntime.LifecycleLaunchCheck() {
+            @Override
+            public void commitRecoveryBlocked() {
+                permit.commitRecoveryBlocked();
+            }
+
+            @Override
+            public void check() {
+                finalLaunchChecks.incrementAndGet();
+                permit.commitLaunch();
+            }
+        };
+    }
+
+    @Test
     public void launchCommitWinningMakesLaterStopTooLateToPreventExactOwnedStart()
             throws Exception {
         RecordingBackend backend = new RecordingBackend();
@@ -1706,6 +1884,44 @@ public class RuntimeSeamTest {
             processPresent.set(true);
             execution = new ImmediateExecution(identity);
             return super.start(command, environment);
+        }
+    }
+
+    /**
+     * A backend whose launch preparation performs the recovery classification that forbids a
+     * launch, exactly as both production backends do before they prepare root capability.
+     */
+    private static final class BlockedInitialRecoveryBackend extends RecordingBackend {
+        private final CountDownLatch recoveryEntered = new CountDownLatch(1);
+        private final CountDownLatch allowBlockedRecovery = new CountDownLatch(1);
+        private final AtomicInteger calls = new AtomicInteger();
+
+        @Override
+        public ExecutionOwnershipManager.RecoveryAssessment recoverExecutions() {
+            events.add("recover");
+            recoveryChecks++;
+            if (calls.getAndIncrement() == 0) {
+                recoveryEntered.countDown();
+                awaitLatch(allowBlockedRecovery);
+                return RecoveryAssessmentFixture.ambiguousMissingRecord();
+            }
+            return ExecutionOwnershipManager.RecoveryAssessment.noCandidate();
+        }
+    }
+
+    private static final class BlockedPreparationBackend extends RecordingBackend {
+        private final CountDownLatch preparationEntered = new CountDownLatch(1);
+        private final CountDownLatch allowPreparationFailure = new CountDownLatch(1);
+
+        @Override
+        public PrivilegeBackend.LaunchPreparation prepareLaunch(
+                SyncthingCommand command,
+                SyncthingEnvironment environment
+        ) throws IOException, ExecutableNotFoundException {
+            events.add("prepare");
+            preparationEntered.countDown();
+            awaitLatch(allowPreparationFailure);
+            throw new ExecutionRecoveryException(RecoveryAssessmentFixture.ownedExecution());
         }
     }
 
