@@ -7,6 +7,7 @@ import com.nutomic.syncthingandroid.service.Constants;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
@@ -33,9 +34,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * application-UID execution, and it never signals a process it cannot prove it started.</p>
  *
  * <p>Construction is side-effect free: no root shell is acquired until an explicit root-capable
- * operation runs. Privileged state, folder, and script operations that belong to a later
- * implementation slice fail closed with {@link RootFailure#PRIVILEGED_STATE_NOT_IMPLEMENTED}
- * instead of silently substituting application-UID behavior.</p>
+ * operation runs. Configuration, Managed State, and HTTPS-certificate operations are served
+ * through this backend's semantic capabilities, each inside one bounded operation-scoped
+ * helper session. Folder and script operations that belong to a later implementation slice
+ * still fail closed with {@link RootFailure#PRIVILEGED_STATE_NOT_IMPLEMENTED} instead of
+ * silently substituting application-UID behavior.</p>
  *
  * <h2>Launch preparation boundary</h2>
  *
@@ -117,6 +120,14 @@ public final class RootBackend implements PrivilegeBackend {
     private final ExecutorService activationWorker;
     private final RootEvidenceStore records;
     private final RootRunSpoolReconciler reconciler;
+    /** Fixed application-private locations of Managed State and its transfer area. */
+    private final ManagedStateLocations managedStateLocations;
+    /** Configuration document storage served through the root transport. */
+    private final ConfigStorage rootConfigStorage;
+    /** Managed State transfer served through the root transport. */
+    private final ManagedStateTransfer rootManagedStateTransfer;
+    /** HTTPS certificate storage served through the root transport. */
+    private final HttpsCertificateStorage rootHttpsCertificateStorage;
     /** Spool of the run this backend most recently launched, if it is still active. */
     private volatile RootRunSpool activeSpool;
     /** Spool of a run this backend prepared but has not created a process for yet, if any. */
@@ -135,7 +146,10 @@ public final class RootBackend implements PrivilegeBackend {
                 Constants.getSyncthingBinary(context.getApplicationContext()),
                 Constants.getSyncthingLogFile(context.getApplicationContext()),
                 context.getApplicationContext().getFilesDir(),
-                new LibsuRootShellFactory(),
+                new LibsuRootShellFactory(
+                        ManagedStateLocations.forApplication(context.getApplicationContext())
+                ),
+                ManagedStateLocations.forApplication(context.getApplicationContext()),
                 ACTIVATION_TIMEOUT_MILLIS,
                 CREATION_CONFIRMATION_TIMEOUT_MILLIS,
                 OwnedExecutionShutdown.SIGKILL_WAIT_MS
@@ -151,6 +165,9 @@ public final class RootBackend implements PrivilegeBackend {
      * @param logFile shared Syncthing log that receives reconciled leftover output, or {@code null}
      * @param logTemporaryDirectory directory used when the shared log is trimmed
      * @param shellFactory root shell transport
+     * @param managedStateLocations fixed application-private locations of Managed State and
+     *     its transfer area; every staging directory an operation is given is validated
+     *     against it
      * @param activationTimeoutMillis caller-visible activation deadline
      * @param creationConfirmationTimeoutMillis bounded wait for a delivered launch to prove that it
      *     created its process
@@ -164,6 +181,7 @@ public final class RootBackend implements PrivilegeBackend {
             File logFile,
             File logTemporaryDirectory,
             RootShellFactory shellFactory,
+            ManagedStateLocations managedStateLocations,
             long activationTimeoutMillis,
             long creationConfirmationTimeoutMillis,
             long cleanupExitWaitMillis
@@ -175,6 +193,10 @@ public final class RootBackend implements PrivilegeBackend {
         this.activationTimeoutMillis = activationTimeoutMillis;
         this.creationConfirmationTimeoutMillis = creationConfirmationTimeoutMillis;
         this.cleanupExitWaitMillis = cleanupExitWaitMillis;
+        this.managedStateLocations = Objects.requireNonNull(managedStateLocations);
+        this.rootConfigStorage = new RootConfigStorage();
+        this.rootManagedStateTransfer = new RootManagedStateTransfer();
+        this.rootHttpsCertificateStorage = new RootHttpsCertificateStorage();
         this.activation = new RootActivation(
                 Objects.requireNonNull(shellFactory),
                 activationTimeoutMillis
@@ -415,7 +437,17 @@ public final class RootBackend implements PrivilegeBackend {
 
     @Override
     public ConfigStorage configStorage() {
-        throw notImplemented("Privileged configuration storage");
+        return rootConfigStorage;
+    }
+
+    @Override
+    public ManagedStateTransfer managedStateTransfer() {
+        return rootManagedStateTransfer;
+    }
+
+    @Override
+    public HttpsCertificateStorage httpsCertificateStorage() {
+        return rootHttpsCertificateStorage;
     }
 
     @Override
@@ -634,6 +666,362 @@ public final class RootBackend implements PrivilegeBackend {
                 "The launch script could not establish durable execution evidence (exit "
                         + exitCode + ")"
         );
+    }
+
+    /** Configuration document storage served through the root transport. */
+    private final class RootConfigStorage implements ConfigStorage {
+        @Override
+        public boolean canRead() {
+            return documentExists();
+        }
+
+        @Override
+        public byte[] load() throws ManagedStateException {
+            byte[] contents = runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "read the configuration document",
+                    shell -> shell.readStateFile(ManagedStateMember.CONFIG)
+            );
+            if (contents == null) {
+                throw new ManagedStateException(
+                        ManagedStateFailure.STATE_ACCESS_FAILED,
+                        "The privileged configuration document is missing"
+                );
+            }
+            return contents;
+        }
+
+        @Override
+        public boolean canWrite() {
+            return documentExists();
+        }
+
+        @Override
+        public void save(byte[] contents) throws ManagedStateException {
+            Objects.requireNonNull(contents, "The configuration document is required");
+            ensureStagingBase(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "write the configuration document"
+            );
+            runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "write the configuration document",
+                    shell -> {
+                        shell.writeStateFile(ManagedStateMember.CONFIG, contents);
+                        return null;
+                    }
+            );
+        }
+
+        /**
+         * Reports whether the configuration document exists as a regular file.
+         *
+         * <p>A check that could not be proven never reports a readable document, and the operation
+         * that follows reports the failure with its own stable cause.</p>
+         */
+        private boolean documentExists() {
+            try {
+                return runStateOperation(
+                        ManagedStateFailure.STATE_ACCESS_FAILED,
+                        "check the configuration document",
+                        shell -> shell.stateMemberExists(ManagedStateMember.CONFIG)
+                );
+            } catch (ManagedStateException e) {
+                logWarning("Could not check the privileged configuration document", e);
+                return false;
+            }
+        }
+    }
+
+    /** Managed State transfer served through the root transport. */
+    private final class RootManagedStateTransfer implements ManagedStateTransfer {
+        @Override
+        public ManagedStateStaging snapshotForExport() throws ManagedStateException {
+            ensureStagingBase(
+                    ManagedStateFailure.STATE_TRANSFER_FAILED,
+                    "snapshot Managed State"
+            );
+            String operationName = newStagingOperationName();
+            try {
+                runStateOperation(
+                        ManagedStateFailure.STATE_TRANSFER_FAILED,
+                        "snapshot Managed State",
+                        shell -> {
+                            shell.stageManagedStateForApp(operationName);
+                            return null;
+                        }
+                );
+            } catch (ManagedStateException failure) {
+                removeStagingDirectoryQuietly(operationName);
+                throw failure;
+            }
+            ManagedStateStaging staging = stagingFor(operationName);
+            try {
+                staging.verifyProvenance(managedStateLocations.stagingBase());
+                staging.verifyAppReadable();
+                return staging;
+            } catch (ManagedStateException | RuntimeException e) {
+                // The privileged operation reported a complete handoff, so a transfer directory
+                // this process still cannot consume or remove has to be cleaned up through the
+                // root transport before the failure is reported.
+                if (!staging.cleanup()) {
+                    removeStagingDirectoryQuietly(operationName);
+                }
+                throw new ManagedStateException(
+                        ManagedStateFailure.STATE_TRANSFER_FAILED,
+                        "The privileged state snapshot did not hand over a usable transfer directory",
+                        e
+                );
+            }
+        }
+
+        @Override
+        public void installImportedState(ManagedStateStaging staging)
+                throws ManagedStateException {
+            Objects.requireNonNull(staging, "The import staging directory is required");
+            staging.verifyProvenance(managedStateLocations.stagingBase());
+            staging.verifyAppReadable();
+            runStateOperation(
+                    ManagedStateFailure.STATE_TRANSFER_FAILED,
+                    "install imported Managed State",
+                    shell -> {
+                        shell.installStagedManagedState(staging.operationId());
+                        return null;
+                    }
+            );
+        }
+
+        @Override
+        public void repairAppAccess() throws ManagedStateException {
+            runStateOperation(
+                    ManagedStateFailure.STATE_REPAIR_FAILED,
+                    "repair Managed State access",
+                    shell -> {
+                        shell.repairManagedStateAccess();
+                        return null;
+                    }
+            );
+            verifyAppAccessAfterRepair();
+        }
+
+        /**
+         * Proves from this process that the repaired members are readable again.
+         *
+         * <p>The privileged repair verifies ownership, mode, and label from UID 0, which cannot
+         * prove that the application itself can open the members. This check therefore reads the
+         * repaired state as the application, and a failure is reported as a repair failure instead
+         * of a success.</p>
+         */
+        private void verifyAppAccessAfterRepair() throws ManagedStateException {
+            for (ManagedStateMember member : ManagedStateMember.values()) {
+                File path = managedStateLocations.member(member);
+                if (ManagedStateStaging.isSymbolicLink(path)) {
+                    throw new ManagedStateException(
+                            ManagedStateFailure.STATE_REPAIR_FAILED,
+                            "The Managed State member " + member.fileName() + " is a symbolic link"
+                    );
+                }
+                if (!path.exists()) {
+                    continue;
+                }
+                if (member.isDirectory()) {
+                    try {
+                        ManagedStateStaging.verifyTreeReadable(path);
+                    } catch (ManagedStateException e) {
+                        throw new ManagedStateException(
+                                ManagedStateFailure.STATE_REPAIR_FAILED,
+                                "The application still cannot read " + member.fileName(),
+                                e
+                        );
+                    }
+                    continue;
+                }
+                try (InputStream input = new FileInputStream(path)) {
+                    input.read();
+                } catch (IOException e) {
+                    throw new ManagedStateException(
+                            ManagedStateFailure.STATE_REPAIR_FAILED,
+                            "The application still cannot read " + member.fileName(),
+                            e
+                    );
+                }
+            }
+        }
+
+        /** Removes one staging directory through the root transport, reporting failures softly. */
+        private void removeStagingDirectoryQuietly(String operationName) {
+            try {
+                runStateOperation(
+                        ManagedStateFailure.STATE_TRANSFER_FAILED,
+                        "remove the staging directory",
+                        shell -> {
+                            shell.removeStagingDirectory(operationName);
+                            return null;
+                        }
+                );
+            } catch (ManagedStateException e) {
+                logWarning("Could not remove the operation staging directory", e);
+            }
+        }
+    }
+
+    /** HTTPS certificate storage served through the root transport. */
+    private final class RootHttpsCertificateStorage implements HttpsCertificateStorage {
+        @Override
+        public HttpsCertificateState snapshot() throws ManagedStateException {
+            return runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "capture the HTTPS certificate state",
+                    shell -> new HttpsCertificateState(
+                            shell.readStateFile(ManagedStateMember.HTTPS_CERT),
+                            shell.readStateFile(ManagedStateMember.HTTPS_KEY)
+                    )
+            );
+        }
+
+        @Override
+        public void replace(byte[] certificatePem, byte[] keyPem) throws ManagedStateException {
+            Objects.requireNonNull(certificatePem, "The replacement certificate is required");
+            Objects.requireNonNull(keyPem, "The replacement key is required");
+            ensureStagingBase(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "replace the HTTPS certificate pair"
+            );
+            runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "replace the HTTPS certificate pair",
+                    shell -> {
+                        shell.writeStateFile(ManagedStateMember.HTTPS_CERT, certificatePem);
+                        shell.writeStateFile(ManagedStateMember.HTTPS_KEY, keyPem);
+                        return null;
+                    }
+            );
+        }
+
+        @Override
+        public void reset() throws ManagedStateException {
+            runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "reset the HTTPS certificate pair",
+                    shell -> {
+                        shell.removeStateMember(ManagedStateMember.HTTPS_CERT);
+                        shell.removeStateMember(ManagedStateMember.HTTPS_KEY);
+                        return null;
+                    }
+            );
+        }
+
+        @Override
+        public void restore(HttpsCertificateState state) throws ManagedStateException {
+            Objects.requireNonNull(state, "The captured certificate state is required");
+            if (state.certificatePresent() || state.keyPresent()) {
+                ensureStagingBase(
+                        ManagedStateFailure.STATE_ACCESS_FAILED,
+                        "restore the HTTPS certificate pair"
+                );
+            }
+            runStateOperation(
+                    ManagedStateFailure.STATE_ACCESS_FAILED,
+                    "restore the HTTPS certificate pair",
+                    shell -> {
+                        restoreStateMember(
+                                shell,
+                                ManagedStateMember.HTTPS_CERT,
+                                state.certificateBytes(),
+                                state.certificatePresent()
+                        );
+                        restoreStateMember(
+                                shell,
+                                ManagedStateMember.HTTPS_KEY,
+                                state.keyBytes(),
+                                state.keyPresent()
+                        );
+                        return null;
+                    }
+            );
+        }
+
+        private void restoreStateMember(
+                RootShell shell,
+                ManagedStateMember member,
+                byte[] contents,
+                boolean present
+        ) throws IOException {
+            if (present) {
+                shell.writeStateFile(member, contents);
+            } else {
+                shell.removeStateMember(member);
+            }
+        }
+    }
+
+    /**
+     * Runs one semantic Managed State operation inside a single bounded helper session and reports
+     * every failure through the stable state vocabulary.
+     *
+     * <p>A failure of the superuser transport itself stays the cause, so diagnostics keep the typed
+     * root failure while callers never see application-UID state access substituted for a failed
+     * privileged operation.</p>
+     */
+    private <T> T runStateOperation(
+            ManagedStateFailure failure,
+            String operation,
+            RootStateSessionOperation<T> session
+    ) throws ManagedStateException {
+        try {
+            return withStateSession(session);
+        } catch (RootTransportException e) {
+            throw new ManagedStateException(failure, "Could not " + operation, e);
+        } catch (IOException e) {
+            throw new ManagedStateException(failure, "Could not " + operation, e);
+        }
+    }
+
+    /**
+     * Runs one operation against a raw session shell.
+     *
+     * <p>The session shell is acquired through the same bounded activation path as every other
+     * privileged operation and is closed exactly once when the operation ends, whether it succeeds
+     * or fails.</p>
+     */
+    private <T> T withStateSession(RootStateSessionOperation<T> operation) throws IOException {
+        RootActivation.Request request = activation.begin();
+        RootShellSession session = acquireBounded(request);
+        try {
+            return operation.run(session.shell());
+        } finally {
+            closeQuietly(session);
+        }
+    }
+
+    /** One privileged state operation that runs inside a single bounded root session. */
+    private interface RootStateSessionOperation<T> {
+        T run(RootShell shell) throws IOException;
+    }
+
+    /** Creates one fresh operation-owned staging directory name. */
+    private static String newStagingOperationName() {
+        return ManagedStateStaging.OPERATION_PREFIX + UUID.randomUUID();
+    }
+
+    /** Ensures the app-owned staging base is ready before UID 0 handles an operation tree. */
+    private void ensureStagingBase(ManagedStateFailure failure, String operation)
+            throws ManagedStateException {
+        try {
+            managedStateLocations.prepareStagingBase();
+        } catch (ManagedStateException e) {
+            throw new ManagedStateException(
+                    failure,
+                    "Could not prepare application-owned staging to " + operation,
+                    e
+            );
+        }
+    }
+
+    /** Describes one operation-owned staging directory without touching the file system. */
+    private ManagedStateStaging stagingFor(String operationName) {
+        File base = managedStateLocations.stagingBase();
+        return new ManagedStateStaging(base, new File(base, operationName), operationName);
     }
 
     private static RootTransportException notImplemented(String operation) {

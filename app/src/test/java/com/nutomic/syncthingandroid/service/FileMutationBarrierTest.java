@@ -17,6 +17,161 @@ import org.junit.Test;
 
 public class FileMutationBarrierTest {
     @Test
+    public void certificateStorageReservationRequiresShutdownRecoveryWithoutLocalHandle() {
+        assertFalse(FileMutationBarrier.requiresShutdownBeforeCertificateWork(false, false));
+        assertTrue(FileMutationBarrier.requiresShutdownBeforeCertificateWork(false, true));
+        assertTrue(FileMutationBarrier.requiresShutdownBeforeCertificateWork(true, false));
+    }
+
+    @Test
+    public void certificateRestoreReservationBlocksOtherServicesUntilReleased() {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        AtomicInteger rejected = new AtomicInteger();
+        AtomicInteger releasedCallbacks = new AtomicInteger();
+        AtomicReference<Boolean> safeToStart = new AtomicReference<>();
+
+        assertNotNull(reservation);
+        assertTrue(FileMutationBarrier.certificateRestorePending());
+        assertNull(FileMutationBarrier.tryReserveCertificateRestore());
+        assertTrue(FileMutationBarrier.rejectIfCertificateRestorePending(
+                rejected::incrementAndGet
+        ));
+        FileMutationBarrier.whenCertificateRestoreReleased(allowed -> {
+            safeToStart.set(allowed);
+            releasedCallbacks.incrementAndGet();
+        });
+        assertEquals(1, rejected.get());
+        assertEquals(0, releasedCallbacks.get());
+        assertTrue(reservation.release(true));
+        assertEquals(1, releasedCallbacks.get());
+        assertEquals(Boolean.TRUE, safeToStart.get());
+        assertFalse(reservation.release(true));
+        assertFalse(FileMutationBarrier.certificateRestorePending());
+
+        FileMutationBarrier.CertificateRestoreReservation failedReservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        AtomicReference<Boolean> failedSafeToStart = new AtomicReference<>();
+        FileMutationBarrier.whenCertificateRestoreReleased(failedSafeToStart::set);
+        assertTrue(failedReservation.release(false));
+        assertEquals(Boolean.FALSE, failedSafeToStart.get());
+        assertTrue(FileMutationBarrier.certificateRestorePending());
+        FileMutationBarrier.CertificateRestoreReservation provenRecovery =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        assertNotNull(provenRecovery);
+        assertTrue(provenRecovery.release(true));
+        assertFalse(FileMutationBarrier.certificateRestorePending());
+    }
+
+    @Test
+    public void certificateStorageReservationWaitsForBothRestoreAndShutdownCompletion() {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        AtomicReference<Boolean> safeToStart = new AtomicReference<>();
+        FileMutationBarrier.whenCertificateRestoreReleased(safeToStart::set);
+
+        assertNotNull(reservation);
+        assertTrue(reservation.holdUntilShutdownCompletion());
+        assertTrue(reservation.completeStorage(true));
+        assertTrue(FileMutationBarrier.certificateRestorePending());
+        assertNull(safeToStart.get());
+        assertNull(FileMutationBarrier.tryReserveCertificateRestore());
+
+        assertTrue(reservation.completeShutdown(true));
+        assertFalse(FileMutationBarrier.certificateRestorePending());
+        assertEquals(Boolean.TRUE, safeToStart.get());
+    }
+
+    @Test
+    public void failedShutdownKeepsCertificateAdmissionFailClosedAfterRestoreCompletes() {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        AtomicReference<Boolean> safeToStart = new AtomicReference<>();
+        FileMutationBarrier.whenCertificateRestoreReleased(safeToStart::set);
+
+        assertNotNull(reservation);
+        assertTrue(reservation.holdUntilShutdownCompletion());
+        assertTrue(reservation.completeShutdown(false));
+        assertTrue(FileMutationBarrier.certificateRestorePending());
+        assertTrue(reservation.completeStorage(true));
+
+        assertEquals(Boolean.FALSE, safeToStart.get());
+        assertTrue(FileMutationBarrier.certificateRestorePending());
+        FileMutationBarrier.CertificateRestoreReservation provenRecovery =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        assertNotNull(provenRecovery);
+        assertTrue(provenRecovery.release(true));
+        assertFalse(FileMutationBarrier.certificateRestorePending());
+    }
+
+    @Test
+    public void certificateRestoreAdmissionSerializesLifecycleLaunchCommit() {
+        AtomicInteger launches = new AtomicInteger();
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+
+        assertNotNull(reservation);
+        assertFalse(FileMutationBarrier.commitLifecycleLaunchIfAvailable(launches::incrementAndGet));
+        assertEquals(0, launches.get());
+        assertTrue(reservation.release(true));
+        assertTrue(FileMutationBarrier.commitLifecycleLaunchIfAvailable(launches::incrementAndGet));
+        assertEquals(1, launches.get());
+    }
+
+    @Test
+    public void databaseResetCannotCommitLaunchWhileCertificateStorageIsReserved() {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        DatabaseResetOwnership ownership = new DatabaseResetOwnership();
+        DatabaseResetOwnership.Operation operation = ownership.reserve(null, null);
+
+        assertNotNull(reservation);
+        assertFalse(FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                operation::commitLaunch
+        ));
+        assertTrue("the blocked reset is still cancellable before process creation",
+                ownership.cancelBeforeLaunch(operation));
+        assertTrue(reservation.release(true));
+    }
+
+    @Test
+    public void newCertificateMutationIsRejectedUntilFailedRestoreIsProvenRecovered() {
+        FileMutationBarrier.CertificateRestoreReservation failedRestore =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        assertNotNull(failedRestore);
+        assertTrue(failedRestore.release(false));
+
+        assertNull(FileMutationBarrier.tryReserveCertificateMutation());
+        assertFalse(FileMutationBarrier.commitLifecycleLaunchIfAvailable(() -> { }));
+
+        FileMutationBarrier.CertificateRestoreReservation recovery =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        assertNotNull(recovery);
+        assertTrue(recovery.release(true));
+        FileMutationBarrier.CertificateRestoreReservation nextMutation =
+                FileMutationBarrier.tryReserveCertificateMutation();
+        assertNotNull(nextMutation);
+        assertTrue(nextMutation.release(true));
+    }
+
+    @Test
+    public void certificateMutationMayProceedPastItsOwnReservationOnly() {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateMutation();
+        AtomicInteger rejected = new AtomicInteger();
+
+        assertNotNull(reservation);
+        assertFalse(FileMutationBarrier.rejectIfCertificateRestorePendingExcept(
+                reservation, rejected::incrementAndGet
+        ));
+        assertTrue(FileMutationBarrier.rejectIfCertificateRestorePendingExcept(
+                null, rejected::incrementAndGet
+        ));
+        assertEquals(1, rejected.get());
+        assertTrue(reservation.release(true));
+    }
+
+    @Test
     public void stoppedStateIsReportedBeforeDeferredRestartRuns() {
         FileMutationBarrier barrier = new FileMutationBarrier();
         List<String> events = new ArrayList<>();

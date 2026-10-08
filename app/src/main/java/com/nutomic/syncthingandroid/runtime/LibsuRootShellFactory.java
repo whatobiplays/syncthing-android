@@ -31,13 +31,14 @@ final class LibsuRootShellFactory implements RootShellFactory {
 
     private final String[] rootCommand;
     private final long operationTimeoutMillis;
+    private final ManagedStateLocations locations;
 
-    LibsuRootShellFactory() {
-        this(new String[] {"su"});
+    LibsuRootShellFactory(ManagedStateLocations locations) {
+        this(new String[] {"su"}, locations);
     }
 
-    LibsuRootShellFactory(String[] rootCommand) {
-        this(rootCommand, LibsuRootShell.OPERATION_TIMEOUT_MILLIS);
+    LibsuRootShellFactory(String[] rootCommand, ManagedStateLocations locations) {
+        this(rootCommand, LibsuRootShell.OPERATION_TIMEOUT_MILLIS, locations);
     }
 
     /**
@@ -47,13 +48,18 @@ final class LibsuRootShellFactory implements RootShellFactory {
      * override exists so the acquisition failure of a provenance probe that stalls past its
      * deadline can be exercised deterministically.</p>
      */
-    LibsuRootShellFactory(String[] rootCommand, long operationTimeoutMillis) {
+    LibsuRootShellFactory(
+            String[] rootCommand,
+            long operationTimeoutMillis,
+            ManagedStateLocations locations
+    ) {
         Objects.requireNonNull(rootCommand);
         if (rootCommand.length == 0) {
             throw new IllegalArgumentException("The root command must not be empty");
         }
         this.rootCommand = rootCommand.clone();
         this.operationTimeoutMillis = operationTimeoutMillis;
+        this.locations = Objects.requireNonNull(locations);
     }
 
     @Override
@@ -116,7 +122,8 @@ final class LibsuRootShellFactory implements RootShellFactory {
                     "The root shell build returned no shell for the root transport process"
             );
         }
-        LibsuRootShell rootShell = new LibsuRootShell(shell, process, operationTimeoutMillis);
+        LibsuRootShell rootShell =
+                new LibsuRootShell(shell, process, locations, operationTimeoutMillis);
         try {
             requireRootShellStatus(shell.getStatus(), Shell.ROOT_SHELL, Shell.NON_ROOT_SHELL);
             requireRootUser(rootShell.currentUid());

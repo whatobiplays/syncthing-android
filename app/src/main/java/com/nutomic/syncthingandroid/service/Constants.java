@@ -60,6 +60,15 @@ public class Constants {
     public static final String PREF_BACKUP_REL_PATH_TO_ZIP      = "backup_rel_path_to_zip";
     public static final String PREF_BACKUP_PASSWORD             = "backup_password";
 
+    /**
+     * Device-local execution mode preference.
+     *
+     * <p>The value records whether Superuser Mode was selected on this device. A backup archive
+     * never changes it: the import keeps whatever this device had before the import and ignores the
+     * value stored in an archive. No code in this application writes this preference yet.</p>
+     */
+    public static final String PREF_USE_ROOT                    = "use_root";
+
     // Preferences - Troubleshooting
     public static final String PREF_VERBOSE_LOG                 = "verbose_log";
     public static final String PREF_ENVIRONMENT_VARIABLES       = "environment_variables";
@@ -217,7 +226,7 @@ public class Constants {
     /**
      * Name of the folder containing the index database.
      */
-    private static final String INDEX_DB_FOLDER = "index-v2";
+    public static final String INDEX_DB_FOLDER = "index-v2";
 
     public static File getIndexDbFolder(Context context) {
         return new File(context.getFilesDir(), INDEX_DB_FOLDER);

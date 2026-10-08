@@ -166,6 +166,24 @@ public interface PrivilegeBackend {
 
     ConfigStorage configStorage();
 
+    /**
+     * Returns the semantic Managed State transfer of the selected backend.
+     *
+     * <p>Callers express state operations through the returned capability and never learn whether
+     * the selected backend runs with the application UID or through the superuser transport. A
+     * failed privileged operation is reported as a state failure and is never retried through the
+     * other backend.</p>
+     */
+    ManagedStateTransfer managedStateTransfer();
+
+    /**
+     * Returns the semantic HTTPS certificate storage of the selected backend.
+     *
+     * <p>The certificate workflow captures prior state, mutates the pair, and restores the capture
+     * on failure through this capability, so it works unchanged while Syncthing runs as UID 0.</p>
+     */
+    HttpsCertificateStorage httpsCertificateStorage();
+
     FolderWriteability validateCandidateFolder(String path);
 
     ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder);

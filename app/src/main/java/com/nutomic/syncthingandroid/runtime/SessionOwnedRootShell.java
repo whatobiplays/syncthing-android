@@ -77,6 +77,46 @@ final class SessionOwnedRootShell implements RootShell {
         return sessionShell.readBootId();
     }
 
+    @Override
+    public byte[] readStateFile(ManagedStateMember member) throws IOException {
+        return sessionShell.readStateFile(member);
+    }
+
+    @Override
+    public void writeStateFile(ManagedStateMember member, byte[] contents) throws IOException {
+        sessionShell.writeStateFile(member, contents);
+    }
+
+    @Override
+    public void removeStateMember(ManagedStateMember member) throws IOException {
+        sessionShell.removeStateMember(member);
+    }
+
+    @Override
+    public boolean stateMemberExists(ManagedStateMember member) throws IOException {
+        return sessionShell.stateMemberExists(member);
+    }
+
+    @Override
+    public void stageManagedStateForApp(String operationName) throws IOException {
+        sessionShell.stageManagedStateForApp(operationName);
+    }
+
+    @Override
+    public void removeStagingDirectory(String operationName) throws IOException {
+        sessionShell.removeStagingDirectory(operationName);
+    }
+
+    @Override
+    public void installStagedManagedState(String operationName) throws IOException {
+        sessionShell.installStagedManagedState(operationName);
+    }
+
+    @Override
+    public void repairManagedStateAccess() throws IOException {
+        sessionShell.repairManagedStateAccess();
+    }
+
     /** Ignored on purpose; the session that created the real shell closes it. */
     @Override
     public void close() {

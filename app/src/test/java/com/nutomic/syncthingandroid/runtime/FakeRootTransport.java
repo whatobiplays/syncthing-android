@@ -2,6 +2,12 @@ package com.nutomic.syncthingandroid.runtime;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -80,6 +86,14 @@ final class FakeRootTransport {
         final Map<Integer, Entry> processes = new LinkedHashMap<>();
         final List<String> signals = new ArrayList<>();
         final List<String> launchScripts = new ArrayList<>();
+        ManagedStateLocations managedStateLocations;
+        int repairOwnershipPasses;
+        int repairContextAttempts;
+        int repairContextFailuresRemaining;
+        int repairContextFailures;
+        int repairContextSuccesses;
+        int stageFailuresRemaining;
+        int stagingCleanupCalls;
 
         /** When false, no root transport exists, as on an unrooted device. */
         boolean rootAvailable = true;
@@ -630,6 +644,223 @@ final class FakeRootTransport {
                 throw new IOException("Simulated failure while reading the boot identifier");
             }
             return Device.BOOT_ID;
+        }
+
+        @Override
+        public byte[] readStateFile(ManagedStateMember member) throws IOException {
+            requireOpen();
+            recordOperation("readStateFile");
+            if (!member.isFile()) throw new IOException("Not a Managed State file");
+            File file = locations().member(member);
+            if (!file.exists() && !Files.isSymbolicLink(file.toPath())) return null;
+            if (Files.isSymbolicLink(file.toPath()) || !file.isFile()) {
+                throw new IOException("Unsafe Managed State member");
+            }
+            return Files.readAllBytes(file.toPath());
+        }
+
+        @Override
+        public void writeStateFile(ManagedStateMember member, byte[] contents) throws IOException {
+            requireOpen();
+            recordOperation("writeStateFile");
+            if (!member.isFile()) throw new IOException("Not a Managed State file");
+            File target = locations().member(member);
+            File parent = target.getParentFile();
+            if (!parent.isDirectory() && !parent.mkdirs()) {
+                throw new IOException("Could not create Managed State directory");
+            }
+            File temporary = File.createTempFile("state-", ".tmp", parent);
+            try {
+                Files.write(temporary.toPath(), contents);
+                Files.move(
+                        temporary.toPath(), target.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE
+                );
+            } finally {
+                Files.deleteIfExists(temporary.toPath());
+            }
+        }
+
+        @Override
+        public void removeStateMember(ManagedStateMember member) throws IOException {
+            requireOpen();
+            recordOperation("removeStateMember");
+            deleteTree(locations().member(member).toPath());
+        }
+
+        @Override
+        public boolean stateMemberExists(ManagedStateMember member) throws IOException {
+            requireOpen();
+            recordOperation("stateMemberExists");
+            File path = locations().member(member);
+            if (Files.isSymbolicLink(path.toPath())) return false;
+            return member.isDirectory() ? path.isDirectory() : path.isFile();
+        }
+
+        @Override
+        public void stageManagedStateForApp(String operationName) throws IOException {
+            requireOpen();
+            recordOperation("stageManagedStateForApp");
+            ManagedStateLocations locations = locations();
+            File destination = operationDirectory(locations, operationName);
+            if (!destination.mkdir()) throw new IOException("Could not create staging directory");
+            if (device.stageFailuresRemaining > 0) {
+                device.stageFailuresRemaining--;
+                throw new IOException("Simulated interrupted privileged snapshot");
+            }
+            for (ManagedStateMember member : ManagedStateMember.values()) {
+                File source = locations.member(member);
+                if (!source.exists() && !Files.isSymbolicLink(source.toPath())) continue;
+                if (Files.isSymbolicLink(source.toPath())) {
+                    throw new IOException("Unsafe Managed State member");
+                }
+                File copy = new File(destination, member.fileName());
+                if (member.isDirectory()) {
+                    if (!source.isDirectory()) throw new IOException("Unsafe Managed State member");
+                    copyTree(source.toPath(), copy.toPath());
+                } else {
+                    if (!source.isFile()) throw new IOException("Unsafe Managed State member");
+                    Files.copy(source.toPath(), copy.toPath());
+                }
+            }
+        }
+
+        @Override
+        public void removeStagingDirectory(String operationName) throws IOException {
+            requireOpen();
+            recordOperation("removeStagingDirectory");
+            device.stagingCleanupCalls++;
+            deleteTree(operationDirectory(locations(), operationName).toPath());
+        }
+
+        @Override
+        public void installStagedManagedState(String operationName) throws IOException {
+            requireOpen();
+            recordOperation("installStagedManagedState");
+            ManagedStateLocations locations = locations();
+            File staged = operationDirectory(locations, operationName);
+            if (Files.isSymbolicLink(staged.toPath()) || !staged.isDirectory()) {
+                throw new IOException("Unsafe staging directory");
+            }
+            for (ManagedStateMember required : new ManagedStateMember[] {
+                    ManagedStateMember.CONFIG, ManagedStateMember.CERT,
+                    ManagedStateMember.KEY
+            }) {
+                requireStagedMember(staged, required);
+            }
+            for (ManagedStateMember member : ManagedStateMember.values()) {
+                File source = new File(staged, member.fileName());
+                File target = locations.member(member);
+                if (!source.exists() && !Files.isSymbolicLink(source.toPath())) {
+                    if (member.isDirectory()) deleteTree(target.toPath());
+                    continue;
+                }
+                requireStagedMember(staged, member);
+                deleteTree(target.toPath());
+                if (member.isDirectory()) {
+                    copyTree(source.toPath(), target.toPath());
+                } else {
+                    Files.copy(source.toPath(), target.toPath());
+                }
+            }
+        }
+
+        @Override
+        public void repairManagedStateAccess() throws IOException {
+            requireOpen();
+            recordOperation("repairManagedStateAccess");
+            ManagedStateLocations locations = locations();
+            for (ManagedStateMember member : ManagedStateMember.values()) {
+                File path = locations.member(member);
+                if (Files.isSymbolicLink(path.toPath())) {
+                    throw new IOException("Unsafe Managed State member");
+                }
+                if (path.exists() && (member.isDirectory() ? !path.isDirectory() : !path.isFile())) {
+                    throw new IOException("Unsafe Managed State member");
+                }
+            }
+            device.repairOwnershipPasses++;
+            device.repairContextAttempts++;
+            if (device.repairContextFailuresRemaining > 0) {
+                device.repairContextFailuresRemaining--;
+                device.repairContextFailures++;
+                throw new IOException("Simulated SELinux context repair failure");
+            }
+            device.repairContextSuccesses++;
+        }
+
+        private ManagedStateLocations locations() throws IOException {
+            if (device.managedStateLocations == null) {
+                throw new IOException("Managed State test locations were not configured");
+            }
+            return device.managedStateLocations;
+        }
+
+        private static File operationDirectory(
+                ManagedStateLocations locations, String operationName
+        ) throws IOException {
+            if (operationName == null || !operationName.matches("op-[0-9a-fA-F-]{36}")) {
+                throw new IOException("Invalid staging operation name");
+            }
+            File base = locations.stagingBase().getAbsoluteFile();
+            File directory = new File(base, operationName).getAbsoluteFile();
+            if (!base.equals(directory.getParentFile())) {
+                throw new IOException("Staging directory escaped its base");
+            }
+            return directory;
+        }
+
+        private static void requireStagedMember(File staged, ManagedStateMember member)
+                throws IOException {
+            File path = new File(staged, member.fileName());
+            if (Files.isSymbolicLink(path.toPath())
+                    || (member.isDirectory() ? !path.isDirectory() : !path.isFile())) {
+                throw new IOException("Unsafe staged Managed State member");
+            }
+        }
+
+        private static void copyTree(Path source, Path target) throws IOException {
+            Files.walkFileTree(source, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs)
+                        throws IOException {
+                    if (Files.isSymbolicLink(directory)) throw new IOException("Symbolic link in tree");
+                    Path destination = target.resolve(source.relativize(directory));
+                    Files.createDirectories(destination);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                        throws IOException {
+                    if (!attrs.isRegularFile() || Files.isSymbolicLink(file)) {
+                        throw new IOException("Special file in tree");
+                    }
+                    Files.copy(file, target.resolve(source.relativize(file)));
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
+
+        private static void deleteTree(Path path) throws IOException {
+            if (!Files.exists(path) && !Files.isSymbolicLink(path)) return;
+            Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                        throws IOException {
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path directory, IOException failure)
+                        throws IOException {
+                    if (failure != null) throw failure;
+                    Files.delete(directory);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
         }
 
         /**

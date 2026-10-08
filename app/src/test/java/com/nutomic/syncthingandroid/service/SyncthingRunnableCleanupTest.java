@@ -252,6 +252,18 @@ public class SyncthingRunnableCleanupTest {
         }
 
         @Override
+        public com.nutomic.syncthingandroid.runtime.ManagedStateTransfer managedStateTransfer() {
+            return com.nutomic.syncthingandroid.runtime.ManagedStateTestSupport.unusedTransfer();
+        }
+
+        @Override
+        public com.nutomic.syncthingandroid.runtime.HttpsCertificateStorage
+        httpsCertificateStorage() {
+            return com.nutomic.syncthingandroid.runtime.ManagedStateTestSupport
+                    .unusedCertificates();
+        }
+
+        @Override
         public FolderWriteability validateCandidateFolder(String path) {
             return null;
         }

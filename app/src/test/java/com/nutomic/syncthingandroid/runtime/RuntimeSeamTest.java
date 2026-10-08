@@ -1425,7 +1425,8 @@ public class RuntimeSeamTest {
                 binary,
                 launcher,
                 unownedExecutionManager(),
-                new InMemoryConfigStorage()
+                new InMemoryConfigStorage(),
+                ManagedStateTestSupport.locations()
         );
         SyncthingEnvironment environment = SyncthingEnvironment.builder()
                 .home("/home")
@@ -1536,7 +1537,8 @@ public class RuntimeSeamTest {
                     return new RecordingProcess("", "", 0);
                 },
                 ownershipManager,
-                new InMemoryConfigStorage()
+                new InMemoryConfigStorage(),
+                ManagedStateTestSupport.locations()
         );
 
         PrivilegeBackend.Execution execution = backend.start(
@@ -1621,7 +1623,8 @@ public class RuntimeSeamTest {
                     return process;
                 },
                 ownershipManager,
-                new InMemoryConfigStorage()
+                new InMemoryConfigStorage(),
+                ManagedStateTestSupport.locations()
         );
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
 
@@ -1783,6 +1786,16 @@ public class RuntimeSeamTest {
         @Override
         public ConfigStorage configStorage() {
             return storage;
+        }
+
+        @Override
+        public ManagedStateTransfer managedStateTransfer() {
+            return ManagedStateTestSupport.unusedTransfer();
+        }
+
+        @Override
+        public HttpsCertificateStorage httpsCertificateStorage() {
+            return ManagedStateTestSupport.unusedCertificates();
         }
 
         @Override
@@ -2105,6 +2118,16 @@ public class RuntimeSeamTest {
         @Override
         public ConfigStorage configStorage() {
             return new InMemoryConfigStorage();
+        }
+
+        @Override
+        public ManagedStateTransfer managedStateTransfer() {
+            return ManagedStateTestSupport.unusedTransfer();
+        }
+
+        @Override
+        public HttpsCertificateStorage httpsCertificateStorage() {
+            return ManagedStateTestSupport.unusedCertificates();
         }
 
         @Override

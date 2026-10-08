@@ -32,6 +32,8 @@ public final class AppUidBackend implements PrivilegeBackend {
     private final AppUidProcessLauncher processLauncher;
     private final ExecutionOwnershipManager ownershipManager;
     private final ConfigStorage configStorage;
+    private final ManagedStateTransfer managedStateTransfer;
+    private final HttpsCertificateStorage httpsCertificateStorage;
 
     public AppUidBackend(Context context) {
         Context applicationContext = context.getApplicationContext();
@@ -49,6 +51,9 @@ public final class AppUidBackend implements PrivilegeBackend {
                 new AndroidProcessSignalTransport()
         );
         this.configStorage = new AppUidConfigStorage(applicationContext);
+        ManagedStateLocations locations = ManagedStateLocations.forApplication(applicationContext);
+        this.managedStateTransfer = new AppUidManagedStateTransfer(locations);
+        this.httpsCertificateStorage = new AppUidHttpsCertificateStorage(locations);
     }
 
     /**
@@ -58,13 +63,17 @@ public final class AppUidBackend implements PrivilegeBackend {
             File binary,
             AppUidProcessLauncher processLauncher,
             ExecutionOwnershipManager ownershipManager,
-            ConfigStorage configStorage
+            ConfigStorage configStorage,
+            ManagedStateLocations managedStateLocations
     ) {
         this.context = null;
         this.binary = Objects.requireNonNull(binary);
         this.processLauncher = Objects.requireNonNull(processLauncher);
         this.ownershipManager = Objects.requireNonNull(ownershipManager);
         this.configStorage = Objects.requireNonNull(configStorage);
+        Objects.requireNonNull(managedStateLocations);
+        this.managedStateTransfer = new AppUidManagedStateTransfer(managedStateLocations);
+        this.httpsCertificateStorage = new AppUidHttpsCertificateStorage(managedStateLocations);
     }
 
     @Override
@@ -169,6 +178,16 @@ public final class AppUidBackend implements PrivilegeBackend {
     @Override
     public ConfigStorage configStorage() {
         return configStorage;
+    }
+
+    @Override
+    public ManagedStateTransfer managedStateTransfer() {
+        return managedStateTransfer;
+    }
+
+    @Override
+    public HttpsCertificateStorage httpsCertificateStorage() {
+        return httpsCertificateStorage;
     }
 
     @Override

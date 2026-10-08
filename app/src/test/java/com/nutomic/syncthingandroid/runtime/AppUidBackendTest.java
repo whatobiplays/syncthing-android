@@ -139,7 +139,9 @@ public class AppUidBackendTest {
                 throw new IOException("No test config");
             }
         };
-        return new AppUidBackend(binary, launcher, ownership, storage);
+        return new AppUidBackend(
+                binary, launcher, ownership, storage, ManagedStateTestSupport.locations()
+        );
     }
 
     private static SyncthingEnvironment environment() {
