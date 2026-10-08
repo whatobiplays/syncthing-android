@@ -260,7 +260,7 @@ public class LibsuRootShellFactoryTest {
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         try {
-            new LibsuRootShellFactory().acquire(
+            new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                     60_000,
                     process,
                     (transportProcess, timeoutSeconds) -> {
@@ -284,7 +284,7 @@ public class LibsuRootShellFactoryTest {
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         try {
-            new LibsuRootShellFactory().acquire(
+            new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                     60_000,
                     process,
                     (transportProcess, timeoutSeconds) -> {
@@ -308,7 +308,7 @@ public class LibsuRootShellFactoryTest {
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         try {
-            new LibsuRootShellFactory().acquire(
+            new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                     60_000,
                     process,
                     (transportProcess, timeoutSeconds) -> null
@@ -327,7 +327,7 @@ public class LibsuRootShellFactoryTest {
 
     @Test
     public void acquisitionRecordsTheExitStatusProvenanceOfTheVerifiedShell() {
-        RootShell attached = new LibsuRootShellFactory().acquire(
+        RootShell attached = new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                 60_000,
                 new DestroyCountingProcess(),
                 (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
@@ -335,7 +335,7 @@ public class LibsuRootShellFactoryTest {
                 ),
                 ScriptedLibsuShell.OWNER_PROCESS_ID
         );
-        RootShell detached = new LibsuRootShellFactory().acquire(
+        RootShell detached = new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                 60_000,
                 new DestroyCountingProcess(),
                 (transportProcess, timeoutSeconds) -> new ScriptedLibsuShell(
@@ -360,7 +360,7 @@ public class LibsuRootShellFactoryTest {
                 ScriptedLibsuShell.ATTACHED_STAT_LINE, null
         );
 
-        RootShell acquired = new LibsuRootShellFactory().acquire(
+        RootShell acquired = new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                 60_000,
                 new DestroyCountingProcess(),
                 (transportProcess, timeoutSeconds) -> shell,
@@ -379,7 +379,7 @@ public class LibsuRootShellFactoryTest {
         ScriptedLibsuShell shell = new ScriptedLibsuShell(null, null).failProvenanceCommand();
         DestroyCountingProcess process = new DestroyCountingProcess();
 
-        RootShell acquired = new LibsuRootShellFactory().acquire(
+        RootShell acquired = new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                 60_000,
                 process,
                 (transportProcess, timeoutSeconds) -> shell,
@@ -402,7 +402,7 @@ public class LibsuRootShellFactoryTest {
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         try {
-            new LibsuRootShellFactory().acquire(
+            new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                     60_000,
                     process,
                     (transportProcess, timeoutSeconds) -> shell,
@@ -438,7 +438,7 @@ public class LibsuRootShellFactoryTest {
         DestroyCountingProcess process = new DestroyCountingProcess();
 
         try {
-            new LibsuRootShellFactory(new String[] {"su"}, 50).acquire(
+            new LibsuRootShellFactory(new String[] {"su"}, 50, ManagedStateTestSupport.locations()).acquire(
                     60_000,
                     process,
                     (transportProcess, timeoutSeconds) -> shell,
@@ -479,7 +479,7 @@ public class LibsuRootShellFactoryTest {
         Thread acquirer = new Thread(
                 () -> {
                     try {
-                        new LibsuRootShellFactory(new String[] {"su"}, 30_000).acquire(
+                        new LibsuRootShellFactory(new String[] {"su"}, 30_000, ManagedStateTestSupport.locations()).acquire(
                                 60_000,
                                 process,
                                 (transportProcess, timeoutSeconds) -> shell,
@@ -532,7 +532,7 @@ public class LibsuRootShellFactoryTest {
     }
 
     private static RootShell acquireOverTransport(Process process, Shell shell) {
-        return new LibsuRootShellFactory().acquire(
+        return new LibsuRootShellFactory(ManagedStateTestSupport.locations()).acquire(
                 60_000,
                 process,
                 (transportProcess, timeoutSeconds) -> shell

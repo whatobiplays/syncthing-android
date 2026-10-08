@@ -20,39 +20,35 @@ import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
+import com.nutomic.syncthingandroid.runtime.HttpsCertificateState;
+import com.nutomic.syncthingandroid.runtime.HttpsCertificateStorage;
 import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
+import com.nutomic.syncthingandroid.runtime.ManagedStateException;
+import com.nutomic.syncthingandroid.runtime.ManagedStateLocations;
+import com.nutomic.syncthingandroid.runtime.ManagedStateStaging;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
 import com.nutomic.syncthingandroid.util.ConfigXml;
-import com.nutomic.syncthingandroid.util.FileUtils;
 import com.nutomic.syncthingandroid.util.PermissionUtil;
 import com.nutomic.syncthingandroid.util.Util;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.inject.Inject;
 
 import net.lingala.zip4j.ZipFile;
-import net.lingala.zip4j.exception.ZipException;
-import net.lingala.zip4j.model.ZipParameters;
-import net.lingala.zip4j.model.enums.CompressionLevel;
-import net.lingala.zip4j.model.enums.CompressionMethod;
-import net.lingala.zip4j.model.enums.EncryptionMethod;
-import net.lingala.zip4j.model.enums.AesKeyStrength;
 
 /**
  * Holds the native syncthing instance and provides an API to access it.
@@ -269,17 +265,30 @@ public class SyncthingService extends Service {
     private final StartingShutdownDeferral mStartingShutdownDeferral =
             new StartingShutdownDeferral();
     private final ShutdownStartIntent mShutdownStartIntent = new ShutdownStartIntent();
+    private final CertificateRestoreDeferredStart mCertificateRestoreDeferredStart =
+            new CertificateRestoreDeferredStart();
+    private boolean mCertificateRestoreWaitRegistered;
+    @Nullable private Boolean mCertificateRestoreSafeToStart;
     private final PostMutationStartupGate mPostMutationStartupGate =
             new PostMutationStartupGate();
     private final DatabaseResetOwnership mDatabaseResetOwnership =
             new DatabaseResetOwnership();
+    /** Runs one certificate-storage operation and holds at most one serialized continuation. */
+    private final ThreadPoolExecutor mCertificateStorageExecutor =
+            CertificateStorageMutation.newWorkerExecutor();
 
     private boolean mShutdownInProgress;
     private boolean mShutdownExitProven;
+    private boolean mShutdownSafetyEstablished;
     private boolean mShutdownWorkerStarted;
     private boolean mShutdownRecoveryCheckStarted;
     private boolean mLastExecutionExitProven;
     private boolean mDestroying;
+    private boolean mCertificateMutationPending;
+    @Nullable private AtomicBoolean mCertificateMutationCancellation;
+    @Nullable private FileMutationBarrier.CertificateRestoreReservation
+            mCertificateStorageReservation;
+    @Nullable private CertificateDestructionRestore mCertificateDestructionRestore;
     private boolean mStopAfterDeltaResetWhenNotRequired;
     private SyncthingCommand mStartupCommand;
 
@@ -385,7 +394,13 @@ public class SyncthingService extends Service {
                 restartContinuationCancelled = mActionRestartContinuation.cancel();
                 mActionRestartContinuation = null;
             }
-            if (!crashedNativeStop) cancelActionResetDeltasContinuation();
+            if (!crashedNativeStop) {
+                cancelActionResetDeltasContinuation();
+                if (mCertificateRestoreDeferredStart.cancelForExplicitStop()
+                        == SyncthingCommand.RESET_DELTAS) {
+                    mStopAfterDeltaResetWhenNotRequired = false;
+                }
+            }
             if (mCertificateVerificationStopHandler != null) {
                 mCertificateVerificationStopHandler.onExplicitStop(crashedNativeStop);
             }
@@ -528,6 +543,8 @@ public class SyncthingService extends Service {
                 boolean lifecycleBlocksStartup = mStartingShutdownDeferral
                         .blocksStartup(mShutdownInProgress)
                         || mFileMutationBarrier != null
+                        || FileMutationBarrier.certificateRestorePending()
+                        || mCertificateRestoreDeferredStart.isPending()
                         || mPostMutationStartupGate.ownsStartup()
                         || !mDatabaseResetOwnership.canStartLifecycle()
                         || ((mCurrentState == State.DISABLED || mCurrentState == State.INIT)
@@ -536,8 +553,13 @@ public class SyncthingService extends Service {
                         || mSyncthingRunnableThread != null));
                 mShutdownStartIntent.onRunConditionChanged(true, lifecycleBlocksStartup);
                 if (lifecycleBlocksStartup) {
+                    if (FileMutationBarrier.certificateRestorePending()) {
+                        deferStartupUntilCertificateRestore(SyncthingCommand.SERVE);
+                    }
                     if (!mShutdownInProgress && !mStartingShutdownDeferral.isPending()
                             && mFileMutationBarrier == null
+                            && !FileMutationBarrier.certificateRestorePending()
+                            && !mCertificateRestoreDeferredStart.isPending()
                             && !mPostMutationStartupGate.ownsStartup()
                             && mDatabaseResetOwnership.canStartLifecycle()) {
                         shutdown(State.DISABLED, null, true);
@@ -560,6 +582,7 @@ public class SyncthingService extends Service {
                 }
             } else {
                 mShutdownStartIntent.onRunConditionChanged(false, false);
+                mCertificateRestoreDeferredStart.onRunConditionChanged(false);
                 revokeStartupLaunchPermit();
                 // Stop syncthing.
                 if (mCurrentState == State.DISABLED) {
@@ -567,6 +590,82 @@ public class SyncthingService extends Service {
                 }
                 shutdown(State.DISABLED);
             }
+        }
+    }
+
+    /** Retries a blocked startup after a process-wide certificate restore reaches a safe outcome. */
+    private void deferStartupUntilCertificateRestore(SyncthingCommand command) {
+        mCertificateRestoreDeferredStart.defer(command);
+        mShutdownStartIntent.onRunConditionChanged(true, true);
+        if (mCertificateRestoreWaitRegistered) return;
+        mCertificateRestoreWaitRegistered = true;
+        FileMutationBarrier.whenCertificateRestoreReleased(safeToStart -> {
+            if (!mHandler.post(() -> {
+                mCertificateRestoreSafeToStart = safeToStart;
+                resumeStartupAfterCertificateRestore(safeToStart);
+            })) {
+                Log.e(TAG, "Could not resume startup after certificate restoration");
+            }
+        });
+    }
+
+    private void resumeStartupAfterCertificateRestore(boolean safeToStart) {
+        mCertificateRestoreWaitRegistered = false;
+        mCertificateRestoreSafeToStart = safeToStart;
+        SyncthingCommand command = mCertificateRestoreDeferredStart.peek();
+        if (command == null) return;
+        if (mDestroying) {
+            mCertificateRestoreDeferredStart.take();
+            return;
+        }
+        if (!safeToStart) {
+            mCertificateRestoreDeferredStart.take();
+            mShutdownStartIntent.clear();
+            return;
+        }
+        if (mShutdownInProgress) {
+            shutdown(
+                    State.DISABLED,
+                    () -> resumeStartupAfterCertificateRestore(safeToStart),
+                    true,
+                    false
+            );
+            return;
+        }
+
+        boolean serviceCanStart = (mCurrentState == State.DISABLED || mCurrentState == State.INIT)
+                && !mShutdownInProgress
+                && !mCertificateMutationPending
+                && mFileMutationBarrier == null
+                && !mPostMutationStartupGate.ownsStartup()
+                && mOwnedExecution == null
+                && mSyncthingRunnable == null
+                && mSyncthingRunnableThread == null
+                && mDatabaseResetOwnership.canStartLifecycle();
+        if (!CertificateRestoreDeferredStart.canResume(
+                command, safeToStart, mLastDeterminedShouldRun, serviceCanStart
+        )) {
+            if (mDatabaseResetOwnership.isReserved()) return;
+            if (command == SyncthingCommand.SERVE
+                    && mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
+                mCertificateRestoreDeferredStart.take();
+            }
+            return;
+        }
+        command = mCertificateRestoreDeferredStart.take();
+        if (command == SyncthingCommand.RESET_DELTAS) {
+            launchStartupTask(command);
+            return;
+        }
+        if (mPostMutationStartupGate.consumeDeferredStart(
+                mShutdownStartIntent,
+                mLastDeterminedShouldRun,
+                true,
+                true,
+                serviceCanStart,
+                false
+        )) {
+            launchStartupTask(command);
         }
     }
 
@@ -684,6 +783,16 @@ public class SyncthingService extends Service {
             }
         }
 
+        if (mCertificateMutationPending) {
+            Log.d(TAG, "launchStartupTask deferred until certificate storage work completes");
+            return;
+        }
+        if (FileMutationBarrier.certificateRestorePending()) {
+            Log.d(TAG, "launchStartupTask deferred until certificate restoration completes");
+            deferStartupUntilCertificateRestore(command);
+            return;
+        }
+
         if (mSyncthingRunnable != null || mSyncthingRunnableThread != null) {
             Log.e(TAG, "launchStartupTask: Syncthing binary lifecycle violated");
             return;
@@ -740,7 +849,11 @@ public class SyncthingService extends Service {
                         if (Util.isTcpPortListening(webGuiTcpPort)) {
                             throw new SyncthingRunnable.GuiPortUnavailableException();
                         }
-                        startupPermit.commitLaunch();
+                        if (!FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                                startupPermit::commitLaunch
+                        )) {
+                            throw new ExecutionAdmissionException();
+                        }
                     }
                 };
         mSyncthingRunnable = SyncthingRunnable.forServiceLifecycle(
@@ -1288,6 +1401,11 @@ public class SyncthingService extends Service {
             return;
         }
         if (mDestroying) return;
+        if (FileMutationBarrier.certificateRestorePending()) {
+            Log.w(TAG, "Database reset rejected while certificate storage is reserved");
+            dispatchResetFailure(onFailure);
+            return;
+        }
 
         DatabaseResetOwnership.Operation operation =
                 mDatabaseResetOwnership.reserve(afterReset, onFailure, continuationPolicy);
@@ -1334,7 +1452,11 @@ public class SyncthingService extends Service {
 
                             @Override
                             public void check() {
-                                operation.commitLaunch();
+                                if (!FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                                        operation::commitLaunch
+                                )) {
+                                    throw new ExecutionAdmissionException();
+                                }
                             }
                         };
                 SyncthingRunnable.forOneShotWithLifecycleCheck(
@@ -1389,12 +1511,21 @@ public class SyncthingService extends Service {
                 Log.e(TAG, "Database reset completion failed", e);
                 runResetFailureContinuation(operation);
             }
+            resumeCertificateRestoreStartAfterDatabaseReset();
             return;
         }
 
         mShutdownStartIntent.clear();
         Log.e(TAG, "Database reset failed", outcome.failure());
         runResetFailureContinuation(operation);
+        resumeCertificateRestoreStartAfterDatabaseReset();
+    }
+
+    private void resumeCertificateRestoreStartAfterDatabaseReset() {
+        Boolean safeToStart = mCertificateRestoreSafeToStart;
+        if (safeToStart != null && mCertificateRestoreDeferredStart.isPending()) {
+            resumeStartupAfterCertificateRestore(safeToStart);
+        }
     }
 
     private void runResetFailureContinuation(DatabaseResetOwnership.Operation operation) {
@@ -1444,11 +1575,19 @@ public class SyncthingService extends Service {
             mDatabaseResetOwnership.cancelBeforeLaunch(resetOperation);
         }
         revokeStartupLaunchPermit();
+        mCertificateRestoreDeferredStart.take();
+        if (mCertificateMutationCancellation != null) {
+            mCertificateMutationCancellation.set(true);
+        }
         CertificateVerificationStopHandler certificateVerification =
                 mCertificateVerificationStopHandler;
         if (certificateVerification != null) certificateVerification.onServiceDestroy();
+        if (mCertificateStorageReservation != null) {
+            mCertificateStorageReservation.holdUntilShutdownCompletion();
+        }
         mPostMutationStartupGate.cancel(mShutdownStartIntent);
-        failFileMutationBarrier();
+        if (!mCertificateMutationPending) failFileMutationBarrier();
+        if (!mCertificateMutationPending) mCertificateStorageExecutor.shutdown();
         if (mRunConditionMonitor != null) {
             /**
              * Shut down the OnShouldRunChangedListener so we won't get interrupted by run
@@ -1464,8 +1603,32 @@ public class SyncthingService extends Service {
             // are in State.INIT requiring an immediate shutdown of this service class.
             Log.i(TAG, "Shutting down syncthing binary due to missing storage permission.");
         }
-        shutdown(State.DISABLED, null, true);
+        shutdown(
+                State.DISABLED,
+                null,
+                true,
+                false,
+                this::failCertificateDestructionRestoreAfterShutdown
+        );
         super.onDestroy();
+    }
+
+    /** Refuses certificate writes when destruction cannot prove the old execution has exited. */
+    private void failCertificateDestructionRestoreAfterShutdown() {
+        CertificateDestructionRestore restore = mCertificateDestructionRestore;
+        if (restore == null) return;
+        restore.onExecutionExitUnproven(new IllegalStateException(
+                "Could not prove Syncthing stopped; certificate restoration was not safe."
+        ));
+    }
+
+    /** Releases retained certificate storage only after shutdown and recovery are both terminal. */
+    private void completeCertificateStorageShutdown(boolean safeToStart) {
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                mCertificateStorageReservation;
+        if (reservation == null) return;
+        reservation.completeShutdown(safeToStart);
+        clearReleasedCertificateStorageReservation(reservation);
     }
 
     private void shutdown(State newState) {
@@ -1487,7 +1650,32 @@ public class SyncthingService extends Service {
 
     @FunctionalInterface
     private interface StoppedFileMutation {
-        void run(Runnable releaseOwnership, boolean automaticStartupAllowed);
+        void run(CertificateMutationOwnership ownership);
+    }
+
+    /** Holds lifecycle admission until certificate file work has returned to the service thread. */
+    private final class CertificateMutationOwnership {
+        private final FileMutationBarrier barrier;
+        private final boolean automaticStartupAllowed;
+        private boolean released;
+
+        CertificateMutationOwnership(
+                FileMutationBarrier barrier,
+                boolean automaticStartupAllowed
+        ) {
+            this.barrier = barrier;
+            this.automaticStartupAllowed = automaticStartupAllowed;
+        }
+
+        boolean release() {
+            if (released) return false;
+            released = true;
+            boolean startupSuppressed = barrier.clearDeferredStartIfSuppressed(
+                    mShutdownStartIntent
+            );
+            if (mFileMutationBarrier == barrier) mFileMutationBarrier = null;
+            return automaticStartupAllowed && !startupSuppressed;
+        }
     }
 
     /** Reserves the shared mutation owner before shutdown and stopped-state file work begin. */
@@ -1495,11 +1683,13 @@ public class SyncthingService extends Service {
             StoppedFileMutation afterMutation,
             Runnable onRejected,
             Runnable onShutdownFailure,
-            Runnable onLifecycleConflict
+            Runnable onLifecycleConflict,
+            @Nullable FileMutationBarrier.CertificateRestoreReservation permittedReservation
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             if (!mHandler.post(() -> shutdownForFileMutation(
-                    afterMutation, onRejected, onShutdownFailure, onLifecycleConflict
+                    afterMutation, onRejected, onShutdownFailure, onLifecycleConflict,
+                    permittedReservation
             ))) {
                 onShutdownFailure.run();
             }
@@ -1509,11 +1699,21 @@ public class SyncthingService extends Service {
         if (FileMutationBarrier.rejectIfShutdownContinuationPending(
                 mShutdownInProgress, mAfterShutdown != null, onLifecycleConflict
         )) return;
+        if (mCertificateMutationPending) {
+            onRejected.run();
+            return;
+        }
+        if (FileMutationBarrier.rejectIfCertificateRestorePendingExcept(
+                permittedReservation, onRejected
+        )) return;
         if (mPostMutationStartupGate.rejectNewMutation(onRejected)) return;
         if (mDatabaseResetOwnership.isReserved()) {
             onRejected.run();
             return;
         }
+        boolean shutdownRequired = FileMutationBarrier.requiresShutdownBeforeCertificateWork(
+                hasServiceExecution(), permittedReservation != null
+        );
 
         FileMutationBarrier owner = FileMutationBarrier.reserveAsyncOwner(
                 mFileMutationBarrier,
@@ -1531,11 +1731,15 @@ public class SyncthingService extends Service {
                             boolean startupSuppressed = owner.clearDeferredStartIfSuppressed(
                                     mShutdownStartIntent
                             );
-                            afterMutation.run(
-                                    () -> releaseAsyncFileMutation(owner), !startupSuppressed
-                            );
+                            afterMutation.run(new CertificateMutationOwnership(
+                                    owner, !startupSuppressed
+                            ));
                         });
-                        shutdown(State.DISABLED, null);
+                        if (shutdownRequired) {
+                            shutdown(State.DISABLED, null);
+                        } else {
+                            owner.completeAsyncOwner().run();
+                        }
                     }
             );
         } catch (RuntimeException e) {
@@ -1543,10 +1747,6 @@ public class SyncthingService extends Service {
             if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
             owner.stopFailed();
         }
-    }
-
-    private void releaseAsyncFileMutation(FileMutationBarrier owner) {
-        if (mFileMutationBarrier == owner) mFileMutationBarrier = null;
     }
 
     /** Publishes certificate mutation ownership before beginning its asynchronous shutdown. */
@@ -1638,6 +1838,7 @@ public class SyncthingService extends Service {
         }
 
         mShutdownInProgress = true;
+        mShutdownSafetyEstablished = false;
         mStartingShutdownDeferral.transferToShutdown();
         mShutdownExitProven = mLastExecutionExitProven;
         mShutdownWorkerStarted = false;
@@ -1692,6 +1893,8 @@ public class SyncthingService extends Service {
         }
 
         Log.e(TAG, "Could not prove the owned Syncthing execution exited: " + outcome);
+        mShutdownSafetyEstablished = false;
+        completeCertificateStorageShutdown(false);
         mShutdownStartIntent.clear();
         mShutdownInProgress = false;
         ShutdownFailureContinuationCleanup.discard(
@@ -1798,6 +2001,8 @@ public class SyncthingService extends Service {
     ) {
         if (!mShutdownInProgress) return;
         if (!launchPermitted) {
+            mShutdownSafetyEstablished = false;
+            completeCertificateStorageShutdown(false);
             mShutdownStartIntent.clear();
             Log.e(TAG, "Shutdown completed but recovery remains blocked: "
                     + (assessment == null ? "unknown" : assessment.classification()));
@@ -1829,9 +2034,13 @@ public class SyncthingService extends Service {
         mShutdownRestApi = null;
         mShutdownInProgress = false;
         mShutdownRecoveryCheckStarted = false;
+        mShutdownSafetyEstablished = true;
+        completeCertificateStorageShutdown(true);
         mOwnedExecution = null;
         if (mDestroying) {
             failFileMutationBarrier();
+            CertificateDestructionRestore destructionRestore = mCertificateDestructionRestore;
+            if (destructionRestore != null) destructionRestore.onExecutionExitProven();
             return;
         }
         Log.d(TAG, "Finished the owned Syncthing lifecycle execution.");
@@ -1886,6 +2095,7 @@ public class SyncthingService extends Service {
         if (completion != null) {
             completion.run();
         }
+        if (mCertificateMutationPending) return;
         if (mPostMutationStartupGate.consumeDeferredStart(
                 mShutdownStartIntent,
                 mLastDeterminedShouldRun,
@@ -1930,7 +2140,8 @@ public class SyncthingService extends Service {
         }
         FileMutationBarrier barrier = new FileMutationBarrier();
         boolean posted = mHandler.post(() -> {
-            if (mDestroying || mFileMutationBarrier != null) {
+            if (mDestroying || mFileMutationBarrier != null || mCertificateMutationPending
+                    || FileMutationBarrier.certificateRestorePending()) {
                 barrier.stopFailed();
                 return;
             }
@@ -2178,106 +2389,29 @@ public class SyncthingService extends Service {
      *
      */
     public boolean exportConfig() {
-        Boolean failSuccess = true;
         Log.d(TAG, "exportConfig BEGIN");
-
         if (!shutdownForFileMutation()) return false;
         try {
-
-        // Create export dir if non-existant.
-            File targetZip = getBackupZipFile();
-            targetZip.getParentFile().mkdirs();
-
-            // Export SharedPreferences.
-            File sharedPreferencesFile = null;
-            FileOutputStream fileOutputStream = null;
-            ObjectOutputStream objectOutputStream = null;
-            try {
-                sharedPreferencesFile = Constants.getSharedPrefsFile(this);
-                fileOutputStream = new FileOutputStream(sharedPreferencesFile);
-                if (!sharedPreferencesFile.exists()) {
-                    sharedPreferencesFile.createNewFile();
+            try (ManagedStateStaging staging = mRuntime.managedStateTransfer()
+                    .snapshotForExport()) {
+                File sharedPreferencesFile = new File(
+                        staging.directory(), SyncthingBackupArchive.SHARED_PREFERENCES
+                );
+                try (ObjectOutputStream preferences = new ObjectOutputStream(
+                        new FileOutputStream(sharedPreferencesFile)
+                )) {
+                    preferences.writeObject(mPreferences.getAll());
                 }
-                objectOutputStream = new ObjectOutputStream(fileOutputStream);
-                objectOutputStream.writeObject(mPreferences.getAll());
-                objectOutputStream.flush();
-                fileOutputStream.flush();
-            } catch (IOException e) {
-                Log.e(TAG, "exportConfig: Failed to export SharedPreferences #1", e);
-                failSuccess = false;
-            } finally {
-                try {
-                    if (objectOutputStream != null) {
-                        objectOutputStream.close();
-                    }
-                    if (fileOutputStream != null) {
-                        fileOutputStream.close();
-                    }
-                } catch (IOException e) {
-                    Log.e(TAG, "exportConfig: Failed to export SharedPreferences #2", e);
-                }
+                String password = mPreferences.getString(
+                        Constants.PREF_BACKUP_PASSWORD, ""
+                );
+                SyncthingBackupArchive.write(getBackupZipFile(), staging, password);
+                Log.d(TAG, "exportConfig END");
+                return true;
             }
-
-            // Make a list of files to backup.
-            List<File> includePaths = Arrays.asList(
-                Constants.getConfigFile(this),
-
-                Constants.getPrivateKeyFile(this),
-                Constants.getPublicKeyFile(this),
-
-                Constants.getHttpsCertFile(this),
-                Constants.getHttpsKeyFile(this),
-
-                Constants.getSharedPrefsFile(this),
-
-                Constants.getIndexDbFolder(this)
-            );
-
-            // If user set one, apply a password and encrypt the zip file.
-            String zipEncryptionPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
-
-            // Compress files to zip file.
-            try {
-                // Delete existing ZIP file to ensure we create a fresh archive instead of appending
-                if (targetZip.exists()) {
-                    targetZip.delete();
-                }
-            
-                ZipParameters parameters = new ZipParameters();
-                parameters.setCompressionMethod(CompressionMethod.DEFLATE);
-                parameters.setCompressionLevel(CompressionLevel.NORMAL);
-
-                ZipFile zipFile;
-                if (zipEncryptionPassword.isEmpty()) {
-                    zipFile = new ZipFile(targetZip);
-                    parameters.setEncryptFiles(false);
-                } else {
-                    zipFile = new ZipFile(targetZip, zipEncryptionPassword.toCharArray());
-                    parameters.setEncryptFiles(true);
-                    parameters.setEncryptionMethod(EncryptionMethod.AES);
-                    parameters.setAesKeyStrength(AesKeyStrength.KEY_STRENGTH_256);
-                }
-
-                // Add files.
-                for (File includePath : includePaths) {
-                    if (includePath.exists()) {
-                        if (includePath.isFile()) {
-                            zipFile.addFile(includePath, parameters);
-                        } else if (includePath.isDirectory()) {
-                            zipFile.addFolder(includePath, parameters);
-                        }
-                    }
-                }
-
-                if (sharedPreferencesFile != null && sharedPreferencesFile.exists()) {
-                    sharedPreferencesFile.delete();
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "exportConfig: Failed to export config, " + e.getMessage());
-                failSuccess = false;
-            }
-            Log.d(TAG, "exportConfig END");
-            return failSuccess;
+        } catch (Exception e) {
+            Log.e(TAG, "exportConfig: Failed to export config", e);
+            return false;
         } finally {
             finishFileMutation(null, true);
         }
@@ -2292,105 +2426,60 @@ public class SyncthingService extends Service {
      * @return True if the import was successful, false otherwise (eg if files aren't found).
      */
     public boolean importConfig() {
-        ZipFile zipFile = null;
         Log.d(TAG, "importConfig PRECHECK");
-
-        // Check if ZIP exists.
         File zipFilePath = getBackupZipFile();
         if (!zipFilePath.exists()) {
             Log.e(TAG, "importConfig: ZIP file is missing. Please check if it is present at '" + zipFilePath.getAbsolutePath() + "' as specified in the settings screen.");
             return false;
         }
-
-        // Open ZIP file.
+        ManagedStateStaging staging = null;
+        ZipFile zipFile;
+        Map<?, ?> importedSharedPreferences;
         try {
-            // If user set one, get password to decrypt the zip file.
-            String zipEncryptionPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
-            if (zipEncryptionPassword.isEmpty()) {
+            staging = ManagedStateLocations.forApplication(this).newStaging();
+            String password = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
+            if (password.isEmpty()) {
                 zipFile = new ZipFile(zipFilePath);
             } else {
-                zipFile = new ZipFile(zipFilePath, zipEncryptionPassword.toCharArray());
+                zipFile = new ZipFile(zipFilePath, password.toCharArray());
                 if (!zipFile.isEncrypted()) {
                     Log.e(TAG, "importConfig: ZIP file is not encrypted, but password was specified in settings screen. Try to specify an empty password temporarily.");
+                    staging.close();
                     return false;
                 }
             }
-
-            // Check if ZIP archive contains required files.
-            List<String> checkFiles = Arrays.asList(
-                Constants.CONFIG_FILE,
-
-                Constants.PRIVATE_KEY_FILE,
-                Constants.PUBLIC_KEY_FILE
-            );
-            for (final String checkFile : checkFiles) {
-                if (zipFile.getFileHeader(checkFile) == null) {
-                    Log.e(TAG, "importConfig: Required file not found inside zip [" + checkFile + "]");
-                    return false;
-                }
-            }
-
-            // Test if supplied encryption password is correct.
-            String cacheDir = this.getCacheDir().getAbsolutePath();
-            zipFile.extractFile(Constants.PUBLIC_KEY_FILE, cacheDir);
-            new File(cacheDir, Constants.PUBLIC_KEY_FILE).delete();
-        } catch (ZipException e) {
-            Log.e(TAG, "importConfig: Failed to open zip, " + e.getMessage());
+            importedSharedPreferences = SyncthingBackupArchive.extract(zipFile, staging);
+        } catch (Exception e) {
+            Log.e(TAG, "importConfig: Failed to validate or extract backup", e);
+            if (staging != null) staging.close();
             return false;
         }
 
-        // Shutdown SyncthingNative.
-        Boolean failSuccess = true;
+        if (!shutdownForFileMutation()) {
+            staging.close();
+            return false;
+        }
+
+        boolean failSuccess = true;
         Log.d(TAG, "importConfig BEGIN");
-        if (!shutdownForFileMutation()) return false;
         Runnable afterImport = null;
         boolean resetRequested = false;
+        boolean useRootPresent = mPreferences.contains(Constants.PREF_USE_ROOT);
+        Object localUseRootValue = mPreferences.getAll().get(Constants.PREF_USE_ROOT);
         try {
-
-        // Remove database folder if it exists.
-            File databasePath = Constants.getIndexDbFolder(this);
-            if (databasePath.exists()) {
-                Log.d(TAG, "importConfig: Clearing index database");
-                try {
-                    FileUtils.deleteDirectoryRecursively(databasePath);
-                } catch (IOException e) {
-                    Log.e(TAG, "Failed to delete directory '" + databasePath.getAbsolutePath() + "'" + e);
-                }
-            }
-
-            // Decompress zip file.
             try {
-                zipFile.extractAll(this.getFilesDir().getAbsolutePath());
-            } catch (ZipException e) {
-                Log.e(TAG, "importConfig: Failed to extract zip, " + e.getMessage());
+                mRuntime.managedStateTransfer().installImportedState(staging);
+            } catch (Exception e) {
+                Log.e(TAG, "importConfig: Failed to install staged Managed State", e);
                 failSuccess = false;
+                return false;
             }
 
-            // Check if necessary files are present after extraction.
-            List<File> checkPaths = Arrays.asList(
-                Constants.getConfigFile(this),
-
-                Constants.getPrivateKeyFile(this),
-                Constants.getPublicKeyFile(this),
-
-                Constants.getHttpsCertFile(this),
-                Constants.getHttpsKeyFile(this),
-
-                Constants.getSharedPrefsFile(this)
-            );
-            for (final File checkPath : checkPaths) {
-                if (!checkPath.exists()) {
-                    Log.e(TAG, "importConfig: Missing file after extraction [" + checkPath.getName() + "]");
-                    failSuccess = false;
-                }
-            }
-        
-            // Import shared preferences.
-            File sharedPreferencesFile = Constants.getSharedPrefsFile(this);
-            if (sharedPreferencesFile.exists()) {
+            if (importedSharedPreferences != null) {
                 Log.d(TAG, "importConfig: Importing shared preferences");
-                failSuccess = failSuccess && importConfigSharedPrefs(sharedPreferencesFile);
-                sharedPreferencesFile.delete();
+                failSuccess = importConfigSharedPrefs(
+                        importedSharedPreferences, useRootPresent, localUseRootValue
+                );
             }
 
             try {
@@ -2409,6 +2498,7 @@ public class SyncthingService extends Service {
             }
             return failSuccess;
         } finally {
+            staging.close();
             finishFileMutation(importCompletionOrFailure(
                     afterImport, failSuccess, this::failImportLifecycle
             ), false, true);
@@ -2444,7 +2534,9 @@ public class SyncthingService extends Service {
      */
     public void replaceHttpsCertificate(byte[] certPem, byte[] keyPem,
                                         OnHttpsCertReplaceResultListener listener) {
-        mHandler.post(() -> doReplaceHttpsCertificate(certPem, keyPem, listener));
+        byte[] certificate = certPem.clone();
+        byte[] key = keyPem.clone();
+        mHandler.post(() -> doReplaceHttpsCertificate(certificate, key, listener));
     }
 
     /**
@@ -2457,6 +2549,10 @@ public class SyncthingService extends Service {
 
     private void doReplaceHttpsCertificate(byte[] certPem, byte[] keyPem,
                                            OnHttpsCertReplaceResultListener listener) {
+        if (mCertificateMutationPending) {
+            listener.onResult(HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE);
+            return;
+        }
         if (FileMutationBarrier.rejectConcurrentMutation(
                 mFileMutationBarrier,
                 () -> listener.onResult(
@@ -2467,57 +2563,49 @@ public class SyncthingService extends Service {
             mHandler.postDelayed(() -> doReplaceHttpsCertificate(certPem, keyPem, listener), 1000);
             return;
         }
-
-        final File certFile = Constants.getHttpsCertFile(this);
-        final File keyFile = Constants.getHttpsKeyFile(this);
-        StoppedFileMutation replaceFiles = (releaseOwnership, automaticStartupAllowed) -> {
-            final boolean certExistedBeforeChange = certFile.exists();
-            final boolean keyExistedBeforeChange = keyFile.exists();
-            final File certBak = backupFile(certFile);
-            final File keyBak = backupFile(keyFile);
-
-            try {
-                writeBytesAtomic(certFile, certPem);
-                writeBytesAtomic(keyFile, keyPem);
-                restrictToOwner(keyFile);
-            } catch (IOException e) {
-                Log.e(TAG, "doReplaceHttpsCertificate: Failed to write new cert/key", e);
-                restoreFile(certBak, certFile);
-                restoreFile(keyBak, keyFile);
-                if (releaseOwnership != null) releaseOwnership.run();
-                if (automaticStartupAllowed && mLastDeterminedShouldRun) {
-                    launchStartupTask(SyncthingCommand.SERVE);
-                }
-                listener.onResult(HttpsCertReplaceResult.FAILED, e.getMessage());
-                return;
-            }
-
-            if (releaseOwnership != null) releaseOwnership.run();
-            applyCertChangeWithVerify(
-                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
-                    certExistedBeforeChange, keyExistedBeforeChange
+        if (mDatabaseResetOwnership.isReserved()) {
+            listener.onResult(
+                    HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
             );
-        };
-
-        if (hasServiceExecution()) {
-            shutdownForFileMutation(
-                    replaceFiles,
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
-                    ),
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
-                    ),
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
-                    )
-            );
-        } else {
-            replaceFiles.run(null, true);
+            return;
         }
+
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateMutation();
+        if (reservation == null) {
+            listener.onResult(HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE);
+            return;
+        }
+        mCertificateStorageReservation = reservation;
+
+        final HttpsCertificateStorage certificateStorage = mRuntime.httpsCertificateStorage();
+        StoppedFileMutation replaceFiles = ownership -> startCertificateMutation(
+                certificateStorage,
+                CertificateStorageMutation.replace(certPem, keyPem),
+                ownership,
+                reservation,
+                listener
+        );
+        shutdownForFileMutation(
+                replaceFiles,
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                ),
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
+                ),
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
+                ),
+                reservation
+        );
     }
 
     private void doResetHttpsCertificate(OnHttpsCertReplaceResultListener listener) {
+        if (mCertificateMutationPending) {
+            listener.onResult(HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE);
+            return;
+        }
         if (FileMutationBarrier.rejectConcurrentMutation(
                 mFileMutationBarrier,
                 () -> listener.onResult(
@@ -2528,41 +2616,42 @@ public class SyncthingService extends Service {
             mHandler.postDelayed(() -> doResetHttpsCertificate(listener), 1000);
             return;
         }
-
-        final File certFile = Constants.getHttpsCertFile(this);
-        final File keyFile = Constants.getHttpsKeyFile(this);
-
-        StoppedFileMutation resetFiles = (releaseOwnership, automaticStartupAllowed) -> {
-            final boolean certExistedBeforeChange = certFile.exists();
-            final boolean keyExistedBeforeChange = keyFile.exists();
-            final File certBak = backupFile(certFile);
-            final File keyBak = backupFile(keyFile);
-            // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
-            deleteQuietly(certFile);
-            deleteQuietly(keyFile);
-            if (releaseOwnership != null) releaseOwnership.run();
-            applyCertChangeWithVerify(
-                    certFile, keyFile, certBak, keyBak, listener, automaticStartupAllowed,
-                    certExistedBeforeChange, keyExistedBeforeChange
+        if (mDatabaseResetOwnership.isReserved()) {
+            listener.onResult(
+                    HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
             );
-        };
-
-        if (hasServiceExecution()) {
-            shutdownForFileMutation(
-                    resetFiles,
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE
-                    ),
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
-                    ),
-                    () -> listener.onResult(
-                            HttpsCertReplaceResult.FAILED, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
-                    )
-            );
-        } else {
-            resetFiles.run(null, true);
+            return;
         }
+
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateMutation();
+        if (reservation == null) {
+            listener.onResult(HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE);
+            return;
+        }
+        mCertificateStorageReservation = reservation;
+
+        final HttpsCertificateStorage certificateStorage = mRuntime.httpsCertificateStorage();
+        StoppedFileMutation resetFiles = ownership -> startCertificateMutation(
+                certificateStorage,
+                CertificateStorageMutation.reset(),
+                ownership,
+                reservation,
+                listener
+        );
+        shutdownForFileMutation(
+                resetFiles,
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, FILE_MUTATION_IN_PROGRESS_MESSAGE
+                ),
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, CERT_MUTATION_SHUTDOWN_FAILURE_MESSAGE
+                ),
+                () -> failCertificateMutationBeforeWrite(
+                        reservation, listener, CERT_MUTATION_LIFECYCLE_PENDING_MESSAGE
+                ),
+                reservation
+        );
     }
 
     private boolean hasServiceExecution() {
@@ -2579,21 +2668,286 @@ public class SyncthingService extends Service {
         );
     }
 
-    private void applyCertChangeWithVerify(File certFile, File keyFile,
-                                           @Nullable File certBak, @Nullable File keyBak,
-                                           OnHttpsCertReplaceResultListener listener,
-                                           boolean automaticStartupAllowed,
-                                           boolean certExistedBeforeChange,
-                                           boolean keyExistedBeforeChange) {
-        if (automaticStartupAllowed && mLastDeterminedShouldRun) {
-            verifyRestartAndRollback(
-                    certFile, keyFile, certBak, keyBak, listener,
-                    certExistedBeforeChange, keyExistedBeforeChange
-            );
+    private void startCertificateMutation(
+            HttpsCertificateStorage storage,
+            CertificateStorageMutation.Action action,
+            CertificateMutationOwnership ownership,
+            FileMutationBarrier.CertificateRestoreReservation reservation,
+            OnHttpsCertReplaceResultListener listener
+    ) {
+        if (mCertificateMutationPending) {
+            ownership.release();
+            reservation.release(true);
+            clearReleasedCertificateStorageReservation(reservation);
+            listener.onResult(HttpsCertReplaceResult.FAILED, FILE_MUTATION_IN_PROGRESS_MESSAGE);
+            return;
+        }
+        AtomicBoolean cancelled = new AtomicBoolean();
+        mCertificateMutationPending = true;
+        mCertificateMutationCancellation = cancelled;
+        mCertificateStorageReservation = reservation;
+        boolean submitted = CertificateStorageMutation.submit(
+                mCertificateStorageExecutor,
+                storage,
+                action,
+                cancelled,
+                result -> {
+                    if (!postCertificateMutationCompletion(() -> completeCertificateMutation(
+                            storage, result, ownership, reservation, listener
+                    ))) {
+                        reservation.release(false);
+                    }
+                }
+        );
+        if (!submitted) Log.w(TAG, "Certificate storage worker rejected the mutation");
+    }
+
+    private void failCertificateMutationBeforeWrite(
+            FileMutationBarrier.CertificateRestoreReservation reservation,
+            OnHttpsCertReplaceResultListener listener,
+            String detail
+    ) {
+        reservation.release(true);
+        clearReleasedCertificateStorageReservation(reservation);
+        listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+    }
+
+    /** Defers destruction rollback until the shutdown path has established stopped-state safety. */
+    private void startDestructionRestoreAfterMutation(
+            HttpsCertificateStorage storage,
+            HttpsCertificateState previous,
+            CertificateMutationOwnership ownership,
+            FileMutationBarrier.CertificateRestoreReservation reservation,
+            OnHttpsCertReplaceResultListener listener
+    ) {
+        CertificateDestructionRestore[] restoreRef = new CertificateDestructionRestore[1];
+        CertificateDestructionRestore restore = new CertificateDestructionRestore(
+                mCertificateStorageExecutor,
+                storage,
+                previous,
+                reservation,
+                outcome -> {
+                    boolean posted = postCertificateMutationCompletion(() -> {
+                        mCertificateMutationPending = false;
+                        mCertificateMutationCancellation = null;
+                        if (mCertificateDestructionRestore == restoreRef[0]) {
+                            mCertificateDestructionRestore = null;
+                        }
+                        ownership.release();
+                        clearReleasedCertificateStorageReservation(reservation);
+                        String detail;
+                        if (!outcome.executionExitProven()) {
+                            detail = "Service was destroyed, but Syncthing exit could not be"
+                                    + " proven; the previous HTTPS certificate state was not"
+                                    + " changed. " + outcome.shutdownFailure().getMessage();
+                        } else if (outcome.restoration().stateRestored()) {
+                            detail = "Service was destroyed during the HTTPS certificate"
+                                    + " operation; the previous certificate state was restored.";
+                        } else {
+                            Throwable failure = outcome.restoration().failure();
+                            detail = "Service was destroyed and the previous HTTPS certificate"
+                                    + " state could not be restored: " + (failure == null
+                                            ? "unknown restoration failure"
+                                            : failure.getMessage());
+                        }
+                        try {
+                            listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+                        } finally {
+                            if (mDestroying) mCertificateStorageExecutor.shutdown();
+                        }
+                    });
+                    if (!posted) mCertificateStorageExecutor.shutdown();
+                }
+        );
+        restoreRef[0] = restore;
+        mCertificateDestructionRestore = restore;
+        mCertificateMutationPending = true;
+        mCertificateMutationCancellation = null;
+
+        if (mShutdownInProgress) return;
+        if (mShutdownSafetyEstablished) {
+            restore.onExecutionExitProven();
         } else {
-            // Not currently meant to run; the new files will take effect on next start.
-            deleteQuietly(certBak);
-            deleteQuietly(keyBak);
+            restore.onExecutionExitUnproven(new IllegalStateException(
+                    "Could not prove Syncthing stopped; certificate restoration was not safe."
+            ));
+        }
+    }
+
+    /** Restores saved certificate files on the worker and resolves the result on the service thread. */
+    private void startCertificateRestore(
+            HttpsCertificateStorage storage,
+            HttpsCertificateState previous,
+            CertificateStorageMutation.Completion completion
+    ) {
+        if (mCertificateMutationPending) {
+            completion.onComplete(CertificateStorageMutation.failedRestore(
+                    previous,
+                    new IllegalStateException("Certificate storage work is already pending")
+            ));
+            return;
+        }
+        FileMutationBarrier.CertificateRestoreReservation reservation =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        if (reservation == null) {
+            completeCertificateRestore(null, null, completion,
+                    CertificateStorageMutation.failedRestore(
+                            previous,
+                            new IllegalStateException(
+                                    "Certificate storage is owned by another restore"
+                            )
+                    ));
+            return;
+        }
+
+        FileMutationBarrier restoreBarrier = FileMutationBarrier.reserveAsyncOwner(
+                mFileMutationBarrier, () -> { }, () -> { }, () -> { }
+        );
+        if (restoreBarrier == null) {
+            reservation.release(false);
+            completeCertificateRestore(null, null, completion,
+                    CertificateStorageMutation.failedRestore(
+                            previous,
+                            new IllegalStateException(
+                                    "Another file mutation owns certificate storage"
+                            )
+                    ));
+            return;
+        }
+        restoreBarrier.setAsyncMutation(() -> { });
+        mFileMutationBarrier = restoreBarrier;
+
+        mCertificateMutationPending = true;
+        mCertificateMutationCancellation = null;
+        mCertificateStorageReservation = reservation;
+        FileMutationBarrier ownedRestoreBarrier = restoreBarrier;
+        FileMutationBarrier.CertificateRestoreReservation ownedReservation = reservation;
+        CertificateStorageMutation.submitRestore(
+                mCertificateStorageExecutor,
+                storage,
+                previous,
+                result -> {
+                    boolean posted = postCertificateMutationCompletion(() ->
+                            completeCertificateRestore(
+                                    ownedRestoreBarrier,
+                                    ownedReservation,
+                                    completion,
+                                    result
+                            )
+                    );
+                    if (!posted) ownedReservation.release(false);
+                }
+        );
+    }
+
+    private void completeCertificateRestore(
+            @Nullable FileMutationBarrier restoreBarrier,
+            @Nullable FileMutationBarrier.CertificateRestoreReservation reservation,
+            CertificateStorageMutation.Completion completion,
+            CertificateStorageMutation.Result result
+    ) {
+        mCertificateMutationPending = false;
+        mCertificateMutationCancellation = null;
+        if (restoreBarrier != null && mFileMutationBarrier == restoreBarrier) {
+            mFileMutationBarrier = null;
+        }
+        if (reservation != null) {
+            reservation.completeStorage(result.stateRestored());
+            clearReleasedCertificateStorageReservation(reservation);
+        }
+        try {
+            completion.onComplete(result);
+        } finally {
+            if (mDestroying) mCertificateStorageExecutor.shutdown();
+        }
+    }
+
+    /** Returns storage results to the main thread before changing lifecycle state or ownership. */
+    private boolean postCertificateMutationCompletion(Runnable completion) {
+        if (!mHandler.post(completion)) {
+            Log.e(TAG, "Certificate storage outcome could not return to the service thread");
+            return false;
+        }
+        return true;
+    }
+
+    private void completeCertificateMutation(
+            HttpsCertificateStorage storage,
+            CertificateStorageMutation.Result result,
+            CertificateMutationOwnership ownership,
+            FileMutationBarrier.CertificateRestoreReservation reservation,
+            OnHttpsCertReplaceResultListener listener
+    ) {
+        mCertificateMutationPending = false;
+        mCertificateMutationCancellation = null;
+        if (mDestroying) {
+            if (result.previous() != null
+                    && (result.succeeded() || !result.stateRestored())) {
+                startDestructionRestoreAfterMutation(
+                        storage, result.previous(), ownership, reservation, listener
+                );
+                return;
+            }
+            reservation.completeStorage(result.succeeded() || result.stateRestored());
+            ownership.release();
+            clearReleasedCertificateStorageReservation(reservation);
+            try {
+                listener.onResult(
+                        HttpsCertReplaceResult.FAILED,
+                        "Service was destroyed during the HTTPS certificate operation."
+                );
+            } finally {
+                mCertificateStorageExecutor.shutdown();
+            }
+            return;
+        }
+        reservation.completeStorage(result.succeeded() || result.stateRestored());
+        clearReleasedCertificateStorageReservation(reservation);
+        boolean automaticStartupAllowed = ownership.release();
+        if (result.succeeded()) {
+            applyCertChangeWithVerify(
+                    storage, result.previous(), listener, automaticStartupAllowed
+            );
+            return;
+        }
+
+        Throwable failure = result.failure();
+        Throwable rollbackFailure = result.rollbackFailure();
+        String detail = result.cancelled()
+                ? "HTTPS certificate operation was cancelled."
+                : failure == null ? "HTTPS certificate operation failed."
+                : failure.getMessage();
+        if (rollbackFailure != null) {
+            detail = (detail == null ? "HTTPS certificate operation failed" : detail)
+                    + "; previous certificate state could not be restored: "
+                    + rollbackFailure.getMessage();
+            Log.e(TAG, "Could not restore HTTPS certificate state after mutation failure",
+                    rollbackFailure);
+        }
+        if (failure != null) Log.e(TAG, "HTTPS certificate mutation failed", failure);
+        if (result.stateRestored() && automaticStartupAllowed && mLastDeterminedShouldRun) {
+            launchStartupTask(SyncthingCommand.SERVE);
+        }
+        listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+    }
+
+    private void clearReleasedCertificateStorageReservation(
+            FileMutationBarrier.CertificateRestoreReservation reservation
+    ) {
+        if (reservation.isReleased() && mCertificateStorageReservation == reservation) {
+            mCertificateStorageReservation = null;
+        }
+    }
+
+    private void applyCertChangeWithVerify(
+            HttpsCertificateStorage storage,
+            HttpsCertificateState previous,
+            OnHttpsCertReplaceResultListener listener,
+            boolean automaticStartupAllowed
+    ) {
+        if (automaticStartupAllowed && mLastDeterminedShouldRun) {
+            verifyRestartAndRollback(storage, previous, listener);
+        } else {
             listener.onResult(HttpsCertReplaceResult.SUCCESS_PENDING_START, null);
         }
     }
@@ -2605,11 +2959,11 @@ public class SyncthingService extends Service {
      * {@link HttpsCertReplaceResult#SUCCESS_PENDING_START}; a stop during failure recovery also
      * suppresses its automatic relaunch.
      */
-    private void verifyRestartAndRollback(File certFile, File keyFile,
-                                          @Nullable File certBak, @Nullable File keyBak,
-                                          OnHttpsCertReplaceResultListener listener,
-                                          boolean certExistedBeforeChange,
-                                          boolean keyExistedBeforeChange) {
+    private void verifyRestartAndRollback(
+            HttpsCertificateStorage storage,
+            HttpsCertificateState previous,
+            OnHttpsCertReplaceResultListener listener
+    ) {
         final CertificateVerificationState verification = new CertificateVerificationState();
         verification.beginVerification();
         final OnServiceStateChangeListener[] verifyListener = new OnServiceStateChangeListener[1];
@@ -2625,16 +2979,11 @@ public class SyncthingService extends Service {
 
         final Runnable finishSuccess = () -> {
             clearStopHandler.run();
-            deleteQuietly(certBak);
-            deleteQuietly(keyBak);
             listener.onResult(HttpsCertReplaceResult.SUCCESS, null);
         };
         final Runnable finishPendingStart = () -> {
             verification.completePendingStart(
-                    () -> {
-                        deleteQuietly(certBak);
-                        deleteQuietly(keyBak);
-                    },
+                    () -> { },
                     () -> {
                         clearStopHandler.run();
                         listener.onResult(HttpsCertReplaceResult.SUCCESS_PENDING_START, null);
@@ -2642,11 +2991,8 @@ public class SyncthingService extends Service {
             );
         };
         final Runnable finishFailure = () -> {
-            Runnable restoreAndRelaunch = verification.completeFailureRecovery(
-                    () -> {
-                        restoreFile(certBak, certFile);
-                        restoreFile(keyBak, keyFile);
-                    },
+            Runnable finishAfterRestore = verification.completeFailureRecovery(
+                    () -> { },
                     () -> mLastDeterminedShouldRun,
                     () -> launchStartupTask(SyncthingCommand.SERVE),
                     () -> {
@@ -2663,6 +3009,49 @@ public class SyncthingService extends Service {
                                 "Syncthing did not come online with the new certificate.");
                     }
             );
+            Runnable restoreSafely = () -> startCertificateRestore(
+                    storage,
+                    previous,
+                    result -> {
+                        if (mDestroying) {
+                            clearStopHandler.run();
+                            String detail = result.stateRestored()
+                                    ? "Service was destroyed before certificate verification completed."
+                                    : "Service was destroyed and the previous HTTPS certificate"
+                                            + " state could not be restored: "
+                                            + result.failure().getMessage();
+                            listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+                        } else if (!result.stateRestored()) {
+                            String detail = "Could not restore the previous HTTPS certificate state: "
+                                    + result.failure().getMessage();
+                            verification.failFailureRecoveryShutdown(() -> {
+                                clearStopHandler.run();
+                                mShutdownStartIntent.clear();
+                                listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+                            });
+                        } else {
+                            Runnable shutdownFailure = () ->
+                                    verification.failFailureRecoveryShutdown(() -> {
+                                        clearStopHandler.run();
+                                        mShutdownStartIntent.clear();
+                                        listener.onResult(
+                                                HttpsCertReplaceResult.FAILED,
+                                                "Syncthing shutdown could not be proven safe after"
+                                                        + " certificate restoration."
+                                        );
+                                    });
+                            CertificateRestoreShutdownContinuation.runAfterShutdown(
+                                    mShutdownInProgress,
+                                    finishAfterRestore,
+                                    shutdownFailure,
+                                    (continuation, failure) -> shutdown(
+                                            State.DISABLED, continuation, true, false, failure
+                                    ),
+                                    this::runShutdownCompletion
+                            );
+                        }
+                    }
+            );
             if (hasServiceExecution()) {
                 Runnable shutdownFailure = () -> verification.failFailureRecoveryShutdown(
                         () -> {
@@ -2676,13 +3065,13 @@ public class SyncthingService extends Service {
                 );
                 shutdown(
                         State.INIT,
-                        restoreAndRelaunch,
+                        restoreSafely,
                         true,
                         false,
                         shutdownFailure
                 );
             } else {
-                restoreAndRelaunch.run();
+                restoreSafely.run();
             }
         };
 
@@ -2742,21 +3131,54 @@ public class SyncthingService extends Service {
                 } catch (RuntimeException e) {
                     Log.e(TAG, "Could not remove certificate verification listener", e);
                 }
+                boolean mutationAlreadyPending = mCertificateMutationPending;
+                CertificateDestructionRestore[] restore =
+                        new CertificateDestructionRestore[1];
                 try {
-                    verification.resolveForDestruction(
-                            () -> {
-                                restoreOriginalFileOrRemoveNew(
-                                        certBak, certFile, certExistedBeforeChange
-                                );
-                                restoreOriginalFileOrRemoveNew(
-                                        keyBak, keyFile, keyExistedBeforeChange
-                                );
-                            },
-                            () -> listener.onResult(
-                                    HttpsCertReplaceResult.FAILED,
-                                    "Service was destroyed before certificate verification completed."
-                            )
+                    restore[0] = CertificateDestructionRestore.prepareForDestruction(
+                            verification,
+                            mutationAlreadyPending,
+                            mCertificateStorageExecutor,
+                            storage,
+                            previous,
+                            outcome -> postCertificateMutationCompletion(() -> {
+                                mCertificateMutationPending = false;
+                                mCertificateMutationCancellation = null;
+                                if (mCertificateDestructionRestore == restore[0]) {
+                                    mCertificateDestructionRestore = null;
+                                }
+                                String detail;
+                                if (!outcome.executionExitProven()) {
+                                    detail = "Service was destroyed, but Syncthing"
+                                            + " exit could not be proven; the previous"
+                                            + " HTTPS certificate state was not changed."
+                                            + " " + outcome.shutdownFailure().getMessage();
+                                } else if (outcome.restoration().stateRestored()) {
+                                    detail = "Service was destroyed before certificate"
+                                            + " verification completed; the previous"
+                                            + " certificate state was restored.";
+                                } else {
+                                    Throwable failure = outcome.restoration().failure();
+                                    detail = "Service was destroyed and the previous"
+                                            + " HTTPS certificate state could not be"
+                                            + " restored: " + (failure == null
+                                                    ? "unknown restoration failure"
+                                                    : failure.getMessage());
+                                }
+                                try {
+                                    listener.onResult(HttpsCertReplaceResult.FAILED, detail);
+                                } finally {
+                                    if (mDestroying) {
+                                        mCertificateStorageExecutor.shutdown();
+                                    }
+                                }
+                            })
                     );
+                    if (restore[0] != null) {
+                        mCertificateMutationPending = true;
+                        mCertificateMutationCancellation = null;
+                        mCertificateDestructionRestore = restore[0];
+                    }
                 } catch (RuntimeException e) {
                     Log.e(TAG, "Could not resolve certificate verification during destruction", e);
                 } finally {
@@ -2791,71 +3213,6 @@ public class SyncthingService extends Service {
                     outcome, finishSuccess, finishPendingStart, finishFailure
             );
         });
-    }
-
-    @Nullable
-    private File backupFile(File file) {
-        if (!file.exists()) {
-            return null;
-        }
-        File bak = new File(file.getParentFile(), file.getName() + ".bak");
-        deleteQuietly(bak);
-        if (file.renameTo(bak)) {
-            return bak;
-        }
-        Log.w(TAG, "backupFile: Failed to back up " + file.getName());
-        return null;
-    }
-
-    private void restoreFile(@Nullable File bak, File target) {
-        if (bak == null || !bak.exists()) {
-            return;
-        }
-        deleteQuietly(target);
-        if (!bak.renameTo(target)) {
-            Log.w(TAG, "restoreFile: Failed to restore " + target.getName());
-        }
-    }
-
-    /** Restores a prior file when backed up, or removes a new file that had no prior version. */
-    private void restoreOriginalFileOrRemoveNew(
-            @Nullable File backup,
-            File target,
-            boolean existedBeforeChange
-    ) {
-        if (backup != null && backup.exists()) {
-            restoreFile(backup, target);
-        } else if (!existedBeforeChange) {
-            deleteQuietly(target);
-        }
-    }
-
-    private void deleteQuietly(@Nullable File file) {
-        if (file != null && file.exists() && !file.delete()) {
-            Log.w(TAG, "deleteQuietly: Failed to delete " + file.getName());
-        }
-    }
-
-    private void writeBytesAtomic(File target, byte[] data) throws IOException {
-        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
-        try (FileOutputStream fos = new FileOutputStream(tmp)) {
-            fos.write(data);
-            fos.flush();
-            fos.getFD().sync();
-        }
-        if (!tmp.renameTo(target)) {
-            deleteQuietly(tmp);
-            throw new IOException("Failed to rename " + tmp.getName() + " to " + target.getName());
-        }
-    }
-
-    private void restrictToOwner(File file) {
-        // Mirror syncthing core, which writes the HTTPS key with 0600 permissions.
-        file.setReadable(false, false);
-        file.setReadable(true, true);
-        file.setWritable(false, false);
-        file.setWritable(true, true);
-        file.setExecutable(false, false);
     }
 
     private boolean cleanupImportedFolderDatabases() {
@@ -2897,106 +3254,118 @@ public class SyncthingService extends Service {
         return false;
     }
 
-    private boolean importConfigSharedPrefs(final File file) {
-        Boolean failSuccess = true;
-        FileInputStream fileInputStream = null;
-        ObjectInputStream objectInputStream = null;
-        Map<?, ?> sharedPrefsMap = null;
+    private boolean importConfigSharedPrefs(
+            Map<?, ?> sharedPrefsMap,
+            boolean useRootPresent,
+            Object localUseRootValue
+    ) {
+        boolean failSuccess = true;
         try {
-            
-            // Read, deserialize shared preferences.
-            fileInputStream = new FileInputStream(file);
-            objectInputStream = new ObjectInputStream(fileInputStream);
-            Object objectFromInputStream = objectInputStream.readObject();
-            if (objectFromInputStream instanceof Map) {
-                sharedPrefsMap = (Map<?, ?>) objectFromInputStream;
+            // Store backup folder to restore it back later in the process.
+            String relPathToZip = mPreferences.getString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, "");
+            String backupPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
 
-                // Store backup folder to restore it back later in the process.
-                String relPathToZip = mPreferences.getString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, "");
-                String backupPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
-
-                // Prepare a SharedPreferences commit.
-                SharedPreferences.Editor editor = mPreferences.edit();
-                editor.clear();
-                for (Map.Entry<?, ?> e : sharedPrefsMap.entrySet()) {
-                    String prefKey = (String) e.getKey();
-                    switch (prefKey) {
-                        // Preferences that are no longer used and left-overs from previous versions of the app.
-                        case "first_start":
-                        case "advanced_folder_picker":
-                        case "backup_folder_name":
-                        case "bind_network":
-                        case "log_to_file":
-                        case "notification_type":
-                        case "notify_crashes":
-                        case "suggest_new_folder_root":
-                        case "use_legacy_hashing":
-                        case "pref_current_language":
-                        case "restartOnWakeup":
-                        case "wakelock_while_binary_running":
-                        case "use_root":
-                        case "important_news_shown_version":
-                            LogV("importConfig: Ignoring deprecated pref \"" + prefKey + "\".");
-                            break;
-                        // Cached information which is not available on SettingsActivity.
-                        case Constants.PREF_APP_START_COUNTER:
-                        case Constants.PREF_BTNSTATE_FORCE_START_STOP:
-                        case Constants.PREF_DEBUG_FACILITIES_AVAILABLE:
-                        case Constants.PREF_EVENT_PROCESSOR_LAST_SYNC_ID:
-                        case Constants.PREF_LAST_BINARY_VERSION:
-                        case Constants.PREF_LOCAL_DEVICE_ID:
-                        case Constants.PREF_LAST_RUN_TIME:
-                            LogV("importConfig: Ignoring cache pref \"" + prefKey + "\".");
-                            break;
-                        default:
-                            Log.i(TAG, "importConfig: Adding pref \"" + prefKey + "\" to commit ...");
-
-                            // The editor only provides typed setters.
-                            if (e.getValue() instanceof Boolean) {
-                                editor.putBoolean(prefKey, (Boolean) e.getValue());
-                            } else if (e.getValue() instanceof String) {
-                                editor.putString(prefKey, (String) e.getValue());
-                            } else if (e.getValue() instanceof Integer) {
-                                editor.putInt(prefKey, (Integer) e.getValue());
-                            } else if (e.getValue() instanceof Float) {
-                                editor.putFloat(prefKey, (Float) e.getValue());
-                            } else if (e.getValue() instanceof Long) {
-                                editor.putLong(prefKey, (Long) e.getValue());
-                            } else if (e.getValue() instanceof Set) {
-                                editor.putStringSet(prefKey, asSet((Set<?>) e.getValue(), String.class));
-                            } else {
-                                Log.w(TAG, "importConfig: SharedPref type " + e.getValue().getClass().getName() + " is unknown");
-                            }
-                            break;
-                    }
+            // Prepare a SharedPreferences commit only after the complete archive value is valid.
+            SharedPreferences.Editor editor = mPreferences.edit();
+            editor.clear();
+            for (Map.Entry<?, ?> e : sharedPrefsMap.entrySet()) {
+                String prefKey = (String) e.getKey();
+                if (isDeviceLocalPreference(prefKey)) {
+                    LogV("importConfig: Ignoring device-local pref \"" + prefKey + "\".");
+                    continue;
                 }
-                editor.putString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, relPathToZip);
-                editor.putString(Constants.PREF_BACKUP_PASSWORD, backupPassword);
-
-                /**
-                 * If all shared preferences have been added to the commit successfully,
-                 * apply the commit.
-                 */
-                failSuccess = failSuccess && editor.commit();
-            } else {
-                Log.e(TAG, "importConfig: Invalid object stream");
+                switch (prefKey) {
+                    // Preferences that are no longer used and left-overs from previous versions of the app.
+                    case "first_start":
+                    case "advanced_folder_picker":
+                    case "backup_folder_name":
+                    case "bind_network":
+                    case "log_to_file":
+                    case "notification_type":
+                    case "notify_crashes":
+                    case "suggest_new_folder_root":
+                    case "use_legacy_hashing":
+                    case "pref_current_language":
+                    case "restartOnWakeup":
+                    case "wakelock_while_binary_running":
+                    case "important_news_shown_version":
+                        LogV("importConfig: Ignoring deprecated pref \"" + prefKey + "\".");
+                        break;
+                    // Cached information which is not available on SettingsActivity.
+                    case Constants.PREF_APP_START_COUNTER:
+                    case Constants.PREF_BTNSTATE_FORCE_START_STOP:
+                    case Constants.PREF_DEBUG_FACILITIES_AVAILABLE:
+                    case Constants.PREF_EVENT_PROCESSOR_LAST_SYNC_ID:
+                    case Constants.PREF_LAST_BINARY_VERSION:
+                    case Constants.PREF_LOCAL_DEVICE_ID:
+                    case Constants.PREF_LAST_RUN_TIME:
+                        LogV("importConfig: Ignoring cache pref \"" + prefKey + "\".");
+                        break;
+                    default:
+                        Log.i(TAG, "importConfig: Adding pref \"" + prefKey + "\" to commit ...");
+                        if (e.getValue() instanceof Boolean) {
+                            editor.putBoolean(prefKey, (Boolean) e.getValue());
+                        } else if (e.getValue() instanceof String) {
+                            editor.putString(prefKey, (String) e.getValue());
+                        } else if (e.getValue() instanceof Integer) {
+                            editor.putInt(prefKey, (Integer) e.getValue());
+                        } else if (e.getValue() instanceof Float) {
+                            editor.putFloat(prefKey, (Float) e.getValue());
+                        } else if (e.getValue() instanceof Long) {
+                            editor.putLong(prefKey, (Long) e.getValue());
+                        } else if (e.getValue() instanceof Set) {
+                            editor.putStringSet(prefKey, asSet((Set<?>) e.getValue(), String.class));
+                        }
+                        break;
+                }
             }
-        } catch (IOException | ClassNotFoundException e) {
+            editor.putString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, relPathToZip);
+            editor.putString(Constants.PREF_BACKUP_PASSWORD, backupPassword);
+
+            if (!restoreLocalExecutionModePreference(
+                    editor, useRootPresent, localUseRootValue
+            )) {
+                Log.e(TAG, "importConfig: Could not preserve the local execution mode preference");
+                failSuccess = false;
+            }
+
+            if (failSuccess) failSuccess = editor.commit();
+        } catch (RuntimeException e) {
             Log.e(TAG, "importConfig: Failed to import SharedPreferences #1", e);
             failSuccess = false;
-        } finally {
-            try {
-                if (objectInputStream != null) {
-                    objectInputStream.close();
-                }
-                if (fileInputStream != null) {
-                    fileInputStream.close();
-                }
-            } catch (IOException e) {
-                Log.e(TAG, "importConfig: Failed to import SharedPreferences #2", e);
-            }
         }
         return failSuccess;
+    }
+
+    private static boolean putPreferenceValue(
+            SharedPreferences.Editor editor, String key, Object value
+    ) {
+        if (value instanceof Boolean) {
+            editor.putBoolean(key, (Boolean) value);
+        } else if (value instanceof String) {
+            editor.putString(key, (String) value);
+        } else if (value instanceof Integer) {
+            editor.putInt(key, (Integer) value);
+        } else if (value instanceof Float) {
+            editor.putFloat(key, (Float) value);
+        } else if (value instanceof Long) {
+            editor.putLong(key, (Long) value);
+        } else if (value instanceof Set) {
+            editor.putStringSet(key, asSet((Set<?>) value, String.class));
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    static boolean isDeviceLocalPreference(String key) {
+        return Constants.PREF_USE_ROOT.equals(key);
+    }
+
+    static boolean restoreLocalExecutionModePreference(
+            SharedPreferences.Editor editor, boolean wasPresent, Object value
+    ) {
+        return !wasPresent || putPreferenceValue(editor, Constants.PREF_USE_ROOT, value);
     }
 
     public static <T> Set<T> asSet(Set<?> c, Class<? extends T> type) {

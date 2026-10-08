@@ -455,6 +455,27 @@ public final class DefaultSyncthingRuntime
         return backend.configStorage();
     }
 
+    /**
+     * Returns the selected backend's semantic Managed State transfer.
+     *
+     * <p>The runtime only delegates: it never substitutes application-UID state access when the
+     * selected backend cannot serve an operation, so a failed privileged transfer stays a reported
+     * failure.</p>
+     */
+    public ManagedStateTransfer managedStateTransfer() {
+        return backend.managedStateTransfer();
+    }
+
+    /**
+     * Returns the selected backend's semantic HTTPS certificate storage.
+     *
+     * <p>The certificate workflow uses this capability for prior-state capture, mutation, and
+     * rollback, so it needs no direct file access of its own.</p>
+     */
+    public HttpsCertificateStorage httpsCertificateStorage() {
+        return backend.httpsCertificateStorage();
+    }
+
     public FolderWriteability validateCandidateFolder(String path) {
         return backend.validateCandidateFolder(path);
     }

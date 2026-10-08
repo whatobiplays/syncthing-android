@@ -143,6 +143,98 @@ interface RootShell extends AutoCloseable {
      */
     String readBootId() throws IOException;
 
+    /**
+     * Reads one approved Managed State regular file with byte-exact content.
+     *
+     * <p>The transfer is a fixed, byte-preserving operation of the root transport: the shell encodes
+     * the file exactly as it exists, so no line-oriented read and no trailing-newline
+     * normalization can alter it. Callers name an approved member and never a path.</p>
+     *
+     * @return the exact file content, or {@code null} when the member is absent
+     * @throws IOException when the member exists but cannot be read, is not a regular file, or is a
+     *     symbolic link
+     */
+    byte[] readStateFile(ManagedStateMember member) throws IOException;
+
+    /**
+     * Replaces one approved Managed State regular file atomically.
+     *
+     * <p>The command writes through an operation-owned temporary file and renames it over the
+     * member, so no reader observes a half-written file and a failed operation leaves the previous
+     * content in place.</p>
+     *
+     * @throws IOException when the member cannot be replaced
+     */
+    void writeStateFile(ManagedStateMember member, byte[] contents) throws IOException;
+
+    /**
+     * Removes one approved Managed State member without following symbolic links.
+     *
+     * <p>A member that is already absent is a successful no-op.</p>
+     *
+     * @throws IOException when a present member cannot be removed
+     */
+    void removeStateMember(ManagedStateMember member) throws IOException;
+
+    /**
+     * Reports whether one approved member exists with its required filesystem kind.
+     *
+     * <p>A symbolic link and a member of the wrong kind both report {@code false}, because neither
+     * may be treated as readable Managed State.</p>
+     *
+     * @throws IOException when the shell cannot answer
+     */
+    boolean stateMemberExists(ManagedStateMember member) throws IOException;
+
+    /**
+     * Copies Managed State into one fresh operation-owned staging directory and hands it to the
+     * application.
+     *
+     * <p>The operation name is one the application generated below the fixed staging base. The
+     * command refuses to reuse an existing directory, copies only the approved members, refuses
+     * symbolic links and special files anywhere in the copied tree, changes ownership and mode only
+     * inside the staged tree, establishes the security context when the kernel enforces SELinux,
+     * and proves the handoff before it reports success. Every failure removes only this operation's
+     * staging tree and reports the failure.</p>
+     *
+     * @throws IOException when the snapshot or the handoff to the application failed
+     */
+    void stageManagedStateForApp(String operationName) throws IOException;
+
+    /**
+     * Removes one operation-owned staging directory without following symbolic links.
+     *
+     * <p>The command removes only that one directory tree and never touches a sibling or the
+     * staging base itself.</p>
+     *
+     * @throws IOException when the directory cannot be removed
+     */
+    void removeStagingDirectory(String operationName) throws IOException;
+
+    /**
+     * Installs the staged members of one application-owned staging directory into Managed State.
+     *
+     * <p>Only approved members replace live state, and the required members must be staged as
+     * regular files. When {@code index-v2} is not staged, the live index database is removed
+     * instead, so a legacy archive never leaves stale database state behind. Symbolic links and
+     * special files in the staged tree fail the operation before live state is touched.</p>
+     *
+     * @throws IOException when the staged tree is unsafe or installation failed
+     */
+    void installStagedManagedState(String operationName) throws IOException;
+
+    /**
+     * Restores application access to the approved Managed State members.
+     *
+     * <p>The command repairs ownership, mode, and the security context of exactly the approved
+     * members and verifies the result. It is idempotent and retry-safe: a repair that only partly
+     * completed can be repeated, including through a new helper session. It never walks the
+     * application data directory and never follows symbolic links.</p>
+     *
+     * @throws IOException when a member cannot be repaired or the repair cannot be verified
+     */
+    void repairManagedStateAccess() throws IOException;
+
     @Override
     void close();
 }

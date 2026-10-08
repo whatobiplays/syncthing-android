@@ -4,6 +4,7 @@ import com.topjohnwu.superuser.Shell;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -42,7 +43,10 @@ final class ScriptedLibsuShell extends Shell {
     private final AtomicInteger statReads = new AtomicInteger();
     private final AtomicInteger closeAttempts = new AtomicInteger();
     private final CountDownLatch provenanceProbeStarted = new CountDownLatch(1);
+    private final List<String> executedCommands = Collections.synchronizedList(new ArrayList<>());
     private int provenanceExitCode;
+    private boolean stateReadFails;
+    private boolean stateJobNotExecuted;
     private boolean diesDuringProvenanceProbe;
     private boolean shellDead;
 
@@ -93,12 +97,31 @@ final class ScriptedLibsuShell extends Shell {
         return statReads.get();
     }
 
+    /** Returns the helper commands sent through this shell, in execution order. */
+    List<String> executedCommands() {
+        synchronized (executedCommands) {
+            return new ArrayList<>(executedCommands);
+        }
+    }
+
     /**
      * Scripts the parent-process probe to complete with a failed job result while the shell stays
      * alive, which is what a command that ran on a healthy transport without succeeding reports.
      */
     ScriptedLibsuShell failProvenanceCommand() {
         provenanceExitCode = 1;
+        return this;
+    }
+
+    /** Scripts a base64 read failure and models whether the generated command propagates it. */
+    ScriptedLibsuShell failStateReadCommand() {
+        stateReadFails = true;
+        return this;
+    }
+
+    /** Scripts a state operation whose libsu job never ran because the shell had exited. */
+    ScriptedLibsuShell notExecuteStateCommand() {
+        stateJobNotExecuted = true;
         return this;
     }
 
@@ -169,6 +192,7 @@ final class ScriptedLibsuShell extends Shell {
         @Override
         public Job add(String... commands) {
             command = commands.length == 0 ? "" : commands[0];
+            executedCommands.add(command);
             return this;
         }
 
@@ -197,6 +221,13 @@ final class ScriptedLibsuShell extends Shell {
                     stdout.add(statLine);
                 }
                 return result(0);
+            }
+            if (stateJobNotExecuted) {
+                shellDead = true;
+                return result(Shell.Result.JOB_NOT_EXECUTED);
+            }
+            if (stateReadFails && command != null && command.contains("base64 \"$standroid_state\"")) {
+                return result(command.contains("base64 \"$standroid_state\" || exit") ? 7 : 0);
             }
             stdout.add("0");
             return result(0);

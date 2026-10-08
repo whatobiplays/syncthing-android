@@ -1,6 +1,7 @@
 package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertFalse;
@@ -16,6 +17,7 @@ import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -27,6 +29,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 /**
@@ -40,6 +44,16 @@ import org.junit.Test;
  * rather than silently falling back to application-UID behaviour.</p>
  */
 public class RootBackendTest {
+
+    @Before
+    public void useHostNoFollowFileMetadata() {
+        ManagedStateTestSupport.useJvmSymbolicLinkInspector();
+    }
+
+    @After
+    public void clearHostNoFollowFileMetadata() {
+        ManagedStateTestSupport.clearJvmSymbolicLinkInspector();
+    }
 
     private static final String RECORD_FILE = "root-execution-v1.txt";
 
@@ -384,10 +398,12 @@ public class RootBackendTest {
     }
 
     @Test
-    public void privilegedOperationsFailClosedWithoutAcquiringRoot() throws Exception {
+    public void configurationCapabilityIsPassiveAndUnsupportedFolderOperationsFailClosed()
+            throws Exception {
         Fixture fixture = new Fixture();
         try {
-            assertNotImplemented(fixture.backend::configStorage);
+            assertNotNull("root mode exposes byte-oriented configuration storage",
+                    fixture.backend.configStorage());
             assertNotImplemented(() -> fixture.backend.validateCandidateFolder("/data"));
             assertNotImplemented(() -> fixture.backend.discoverConflicts(null));
             assertNotImplemented(() -> fixture.backend.loadFolderIgnoreList(null));
@@ -395,6 +411,207 @@ public class RootBackendTest {
             assertNotImplemented(() -> fixture.backend.runFolderScripts(null, FolderEvent.SYNC_COMPLETE));
 
             assertEquals(0, fixture.factory.acquireCalls());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void rootConfigurationAndCertificateStateRemainByteExact() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            byte[] configuration = new byte[] { 0x3c, 0x0d, 0x0a, (byte) 0xff, 0x00 };
+            Files.write(fixture.locations.member(ManagedStateMember.CONFIG).toPath(), configuration);
+            assertArrayEquals(configuration, fixture.backend.configStorage().load());
+
+            byte[] previousCertificate = new byte[] { 0x01, 0x0d, 0x0a, (byte) 0xfe };
+            byte[] previousKey = new byte[] { 0x05, 0x00, (byte) 0x80 };
+            byte[] replacementCertificate = new byte[] { 0x11, 0x12 };
+            byte[] replacementKey = new byte[] { 0x21, 0x22, 0x23 };
+            Files.write(
+                    fixture.locations.member(ManagedStateMember.HTTPS_CERT).toPath(),
+                    previousCertificate
+            );
+            Files.write(
+                    fixture.locations.member(ManagedStateMember.HTTPS_KEY).toPath(),
+                    previousKey
+            );
+
+            HttpsCertificateStorage certificates = fixture.backend.httpsCertificateStorage();
+            HttpsCertificateState previous = certificates.snapshot();
+            certificates.replace(replacementCertificate, replacementKey);
+            assertArrayEquals(
+                    replacementCertificate,
+                    Files.readAllBytes(
+                            fixture.locations.member(ManagedStateMember.HTTPS_CERT).toPath()
+                    )
+            );
+            certificates.restore(previous);
+            assertArrayEquals(
+                    previousCertificate,
+                    Files.readAllBytes(
+                            fixture.locations.member(ManagedStateMember.HTTPS_CERT).toPath()
+                    )
+            );
+            assertArrayEquals(
+                    previousKey,
+                    Files.readAllBytes(
+                            fixture.locations.member(ManagedStateMember.HTTPS_KEY).toPath()
+                    )
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void privilegedStateTransportFailureRetainsItsRootSpecificCause() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            Files.write(
+                    fixture.locations.member(ManagedStateMember.CONFIG).toPath(),
+                    new byte[] { 0x3c, 0x78, 0x3e }
+            );
+            fixture.device.rootAvailable = false;
+
+            ManagedStateException failure = assertThrows(
+                    ManagedStateException.class,
+                    () -> fixture.backend.configStorage().load()
+            );
+
+            assertEquals(ManagedStateFailure.STATE_ACCESS_FAILED, failure.failure());
+            assertTrue(
+                    "a denied root operation remains available as the diagnostic cause",
+                    failure.getCause() instanceof RootTransportException
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void rootSnapshotUsesAppPreparedBaseAndCleansOnlyItsOperationDirectory()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            byte[] config = new byte[] { 0x51, 0x52 };
+            byte[] certificate = new byte[] { 0x53 };
+            byte[] key = new byte[] { 0x54 };
+            Files.write(fixture.locations.member(ManagedStateMember.CONFIG).toPath(), config);
+            Files.write(fixture.locations.member(ManagedStateMember.CERT).toPath(), certificate);
+            Files.write(fixture.locations.member(ManagedStateMember.KEY).toPath(), key);
+
+            try (ManagedStateStaging staging =
+                         fixture.backend.managedStateTransfer().snapshotForExport()) {
+                assertArrayEquals(config, Files.readAllBytes(
+                        staging.member(ManagedStateMember.CONFIG).toPath()
+                ));
+                assertArrayEquals(certificate, Files.readAllBytes(
+                        staging.member(ManagedStateMember.CERT).toPath()
+                ));
+                assertArrayEquals(key, Files.readAllBytes(
+                        staging.member(ManagedStateMember.KEY).toPath()
+                ));
+            }
+
+            assertTrue(fixture.locations.stagingBase().isDirectory());
+            assertEquals(0, fixture.locations.stagingBase().list().length);
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void failedPrivilegedSnapshotAttemptsRootCleanupOfPartialOperationDirectory()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.stageFailuresRemaining = 1;
+
+            ManagedStateException failure = assertThrows(
+                    ManagedStateException.class,
+                    () -> fixture.backend.managedStateTransfer().snapshotForExport()
+            );
+
+            assertEquals(ManagedStateFailure.STATE_TRANSFER_FAILED, failure.failure());
+            assertEquals("the failed root snapshot receives operation-scoped root cleanup",
+                    1, fixture.device.stagingCleanupCalls);
+            assertEquals(0, fixture.locations.stagingBase().list().length);
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void managedStateRepairRetriesContextAfterPartialOwnershipFromNewBackend()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            File config = fixture.locations.member(ManagedStateMember.CONFIG);
+            byte[] configBytes = new byte[] { 0x31, 0x32, 0x33 };
+            Files.write(config.toPath(), configBytes);
+            File indexEntry = new File(
+                    fixture.locations.member(ManagedStateMember.INDEX), "database.bin"
+            );
+            if (!indexEntry.getParentFile().mkdirs()) {
+                throw new IOException("Could not create the test index directory");
+            }
+            writeText(indexEntry, "index data");
+            File unrelated = new File(fixture.locations.stateRoot(), "unrelated-state");
+            byte[] unrelatedBytes = new byte[] { 0x41, 0x42 };
+            Files.write(unrelated.toPath(), unrelatedBytes);
+            File userFolder = new File(fixture.locations.stateRoot(), "user-sync");
+            if (!userFolder.mkdir()) {
+                throw new IOException("Could not create the unrelated synchronization folder");
+            }
+            File userFile = new File(userFolder, "keep.txt");
+            writeText(userFile, "keep this folder");
+
+            fixture.device.repairContextFailuresRemaining = 1;
+            ManagedStateException firstFailure = assertThrows(
+                    ManagedStateException.class,
+                    () -> fixture.backend.managedStateTransfer().repairAppAccess()
+            );
+            assertEquals(ManagedStateFailure.STATE_REPAIR_FAILED, firstFailure.failure());
+            assertEquals(1, fixture.device.repairOwnershipPasses);
+            assertEquals(1, fixture.device.repairContextAttempts);
+            assertEquals(1, fixture.device.repairContextFailures);
+
+            fixture.newBackend().managedStateTransfer().repairAppAccess();
+
+            assertEquals(2, fixture.device.repairOwnershipPasses);
+            assertEquals(
+                    "a new helper session retries context repair after the earlier ownership pass",
+                    2,
+                    fixture.device.repairContextAttempts
+            );
+            assertEquals(1, fixture.device.repairContextSuccesses);
+            assertArrayEquals(configBytes, Files.readAllBytes(config.toPath()));
+            assertArrayEquals(unrelatedBytes, Files.readAllBytes(unrelated.toPath()));
+            assertEquals("keep this folder", readText(userFile));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void repairVerificationReportsUnreadableIndexAsRepairFailure() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            File index = fixture.locations.member(ManagedStateMember.INDEX);
+            assertTrue(index.mkdir());
+            File outsideFile = new File(fixture.directory, "outside-index-file");
+            Files.write(outsideFile.toPath(), new byte[] { 0x41 });
+            Files.createSymbolicLink(
+                    new File(index, "redirected-entry").toPath(), outsideFile.toPath()
+            );
+
+            ManagedStateException failure = assertThrows(
+                    ManagedStateException.class,
+                    () -> fixture.backend.managedStateTransfer().repairAppAccess()
+            );
+
+            assertEquals(ManagedStateFailure.STATE_REPAIR_FAILED, failure.failure());
         } finally {
             fixture.close();
         }
@@ -814,6 +1031,7 @@ public class RootBackendTest {
                     unappendableLog,
                     fixture.directory,
                     fixture.factory,
+                    fixture.locations,
                     60_000,
                     RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
                     TEST_CLEANUP_EXIT_WAIT_MILLIS
@@ -3905,6 +4123,7 @@ public class RootBackendTest {
         final File directory;
         final File binary;
         final File logFile;
+        final ManagedStateLocations locations;
         final RootBackend backend;
 
         Fixture() throws IOException {
@@ -3936,6 +4155,10 @@ public class RootBackendTest {
             binary = new File(directory, "libsyncthingnative.so");
             writeText(binary, "bundled binary");
             logFile = new File(directory, "syncthing.log");
+            locations = new ManagedStateLocations(
+                    directory, new File(directory, "managed-state-cache"), 10_000, 10_000
+            );
+            device.managedStateLocations = locations;
             backend = new RootBackend(
                     null,
                     directory,
@@ -3943,6 +4166,7 @@ public class RootBackendTest {
                     logFile,
                     directory,
                     factory,
+                    locations,
                     activationTimeoutMillis,
                     creationConfirmationTimeoutMillis,
                     cleanupExitWaitMillis
@@ -3958,6 +4182,7 @@ public class RootBackendTest {
                     logFile,
                     directory,
                     factory,
+                    locations,
                     60_000,
                     RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
                     TEST_CLEANUP_EXIT_WAIT_MILLIS
