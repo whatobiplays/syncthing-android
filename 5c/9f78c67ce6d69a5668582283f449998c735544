@@ -1,0 +1,21 @@
+.scratch/superuser-runtime-redesign/issues/15-finish-root-settings-and-failure-ux.md
+  s_23fabbd5e7ddf5::t_9e848b2622ec61 1-20
+.scratch/superuser-runtime-redesign/issues/14-disable-superuser-mode-and-repair-state.md
+  s_23fabbd5e7ddf5::t_9e848b2622ec61 1-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5c9f78c67ce6d69a5668582283f449998c735544",
+  "prompts": {},
+  "sessions": {
+    "s_23fabbd5e7ddf5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a118df-52e8-71c0-868c-b7420ce563fb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
