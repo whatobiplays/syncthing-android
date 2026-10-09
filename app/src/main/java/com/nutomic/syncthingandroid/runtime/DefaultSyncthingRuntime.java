@@ -1,6 +1,7 @@
 package com.nutomic.syncthingandroid.runtime;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -476,24 +477,80 @@ public final class DefaultSyncthingRuntime
         return backend.httpsCertificateStorage();
     }
 
-    public FolderWriteability validateCandidateFolder(String path) {
+    /**
+     * Checks one candidate folder path for writeability through the selected backend.
+     *
+     * <p>The path is the one the user selected in the folder editor. The probe is read-only and
+     * never leaves an artifact behind in the folder.</p>
+     */
+    public FolderWriteability validateCandidateFolder(String path) throws FolderOperationException {
         return backend.validateCandidateFolder(path);
     }
 
-    public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder) {
+    /**
+     * Lists the conflict files of one configured folder through the selected backend.
+     *
+     * <p>The reference carries the folder identifier only; the selected backend resolves the
+     * authoritative path itself, inside the same operation.</p>
+     */
+    public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder)
+            throws FolderOperationException {
         return backend.discoverConflicts(folder);
     }
 
-    public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder) {
+    /**
+     * Reads the ignore list of one configured folder through the selected backend.
+     *
+     * <p>A folder without an ignore-list member reports {@code null} lines, while a member that
+     * exists but cannot be read fails instead of appearing empty.</p>
+     */
+    public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder)
+            throws FolderOperationException {
         return backend.loadFolderIgnoreList(folder);
     }
 
-    public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore) {
+    /** Replaces the ignore list of one configured folder through the selected backend. */
+    public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore)
+            throws FolderOperationException {
         backend.saveFolderIgnoreList(folder, ignore);
     }
 
-    public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
-        backend.runFolderScripts(folder, event);
+    /**
+     * Runs the approved scripts of one configured folder for one folder event.
+     *
+     * <p>The selected backend runs the scripts under its own identity, and a script that exits
+     * with a non-zero status is reported in the result rather than raised, so a failed script
+     * never stops the completion handling around it.</p>
+     */
+    public List<FolderScriptOutcome> runFolderScripts(
+            ConfiguredFolderReference folder,
+            FolderEvent event
+    ) throws FolderOperationException {
+        return backend.runFolderScripts(folder, event);
+    }
+
+    /**
+     * Applies the background I/O priority class to one exact owned execution.
+     *
+     * <p>Only a backend that owns a privileged execution applies the tuning, and it re-verifies
+     * the exact ownership of the identifier first. The outcome is always returned rather than
+     * raised: the optimization is optional, so a device that cannot apply it keeps working.</p>
+     */
+    public TuningOutcome applyIoPriority(ExecutionIdentity identity) {
+        return backend.applyIoPriority(identity);
+    }
+
+    /**
+     * Applies the optional system-wide inotify watch limit as explicit privileged maintenance.
+     *
+     * <p>This entry point is independent of the selected Execution Mode. A caller may use it while
+     * Normal Mode is selected; the selected backend then acquires the bounded root helper session
+     * it needs without changing the mode. It must only be called for an explicit user request,
+     * never as an implicit part of startup, so it never raises a root prompt on the user's behalf.
+     * The outcome is always returned rather than raised.</p>
+     */
+    public TuningOutcome applyInotifyWatchLimit() {
+        return backend.applyInotifyWatchLimit();
     }
 
     @FunctionalInterface

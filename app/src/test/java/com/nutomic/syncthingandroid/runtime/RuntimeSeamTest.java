@@ -37,6 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 public class RuntimeSeamTest {
+    /** Home path configured folder paths expand to; these tests never use a home-relative path. */
+    private static final String TEST_TILDE_BASE = "/storage/emulated/0/syncthing";
 
     @Test
     public void commandsOwnTheSupportedSyncthingArgv() {
@@ -1385,11 +1387,12 @@ public class RuntimeSeamTest {
     }
 
     @Test
-    public void runtimeKeepsConfigStorageAndFolderOperationsSemantic() throws IOException {
+    public void runtimeKeepsConfigStorageAndFolderOperationsSemantic()
+            throws IOException, FolderOperationException {
         RecordingBackend backend = new RecordingBackend();
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
         ConfigStorage storage = backend.storage;
-        ConfiguredFolderReference folder = ConfiguredFolderReference.of("folder-id", "/configured/folder");
+        ConfiguredFolderReference folder = ConfiguredFolderReference.of("folder-id");
 
         assertSame(storage, runtime.configStorage());
         storage.save(new byte[]{1, 2, 3});
@@ -1408,9 +1411,13 @@ public class RuntimeSeamTest {
         );
         runtime.saveFolderIgnoreList(folder, new String[]{"*.tmp", "*.bak"});
         assertArrayEquals(new String[]{"*.tmp", "*.bak"}, backend.ignore);
-        runtime.runFolderScripts(folder, FolderEvent.SYNC_COMPLETE);
+        assertEquals(
+                Collections.singletonList(
+                        FolderScriptOutcome.of("backup.sh", 0)
+                ),
+                runtime.runFolderScripts(folder, FolderEvent.SYNC_COMPLETE)
+        );
         assertEquals("folder-id", backend.folder.id());
-        assertEquals("/configured/folder", backend.folder.path());
         assertEquals(FolderEvent.SYNC_COMPLETE, backend.event);
         assertEquals("sync_complete", FolderEvent.SYNC_COMPLETE.argument());
     }
@@ -1426,8 +1433,11 @@ public class RuntimeSeamTest {
                 launcher,
                 unownedExecutionManager(),
                 new InMemoryConfigStorage(),
-                ManagedStateTestSupport.locations()
-        );
+                ManagedStateTestSupport.locations(),
+                new FakeFolderNativeAccess(),
+                TEST_TILDE_BASE,
+                null
+                );
         SyncthingEnvironment environment = SyncthingEnvironment.builder()
                 .home("/home")
                 .syncthingHome("/state")
@@ -1538,8 +1548,11 @@ public class RuntimeSeamTest {
                 },
                 ownershipManager,
                 new InMemoryConfigStorage(),
-                ManagedStateTestSupport.locations()
-        );
+                ManagedStateTestSupport.locations(),
+                new FakeFolderNativeAccess(),
+                TEST_TILDE_BASE,
+                null
+                );
 
         PrivilegeBackend.Execution execution = backend.start(
                 SyncthingCommand.DEVICE_ID,
@@ -1624,8 +1637,11 @@ public class RuntimeSeamTest {
                 },
                 ownershipManager,
                 new InMemoryConfigStorage(),
-                ManagedStateTestSupport.locations()
-        );
+                ManagedStateTestSupport.locations(),
+                new FakeFolderNativeAccess(),
+                TEST_TILDE_BASE,
+                null
+                );
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
 
         SyncthingEnvironment environment = normalModeEnvironment();
@@ -1824,12 +1840,13 @@ public class RuntimeSeamTest {
         }
 
         @Override
-        public void runFolderScripts(
+        public List<FolderScriptOutcome> runFolderScripts(
                 ConfiguredFolderReference folder,
                 FolderEvent event
         ) {
             this.folder = folder;
             this.event = event;
+            return Collections.singletonList(FolderScriptOutcome.of("backup.sh", 0));
         }
 
     }
@@ -2151,7 +2168,10 @@ public class RuntimeSeamTest {
         }
 
         @Override
-        public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
+        public List<FolderScriptOutcome> runFolderScripts(
+                ConfiguredFolderReference folder,
+                FolderEvent event
+        ) {
             throw new UnsupportedOperationException();
         }
     }

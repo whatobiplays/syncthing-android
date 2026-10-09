@@ -28,6 +28,7 @@ import com.nutomic.syncthingandroid.runtime.ManagedStateLocations;
 import com.nutomic.syncthingandroid.runtime.ManagedStateStaging;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
+import com.nutomic.syncthingandroid.runtime.TuningOutcome;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
 import com.nutomic.syncthingandroid.util.ConfigXml;
 import com.nutomic.syncthingandroid.util.PermissionUtil;
@@ -922,6 +923,23 @@ public class SyncthingService extends Service {
             ExecutionIdentity identity,
             OwnershipVerificationCallback callback
     ) {
+        verifyOwnershipAsync(identity, callback, false);
+    }
+
+    /**
+     * Verifies the recorded ownership of one execution on a worker thread.
+     *
+     * <p>The check never runs on the service thread. When the caller asks for it, the optional
+     * process tuning runs on this same worker directly after a successful verification, so neither
+     * the check nor the privileged command can block the service thread.</p>
+     *
+     * @param applyProcessTuning whether the optional tuning runs after a verified observation
+     */
+    private void verifyOwnershipAsync(
+            ExecutionIdentity identity,
+            OwnershipVerificationCallback callback,
+            boolean applyProcessTuning
+    ) {
         Thread verificationThread = new Thread(() -> {
             ExecutionOwnershipManager.Observation observation = mRuntime.observe(identity);
             if (observation == ExecutionOwnershipManager.Observation.EXITED) {
@@ -931,11 +949,56 @@ public class SyncthingService extends Service {
                     Log.e(TAG, "Could not clear the exited Syncthing execution record", e);
                 }
             }
+            // The verdict travels to the service thread before any optional tuning starts, so a
+            // slow privileged command can never delay startup or REST readiness.
             OwnershipVerification result = new OwnershipVerification(identity, observation);
             mHandler.post(() -> callback.onComplete(result));
+            if (applyProcessTuning
+                    && observation == ExecutionOwnershipManager.Observation.OWNED) {
+                requestOwnedExecutionTuning(identity);
+            }
         }, "Syncthing ownership verification");
         verificationThread.setDaemon(true);
         verificationThread.start();
+    }
+
+    /**
+     * Asks for the optional process tuning of one verified owned execution, off the service thread.
+     *
+     * <p>Tuning is best effort and never part of startup: the ownership verdict has already been
+     * handed to the service thread, and the privileged command runs on a worker of its own. The
+     * service thread confirms first that the execution is still the current one, so tuning of an
+     * execution that already exited or was replaced never starts, and the privileged operation
+     * re-verifies the exact identity of the identifier immediately before it targets a process.</p>
+     */
+    private void requestOwnedExecutionTuning(ExecutionIdentity identity) {
+        mHandler.post(() -> {
+            if (!sameExecution(mOwnedExecution, identity)) {
+                return;
+            }
+            Thread tuningThread = new Thread(
+                    () -> tuneOwnedExecution(identity),
+                    "Syncthing execution tuning"
+            );
+            tuningThread.setDaemon(true);
+            tuningThread.start();
+        });
+    }
+    /**
+     * Applies the optional process tuning to one verified owned execution.
+     *
+     * <p>Tuning never changes lifecycle state and never raises: the outcome is logged and the
+     * service keeps running with the system default when a device cannot apply it. The privileged
+     * operation re-verifies the exact ownership of the identifier before it targets anything, so
+     * an identifier that was reused by an unrelated process is never tuned.</p>
+     */
+    private void tuneOwnedExecution(ExecutionIdentity identity) {
+        try {
+            TuningOutcome outcome = mRuntime.applyIoPriority(identity);
+            Log.i(TAG, "Owned execution tuning: " + outcome.status() + ": " + outcome.detail());
+        } catch (RuntimeException unexpected) {
+            Log.w(TAG, "Owned execution tuning did not complete", unexpected);
+        }
     }
 
     private void onLifecycleOutcome(SyncthingRunnable.LifecycleOutcome outcome) {
@@ -951,7 +1014,11 @@ public class SyncthingService extends Service {
                         mSyncthingRunnableThread.interrupt();
                     }
                 } else {
-                    verifyOwnershipAsync(outcome.identity(), this::onInitialOwnershipVerified);
+                    verifyOwnershipAsync(
+                            outcome.identity(),
+                            this::onInitialOwnershipVerified,
+                            true
+                    );
                 }
                 break;
             case IDENTITY_UNAVAILABLE:

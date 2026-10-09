@@ -15,6 +15,9 @@ import java.util.stream.Stream;
 
 /** Runs an imported staging directory through RootBackend and the production libsu script builder. */
 public final class RootBackendProductionScriptTestSupport {
+    /** Home path configured folder paths expand to; the tests never use a home-relative path. */
+    static final String TEST_TILDE_BASE = "/storage/emulated/0/syncthing";
+
     private RootBackendProductionScriptTestSupport() {
     }
 
@@ -41,12 +44,13 @@ public final class RootBackendProductionScriptTestSupport {
                 binary,
                 null,
                 temporary.toFile(),
-                factory,
-                locations,
-                60_000,
-                RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
-                100
-        );
+            factory,
+            locations,
+            60_000,
+            RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
+            100,
+            TEST_TILDE_BASE
+    );
 
         try {
             backend.managedStateTransfer().installImportedState(staging);

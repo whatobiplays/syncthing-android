@@ -5,6 +5,7 @@ import com.topjohnwu.superuser.Shell;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -49,6 +50,8 @@ final class ScriptedLibsuShell extends Shell {
     private boolean stateJobNotExecuted;
     private boolean diesDuringProvenanceProbe;
     private boolean shellDead;
+    private List<String> scriptedJobOutput;
+    private int scriptedJobExitCode;
 
     /**
      * Creates a verified root shell double.
@@ -134,6 +137,19 @@ final class ScriptedLibsuShell extends Shell {
         return this;
     }
 
+    /**
+     * Scripts the answer of every helper job that is neither a process probe nor a Managed State
+     * read, so a folder or tuning operation can be driven to its own result.
+     *
+     * @param exitCode exit status the scripted job reports
+     * @param stdout   output lines the scripted job reports
+     */
+    ScriptedLibsuShell scriptJobResult(int exitCode, String... stdout) {
+        this.scriptedJobExitCode = exitCode;
+        this.scriptedJobOutput = Arrays.asList(stdout);
+        return this;
+    }
+
     @Override
     public boolean isAlive() {
         return !shellDead;
@@ -203,6 +219,14 @@ final class ScriptedLibsuShell extends Shell {
 
         @Override
         public Result exec() {
+            // An explicitly scripted result answers every helper job, including the ones whose
+            // command text happens to mention /proc, such as the explicit inotify watch-limit
+            // command. Tests that script a result are never the tests that exercise the
+            // parent-process probe below.
+            if (scriptedJobOutput != null) {
+                stdout.addAll(scriptedJobOutput);
+                return result(scriptedJobExitCode);
+            }
             if (command != null && command.contains("/proc/")) {
                 statReads.incrementAndGet();
                 provenanceProbeStarted.countDown();

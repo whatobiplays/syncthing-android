@@ -53,6 +53,10 @@ import com.nutomic.syncthingandroid.model.SystemVersion;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.FolderEvent;
+import com.nutomic.syncthingandroid.runtime.FolderOperationException;
+import com.nutomic.syncthingandroid.runtime.FolderScriptDispatch;
+import com.nutomic.syncthingandroid.runtime.FolderScriptAdmission;
+import com.nutomic.syncthingandroid.runtime.FolderScriptOutcome;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.util.FileUtils;
@@ -178,6 +182,15 @@ public class RestApi {
     private int mLastTotalSyncCompletion = -1;
 
     private volatile boolean hasShutdown = false;
+
+    /**
+     * Bounded wait for an already admitted sync-completion script dispatch during teardown.
+     *
+     * <p>The executor interruption is what cancels the dispatch; this bound only decides how long
+     * teardown waits for that cancellation to be observed.</p>
+     */
+    private static final long FOLDER_SCRIPT_TEARDOWN_WAIT_MILLIS = 2_000;
+
     /** Serializes shutdown with the final check-and-submit of background REST work. */
     private final Object executorAdmission = new Object();
 
@@ -188,6 +201,26 @@ public class RestApi {
     @Inject NotificationHandler mNotificationHandler;
 
     @Inject DefaultSyncthingRuntime mRuntime;
+
+    /**
+     * Admission gate for sync-completion script dispatch.
+     *
+     * <p>It is closed by {@link #prepareShutdown()} before the executor stops accepting work, so
+     * dispatch and teardown cannot interleave.</p>
+     */
+    private final FolderScriptAdmission mFolderScriptAdmission = new FolderScriptAdmission();
+
+    /**
+     * Runs the sync-completion scripts of one folder.
+     *
+     * <p>It holds the admission gate for the duration of one dispatch and reports every problem
+     * instead of raising it, so a failed or slow script never suppresses the completion
+     * announcement that follows it.</p>
+     */
+    private final FolderScriptDispatch mFolderScriptDispatch = new FolderScriptDispatch(
+            mFolderScriptAdmission,
+            (folder, event) -> mRuntime.runFolderScripts(folder, event)
+    );
 
     public RestApi(Context context, URL url, String apiKey, OnApiAvailableListener apiListener,
                    OnConfigChangedListener configListener) {
@@ -620,11 +653,22 @@ public class RestApi {
      * sending the returned request.
      */
     public OwnedExecutionShutdown.RestShutdownRequest prepareShutdown() {
+        // Admission closes before the executor stops accepting work, and it is the same state the
+        // dispatch checks, so no sync-completion script can start after this point. What was
+        // admitted earlier is waited for inside a bound; a dispatch that outlasts the bound keeps
+        // its own transport deadlines, and the executor interruption above cancels it.
+        try {
+            if (!mFolderScriptAdmission.closeAndWait(FOLDER_SCRIPT_TEARDOWN_WAIT_MILLIS)) {
+                Log.w(TAG, "prepareShutdown: A folder script dispatch did not finish within "
+                        + FOLDER_SCRIPT_TEARDOWN_WAIT_MILLIS + " ms");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
         synchronized (executorAdmission) {
             hasShutdown = true;
             executorService.shutdownNow();
         }
-        Util.killProcess("find");
         return PostRequest.singleAttemptShutdown(mContext, mUrl, mApiKey);
     }
 
@@ -1272,12 +1316,20 @@ public class RestApi {
 
                     if (finalPlanGetSyncConflictFiles) {
                         // Check for ".sync-conflict-YYYYMMDD-HHMMSS-DEVICEI*" files.
-                        mLocalCompletion.setDiscoveredConflictFiles(
-                                folderId,
-                                mRuntime.discoverConflicts(
-                                        ConfiguredFolderReference.of(folder.id, folder.path)
-                                ).relativePaths().toArray(new String[0])
-                        );
+                        try {
+                            mLocalCompletion.setDiscoveredConflictFiles(
+                                    folderId,
+                                    mRuntime.discoverConflicts(
+                                            ConfiguredFolderReference.of(folder.id)
+                                    ).relativePaths().toArray(new String[0])
+                            );
+                        } catch (FolderOperationException e) {
+                            // A scan that could not run to completion must never be published as
+                            // an empty result: the previously known conflicts stay visible until a
+                            // later scan succeeds.
+                            Log.w(TAG, "Got local folder completion: Could not scan folder=["
+                                    + folder.id + "] for conflict files: " + e.getMessage());
+                        }
                     }
 
                     if (finalPlanOnFolderSyncCompleted) {
@@ -1304,10 +1356,15 @@ public class RestApi {
         Boolean folderRunScriptEnabled = sharedPreferences.getBoolean(
             Constants.DYN_PREF_OBJECT_FOLDER_RUN_SCRIPT(folder.id), false
         );
+        // Admission is taken immediately before the dispatch and shares its state with teardown,
+        // so either the dispatch runs and teardown waits for it, or the dispatch never starts.
         if (folderRunScriptEnabled) {
-            mRuntime.runFolderScripts(
-                    ConfiguredFolderReference.of(folder.id, folder.path),
-                    FolderEvent.SYNC_COMPLETE
+            // The dispatch reports its own problems and never raises, so the completion
+            // announcement below always reaches its listeners.
+            mFolderScriptDispatch.dispatch(
+                    ConfiguredFolderReference.of(folder.id),
+                    FolderEvent.SYNC_COMPLETE,
+                    message -> Log.w(TAG, "onFolderSyncCompleted: " + message)
             );
         }
 

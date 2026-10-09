@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.runtime;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 
 /** Backend contract for launching and controlling bundled Syncthing executions. */
 public interface PrivilegeBackend {
@@ -184,15 +185,88 @@ public interface PrivilegeBackend {
      */
     HttpsCertificateStorage httpsCertificateStorage();
 
-    FolderWriteability validateCandidateFolder(String path);
+    /**
+     * Reports whether one candidate folder path can be written for the selected backend.
+     *
+     * <p>The candidate path comes from the folder editor rather than from the authoritative
+     * configuration: this is the one folder operation deliberately addressed by a path the user
+     * selected, and it only ever performs a read-only capability probe that leaves no artifact
+     * behind.</p>
+     *
+     * @throws FolderOperationException when no verdict could be reached at all
+     */
+    FolderWriteability validateCandidateFolder(String path) throws FolderOperationException;
 
-    ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder);
+    /**
+     * Lists the conflict files below one configured folder.
+     *
+     * <p>The reference carries the folder identifier only; the selected backend resolves the
+     * authoritative path of that identifier as part of the same operation.</p>
+     *
+     * @throws FolderOperationException when the folder cannot be resolved or scanned; a scan that
+     *                                  runs out of budget fails instead of returning a shorter list
+     */
+    ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder)
+            throws FolderOperationException;
 
-    FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder);
+    /**
+     * Reads the ignore list of one configured folder.
+     *
+     * @return the exact lines of the ignore list, or {@code null} lines when the folder has no
+     *         ignore-list member at all
+     * @throws FolderOperationException when the member exists but cannot be read, so a failed read
+     *                                  is never reported as an empty or missing ignore list
+     */
+    FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder)
+            throws FolderOperationException;
 
-    void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore);
+    /**
+     * Replaces the ignore list of one configured folder.
+     *
+     * @throws FolderOperationException when the member cannot be replaced
+     */
+    void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore)
+            throws FolderOperationException;
 
-    void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event);
+    /**
+     * Runs the approved scripts of one configured folder for one folder event.
+     *
+     * @return one outcome per script that ran, in dispatch order; an individual non-zero exit
+     *         status is reported here rather than raised
+     * @throws FolderOperationException when the dispatch itself could not be performed
+     */
+    List<FolderScriptOutcome> runFolderScripts(ConfiguredFolderReference folder, FolderEvent event)
+            throws FolderOperationException;
+
+    /**
+     * Applies the background I/O priority class to one exact owned execution.
+     *
+     * <p>Only a backend that owns a privileged execution can apply process tuning. An
+     * implementation re-verifies the ownership of the exact identifier immediately before it
+     * runs the command, never looks a process up by name, and reports every failure through the
+     * returned outcome instead of raising it, because tuning is always optional.</p>
+     */
+    default TuningOutcome applyIoPriority(ExecutionIdentity identity) {
+        return TuningOutcome.notApplicable(
+                "The selected backend does not apply privileged I/O priority"
+        );
+    }
+
+    /**
+     * Applies the optional system-wide inotify watch limit as explicit privileged maintenance.
+     *
+     * <p>The operation is independent of the selected Execution Mode: a caller may request it
+     * while Normal Mode is selected, and the implementation acquires whatever bounded root helper
+     * session it needs without changing the selected mode. Implementations must only run it for an
+     * explicit user request, never as an implicit part of startup, so it never raises a root
+     * prompt on the user's behalf. Failures are reported through the returned outcome and are
+     * never raised, because the tuning is optional.</p>
+     */
+    default TuningOutcome applyInotifyWatchLimit() {
+        return TuningOutcome.notApplicable(
+                "The selected backend does not apply the system inotify watch limit"
+        );
+    }
 
     interface Execution {
         InputStream stdout();

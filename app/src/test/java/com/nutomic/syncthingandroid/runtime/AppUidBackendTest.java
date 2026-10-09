@@ -18,6 +18,8 @@ import java.util.concurrent.CountDownLatch;
 import org.junit.Test;
 
 public class AppUidBackendTest {
+    /** Home path configured folder paths expand to; these tests never use a home-relative path. */
+    private static final String TEST_TILDE_BASE = "/storage/emulated/0/syncthing";
     @Test
     public void successfulOneShotCanUseOutputWhenChildExitedBeforeIdentityCapture()
             throws Exception {
@@ -76,6 +78,14 @@ public class AppUidBackendTest {
     }
 
     private static AppUidBackend backend(File binary, FakeProcess process) {
+        return backend(binary, process, null);
+    }
+
+    private static AppUidBackend backend(
+            File binary,
+            FakeProcess process,
+            RootShellFactory privilegedTuningShellFactory
+    ) {
         ExecutionRecordStore records = new ExecutionRecordStore() {
             @Override
             public ReadResult read() {
@@ -140,8 +150,71 @@ public class AppUidBackendTest {
             }
         };
         return new AppUidBackend(
-                binary, launcher, ownership, storage, ManagedStateTestSupport.locations()
-        );
+                binary, launcher, ownership, storage, ManagedStateTestSupport.locations(),
+                new FakeFolderNativeAccess(),
+                TEST_TILDE_BASE,
+                privilegedTuningShellFactory
+                );
+    }
+
+    @Test
+    public void normalModeInotifyMaintenanceNeedsAnExplicitPrivilegedHelper() throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        try {
+            AppUidBackend backend = backend(binary, new FakeProcess(""));
+            ExecutionIdentity identity = new ExecutionIdentity(
+                    4242, 9_001L, "boot-a", binary.getAbsolutePath(), "run-token"
+            );
+
+            assertEquals(
+                    "Normal Mode without a privileged helper reports the request as inapplicable",
+                    TuningOutcome.Status.NOT_APPLICABLE,
+                    backend.applyInotifyWatchLimit().status()
+            );
+            assertEquals(
+                    "Normal Mode never applies a privileged I/O priority and never falls back",
+                    TuningOutcome.Status.NOT_APPLICABLE,
+                    backend.applyIoPriority(identity).status()
+            );
+        } finally {
+            assertTrue(binary.delete());
+        }
+    }
+
+    @Test
+    public void onlyTheExplicitInotifyRequestReachesThePrivilegedHelper() throws Exception {
+        File binary = File.createTempFile("syncthing", ".bin");
+        try {
+            FakeRootTransport.Device device = new FakeRootTransport.Device();
+            device.inotifyTuningOutcome = TuningOutcome.applied("Simulated tuning");
+            AppUidBackend backend = backend(
+                    binary, new FakeProcess(""), new FakeRootTransport.Factory(device)
+            );
+
+            assertEquals(
+                    "constructing a Normal Mode backend never asks for root",
+                    0,
+                    device.acquisitions
+            );
+
+            TuningOutcome outcome = backend.applyInotifyWatchLimit();
+
+            assertEquals(TuningOutcome.Status.APPLIED, outcome.status());
+            assertEquals(
+                    "the explicit request targets the approved system limit through one helper",
+                    Collections.singletonList(
+                            "1:applyInotifyWatchLimit:" + InotifyWatchLimit.TARGET
+                    ),
+                    device.shellOperations
+            );
+            assertEquals(
+                    "the helper session is closed before the caller returns",
+                    device.acquisitions,
+                    device.shellCloses
+            );
+        } finally {
+            assertTrue(binary.delete());
+        }
     }
 
     private static SyncthingEnvironment environment() {

@@ -16,6 +16,7 @@ import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutableNotFoundException;
 import com.nutomic.syncthingandroid.runtime.FolderEvent;
 import com.nutomic.syncthingandroid.runtime.FolderIgnoreResult;
+import com.nutomic.syncthingandroid.runtime.FolderScriptOutcome;
 import com.nutomic.syncthingandroid.runtime.FolderWriteability;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
 import com.nutomic.syncthingandroid.runtime.PrivilegeBackend;
@@ -25,6 +26,8 @@ import com.nutomic.syncthingandroid.runtime.SyncthingExecution;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -285,7 +288,11 @@ public class SyncthingRunnableCleanupTest {
         }
 
         @Override
-        public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
+        public List<FolderScriptOutcome> runFolderScripts(
+                ConfiguredFolderReference folder,
+                FolderEvent event
+        ) {
+            return Collections.emptyList();
         }
     }
 

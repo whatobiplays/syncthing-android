@@ -9,6 +9,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -135,6 +136,40 @@ final class FakeRootTransport {
 
         /** Command-like operations each shell ran, as {@code "<shell index>:<operation>"}. */
         final List<String> shellOperations = new CopyOnWriteArrayList<>();
+
+        /** When set, every privileged folder operation reports this failure instead. */
+        IOException folderOperationFailure;
+        /** Runs while the authoritative configuration is read, before the read reports. */
+        Runnable duringStateFileRead;
+        /** Verdict the writeability probe reports when nothing fails. */
+        FolderWriteability folderWriteability = FolderWriteability.UNKNOWN;
+        /** Result the conflict scan reports when nothing fails. */
+        ConflictDiscoveryResult conflictDiscovery =
+                ConflictDiscoveryResult.of(Collections.emptyList());
+        /** Result the ignore-list read reports when nothing fails. */
+        FolderIgnoreResult folderIgnoreResult = FolderIgnoreResult.of(null);
+        /** Folder roots every ignore-list write received, in order. */
+        final List<String> ignoreListWriteRoots = new ArrayList<>();
+        /** Member content every ignore-list write received, in order. */
+        final List<byte[]> ignoreListWrites = new ArrayList<>();
+        /** Outcomes the script dispatch reports when nothing fails. */
+        List<FolderScriptOutcome> folderScriptOutcomes = Collections.emptyList();
+        /** Folder roots every script dispatch used, in order. */
+        final List<String> scriptDispatchRoots = new ArrayList<>();
+        /** Event arguments every script dispatch used, in order. */
+        final List<String> scriptDispatchEvents = new ArrayList<>();
+        /** Outcome the I/O-priority tuning reports. */
+        TuningOutcome ioPriorityOutcome = TuningOutcome.notApplicable("Simulated device");
+        /** Process identifiers the I/O-priority tuning targeted, in order. */
+        final List<Integer> ioPriorityPids = new ArrayList<>();
+        /** Recorded process start times the I/O-priority tuning re-verified, in order. */
+        final List<Long> ioPriorityStartTimes = new ArrayList<>();
+        /** When set, every privileged tuning operation reports this failure instead. */
+        IOException tuningFailure;
+        /** Outcome the inotify tuning reports. */
+        TuningOutcome inotifyTuningOutcome = TuningOutcome.notApplicable("Simulated device");
+        /** Watch limits the inotify tuning was asked to apply, in order. */
+        final List<Integer> inotifyWatchLimits = new ArrayList<>();
 
         int acquisitions;
         int shellCloses;
@@ -650,6 +685,9 @@ final class FakeRootTransport {
         public byte[] readStateFile(ManagedStateMember member) throws IOException {
             requireOpen();
             recordOperation("readStateFile");
+            if (device.duringStateFileRead != null) {
+                device.duringStateFileRead.run();
+            }
             if (!member.isFile()) throw new IOException("Not a Managed State file");
             File file = locations().member(member);
             if (!file.exists() && !Files.isSymbolicLink(file.toPath())) return null;
@@ -696,6 +734,90 @@ final class FakeRootTransport {
             File path = locations().member(member);
             if (Files.isSymbolicLink(path.toPath())) return false;
             return member.isDirectory() ? path.isDirectory() : path.isFile();
+        }
+
+        @Override
+        public FolderWriteability probeFolderWriteability(String candidatePath) throws IOException {
+            requireOpen();
+            recordOperation("probeFolderWriteability");
+            awaitGate();
+            if (device.folderOperationFailure != null) {
+                throw device.folderOperationFailure;
+            }
+            return device.folderWriteability;
+        }
+
+        @Override
+        public ConflictDiscoveryResult discoverConflictFiles(String folderRoot) throws IOException {
+            requireOpen();
+            recordOperation("discoverConflictFiles:" + folderRoot);
+            awaitGate();
+            if (device.folderOperationFailure != null) {
+                throw device.folderOperationFailure;
+            }
+            return device.conflictDiscovery;
+        }
+
+        @Override
+        public FolderIgnoreResult readFolderIgnoreList(String folderRoot) throws IOException {
+            requireOpen();
+            recordOperation("readFolderIgnoreList:" + folderRoot);
+            awaitGate();
+            if (device.folderOperationFailure != null) {
+                throw device.folderOperationFailure;
+            }
+            return device.folderIgnoreResult;
+        }
+
+        @Override
+        public void writeFolderIgnoreList(String folderRoot, byte[] contents) throws IOException {
+            requireOpen();
+            recordOperation("writeFolderIgnoreList:" + folderRoot);
+            awaitGate();
+            if (device.folderOperationFailure != null) {
+                throw device.folderOperationFailure;
+            }
+            device.ignoreListWriteRoots.add(folderRoot);
+            device.ignoreListWrites.add(contents.clone());
+        }
+
+        @Override
+        public List<FolderScriptOutcome> runFolderScriptSet(String folderRoot, String eventArgument)
+                throws IOException {
+            requireOpen();
+            recordOperation("runFolderScriptSet:" + folderRoot);
+            awaitGate();
+            if (device.folderOperationFailure != null) {
+                throw device.folderOperationFailure;
+            }
+            device.scriptDispatchRoots.add(folderRoot);
+            device.scriptDispatchEvents.add(eventArgument);
+            return device.folderScriptOutcomes;
+        }
+
+        @Override
+        public TuningOutcome applyIoPriority(ExecutionIdentity identity) throws IOException {
+            requireOpen();
+            recordOperation("applyIoPriority:" + identity.pid());
+            awaitGate();
+            if (device.tuningFailure != null) {
+                throw device.tuningFailure;
+            }
+            device.ioPriorityPids.add(identity.pid());
+            device.ioPriorityStartTimes.add(identity.processStartTimeTicks());
+            return device.ioPriorityOutcome;
+        }
+
+        @Override
+        public TuningOutcome applyInotifyWatchLimit(int watchLimit) throws IOException {
+            requireOpen();
+            recordOperation("applyInotifyWatchLimit:" + watchLimit);
+            awaitGate();
+            if (device.tuningFailure != null) {
+                throw device.tuningFailure;
+            }
+            device.inotifyWatchLimits.add(watchLimit);
+            return device.inotifyTuningOutcome;
         }
 
         @Override

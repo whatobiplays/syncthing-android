@@ -5,27 +5,25 @@ import java.util.Objects;
 /**
  * Identifies an existing configured folder for backend-owned folder operations.
  *
- * <p>The path is carried as the current normal-mode resolution. Callers pass this semantic
- * reference instead of exposing an arbitrary path operation on the backend.</p>
+ * <p>The reference deliberately carries only the folder identifier. The folder path is part of
+ * the authoritative configuration, which only the selected backend may resolve at operation
+ * time: a caller-provided path could be forged, stale, or memory-only projection state, and must
+ * never decide which files a privileged operation touches.</p>
  */
 public final class ConfiguredFolderReference {
     private final String id;
-    private final String path;
 
-    private ConfiguredFolderReference(String id, String path) {
-        this.id = Objects.requireNonNull(id);
-        this.path = Objects.requireNonNull(path);
+    private ConfiguredFolderReference(String id) {
+        this.id = Objects.requireNonNull(id, "The folder identifier is required");
     }
 
-    public static ConfiguredFolderReference of(String id, String configuredPath) {
-        return new ConfiguredFolderReference(id, configuredPath);
+    /** Creates a reference to the configured folder with the given identifier. */
+    public static ConfiguredFolderReference of(String id) {
+        return new ConfiguredFolderReference(id);
     }
 
+    /** Returns the configured folder identifier this reference names. */
     public String id() {
         return id;
-    }
-
-    String path() {
-        return path;
     }
 }

@@ -18,6 +18,7 @@ import com.nutomic.syncthingandroid.R;
 import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.runtime.ConfigStorage;
 import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
+import com.nutomic.syncthingandroid.runtime.FolderOperationException;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentityUnavailableException;
@@ -788,23 +789,35 @@ public class ConfigXml {
     }
 
     /**
-     * Gets ignore list for given folder.
+     * Gets the ignore list of one configured folder.
+     *
+     * <p>The list is read through the selected backend, which resolves the authoritative path of
+     * the folder itself, so a caller-supplied or projected path never decides which file is read.
+     * A folder without an ignore-list member reports {@code null} lines, while a member that
+     * exists but cannot be read raises instead: a failed read is never presented as an empty or
+     * missing ignore list.</p>
+     *
+     * @throws FolderOperationException when the ignore list exists but cannot be read
      */
-    public void getFolderIgnoreList(Folder folder, OnResultListener1<FolderIgnoreList> listener) {
+    public void getFolderIgnoreList(Folder folder, OnResultListener1<FolderIgnoreList> listener)
+            throws FolderOperationException {
         FolderIgnoreList folderIgnoreList = new FolderIgnoreList();
         FolderIgnoreResult result = mRuntime.loadFolderIgnoreList(
-                ConfiguredFolderReference.of(folder.id, folder.path)
+                ConfiguredFolderReference.of(folder.id)
         );
         folderIgnoreList.ignore = result.lines();
         listener.onResult(folderIgnoreList);
     }
 
     /**
-     * Stores ignore list for given folder.
+     * Stores the ignore list of one configured folder.
+     *
+     * @throws FolderOperationException when the ignore list cannot be replaced
      */
-    public void postFolderIgnoreList(Folder folder, String[] ignore) {
+    public void postFolderIgnoreList(Folder folder, String[] ignore)
+            throws FolderOperationException {
         mRuntime.saveFolderIgnoreList(
-                ConfiguredFolderReference.of(folder.id, folder.path),
+                ConfiguredFolderReference.of(folder.id),
                 ignore
         );
     }

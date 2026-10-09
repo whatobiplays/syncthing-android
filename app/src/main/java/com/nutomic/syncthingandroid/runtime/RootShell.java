@@ -235,6 +235,94 @@ interface RootShell extends AutoCloseable {
      */
     void repairManagedStateAccess() throws IOException;
 
+    /**
+     * Reports whether one candidate folder is writable for this shell's identity.
+     *
+     * <p>This is a read-only probe: it changes nothing inside the candidate directory, and it
+     * reports {@link FolderWriteability#UNKNOWN} rather than a verdict when the path is missing,
+     * is not a directory, or cannot be inspected.</p>
+     *
+     * @param candidatePath absolute path the user selected for a folder
+     */
+    FolderWriteability probeFolderWriteability(String candidatePath) throws IOException;
+
+    /**
+     * Lists conflict files below one configured folder.
+     *
+     * <p>The scan never follows symbolic links, never leaves the folder, excludes Syncthing's
+     * versioning directory, and enforces fixed entry, match, output, and time budgets. A budget
+     * that runs out ends the whole operation with a typed limit failure: a partial list is never
+     * reported as a successful result.</p>
+     *
+     * @param folderRoot absolute path of a folder the authoritative configuration owns
+     */
+    ConflictDiscoveryResult discoverConflictFiles(String folderRoot) throws IOException;
+
+    /**
+     * Reads the fixed ignore-list member of one configured folder.
+     *
+     * <p>The member is transported byte-exact. An absent member is reported as absent, while a
+     * symbolic link, a wrong entry kind, or an unreadable member fails the operation, so a failed
+     * read can never be mistaken for an empty ignore list.</p>
+     *
+     * @param folderRoot absolute path of a folder the authoritative configuration owns
+     */
+    FolderIgnoreResult readFolderIgnoreList(String folderRoot) throws IOException;
+
+    /**
+     * Replaces the fixed ignore-list member of one configured folder atomically.
+     *
+     * <p>The content is written into an operation-owned temporary file inside the same directory
+     * and renamed over the member, so no reader observes a half-written list. When the member
+     * already exists, its ownership, permissions, and security context are preserved; the
+     * operation fails instead of leaving the member with different metadata.</p>
+     *
+     * @param folderRoot absolute path of a folder the authoritative configuration owns
+     * @param contents   exact new member content
+     */
+    void writeFolderIgnoreList(String folderRoot, byte[] contents) throws IOException;
+
+    /**
+     * Runs the approved scripts of one configured folder for one folder event.
+     *
+     * <p>Only regular {@code .sh} files directly inside the folder's marker directory run;
+     * symbolic links and other entry kinds are skipped. Every script runs through
+     * {@code /system/bin/sh} with the folder root as its working directory and the event name as
+     * its only argument. The whole dispatch stays inside the transport's script deadline and
+     * reports one outcome per script, so an individual non-zero status is reported rather than
+     * raised.</p>
+     *
+     * @param folderRoot    absolute path of a folder the authoritative configuration owns
+     * @param eventArgument event name passed to every approved script
+     */
+    List<FolderScriptOutcome> runFolderScriptSet(String folderRoot, String eventArgument)
+            throws IOException;
+
+    /**
+     * Applies the background I/O priority class to one exact process.
+     *
+     * <p>The command re-verifies the recorded start time of the process it was given before it
+     * targets it, so the identifier cannot reach the platform's tuner after the kernel reused it
+     * for another process. The command only targets the identifier it receives and never looks
+     * for processes by name.</p>
+     *
+     * @param identity owned execution this session verified and whose start time is re-checked
+     * @return the tuning outcome; a device without the command, and a process that no longer
+     *         matches the recorded execution, report themselves as not applicable
+     */
+    TuningOutcome applyIoPriority(ExecutionIdentity identity) throws IOException;
+
+    /**
+     * Raises the system-wide inotify watch limit to at least the requested value.
+     *
+     * <p>An already sufficient limit succeeds without writing, and a write is read back before
+     * success is reported, so a silently rejected setting is never treated as applied.</p>
+     *
+     * @param watchLimit requested minimum number of inotify watches
+     * @return the tuning outcome; a kernel without the switch reports it as not applicable
+     */
+    TuningOutcome applyInotifyWatchLimit(int watchLimit) throws IOException;
+
     @Override
     void close();
 }

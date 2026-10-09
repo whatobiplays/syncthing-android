@@ -19,8 +19,11 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -64,6 +67,8 @@ public class RootBackendTest {
      * its cleanup signal observes the bounded behaviour without waiting five seconds.</p>
      */
     private static final long TEST_CLEANUP_EXIT_WAIT_MILLIS = 250;
+    /** Home path configured folder paths expand to; the tests never use a home-relative path. */
+    private static final String TEST_TILDE_BASE = "/storage/emulated/0/syncthing";
 
     @Test
     public void constructionAndPassiveCallsAcquireNoRoot() throws Exception {
@@ -398,19 +403,289 @@ public class RootBackendTest {
     }
 
     @Test
-    public void configurationCapabilityIsPassiveAndUnsupportedFolderOperationsFailClosed()
-            throws Exception {
+    public void configurationCapabilityIsPassive() throws Exception {
         Fixture fixture = new Fixture();
         try {
             assertNotNull("root mode exposes byte-oriented configuration storage",
                     fixture.backend.configStorage());
-            assertNotImplemented(() -> fixture.backend.validateCandidateFolder("/data"));
-            assertNotImplemented(() -> fixture.backend.discoverConflicts(null));
-            assertNotImplemented(() -> fixture.backend.loadFolderIgnoreList(null));
-            assertNotImplemented(() -> fixture.backend.saveFolderIgnoreList(null, new String[] {"x"}));
-            assertNotImplemented(() -> fixture.backend.runFolderScripts(null, FolderEvent.SYNC_COMPLETE));
-
             assertEquals(0, fixture.factory.acquireCalls());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void folderOperationsResolveTheConfiguredFolderInsideOneBoundedSession()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+
+            fixture.device.conflictDiscovery = ConflictDiscoveryResult.of(
+                    Collections.singletonList("nested/file.sync-conflict-20260101-010101-DEVICE")
+            );
+            assertEquals(
+                    Collections.singletonList("nested/file.sync-conflict-20260101-010101-DEVICE"),
+                    fixture.backend.discoverConflicts(ConfiguredFolderReference.of("folder-1"))
+                            .relativePaths()
+            );
+
+            fixture.device.folderIgnoreResult = FolderIgnoreResult.of(new String[] {"*.tmp"});
+            assertArrayEquals(
+                    new String[] {"*.tmp"},
+                    fixture.backend.loadFolderIgnoreList(ConfiguredFolderReference.of("folder-1"))
+                            .lines()
+            );
+
+            fixture.backend.saveFolderIgnoreList(
+                    ConfiguredFolderReference.of("folder-1"),
+                    new String[] {"*.tmp", "*.bak"}
+            );
+            assertEquals(
+                    Collections.singletonList("/configured/folder"),
+                    fixture.device.ignoreListWriteRoots
+            );
+            assertEquals(
+                    "*.tmp\n*.bak",
+                    new String(fixture.device.ignoreListWrites.get(0), StandardCharsets.UTF_8)
+            );
+
+            fixture.device.folderScriptOutcomes = Collections.singletonList(
+                    FolderScriptOutcome.of("backup.sh", 3)
+            );
+            assertEquals(
+                    Collections.singletonList(FolderScriptOutcome.of("backup.sh", 3)),
+                    fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE
+                    )
+            );
+            assertEquals(
+                    Collections.singletonList("/configured/folder"),
+                    fixture.device.scriptDispatchRoots
+            );
+            assertEquals(
+                    Collections.singletonList("sync_complete"),
+                    fixture.device.scriptDispatchEvents
+            );
+
+            fixture.device.folderWriteability = FolderWriteability.WRITABLE;
+            assertEquals(
+                    FolderWriteability.WRITABLE,
+                    fixture.backend.validateCandidateFolder("/candidate/folder")
+            );
+
+            // One bounded session per operation, and every session was closed again.
+            assertEquals(5, fixture.device.acquisitions);
+            assertEquals(5, fixture.device.shellCloses);
+            // Each operation resolved the configuration and then did its privileged work on the
+            // same session shell, so no operation nested a second helper session inside its own.
+            List<String> operations = fixture.device.shellOperations;
+            List<String> expectedOperations = Arrays.asList(
+                    "readStateFile",
+                    "discoverConflictFiles:/configured/folder",
+                    "readStateFile",
+                    "readFolderIgnoreList:/configured/folder",
+                    "readStateFile",
+                    "writeFolderIgnoreList:/configured/folder",
+                    "readStateFile",
+                    "runFolderScriptSet:/configured/folder",
+                    "probeFolderWriteability"
+            );
+            assertEquals(expectedOperations.size(), operations.size());
+            for (int index = 0; index < operations.size(); index++) {
+                String operation = operations.get(index);
+                int separator = operation.indexOf(':');
+                assertEquals(expectedOperations.get(index), operation.substring(separator + 1));
+                if (index % 2 == 1) {
+                    assertEquals(
+                            "the privileged work used the shell that read the configuration",
+                            operations.get(index - 1).substring(0, separator),
+                            operation.substring(0, separator)
+                    );
+                }
+            }
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void folderOperationsRejectUnknownAndUnreadableConfiguration() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+
+            FolderOperationException missing = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.discoverConflicts(
+                            ConfiguredFolderReference.of("folder-2")
+                    )
+            );
+            assertEquals(FolderOperationFailure.FOLDER_NOT_CONFIGURED, missing.failure());
+            assertTrue(
+                    "an unresolved folder never reached a privileged folder operation",
+                    fixture.device.scriptDispatchRoots.isEmpty()
+            );
+
+            Files.write(
+                    fixture.locations.member(ManagedStateMember.CONFIG).toPath(),
+                    "not a configuration document".getBytes(StandardCharsets.UTF_8)
+            );
+            FolderOperationException unreadable = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.loadFolderIgnoreList(
+                            ConfiguredFolderReference.of("folder-1")
+                    )
+            );
+            assertEquals(
+                    FolderOperationFailure.FOLDER_CONFIGURATION_UNREADABLE,
+                    unreadable.failure()
+            );
+            assertTrue(fixture.device.ignoreListWriteRoots.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void folderOperationFailuresStayTypedAndNeverBecomeEmptyResults() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            fixture.device.folderOperationFailure = new RootFolderOperationException(
+                    FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                    "Simulated conflict-scan budget failure"
+            );
+
+            FolderOperationException failure = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.discoverConflicts(
+                            ConfiguredFolderReference.of("folder-1")
+                    )
+            );
+            assertEquals(FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED, failure.failure());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void cancelledFolderOperationKeepsItsOwnTypedOutcome() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            // An interrupted worker is how a superseded or torn-down request abandons its work.
+            Thread.currentThread().interrupt();
+            FolderOperationException cancelled;
+            try {
+                cancelled = assertThrows(
+                        FolderOperationException.class,
+                        () -> fixture.backend.discoverConflicts(
+                                ConfiguredFolderReference.of("folder-1")
+                        )
+                );
+            } finally {
+                // The interrupt belongs to the scenario, not to the surrounding test run.
+                Thread.interrupted();
+            }
+
+            assertEquals(FolderOperationFailure.FOLDER_OPERATION_CANCELLED, cancelled.failure());
+            assertEquals(
+                    "an interrupted caller never reached a privileged conflict scan",
+                    0,
+                    countOperations(fixture.device, "discoverConflictFiles:/configured/folder")
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void configurationReadInterruptedWhileItRunsIsReportedAsCancelled() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            File configuration = fixture.locations.member(ManagedStateMember.CONFIG);
+            // The read fails while the caller that started it is interrupted, which is what an
+            // abandoned request sees. That failure may not be reported as a configuration that
+            // cannot be read, because the operation was abandoned rather than privileged access
+            // broken.
+            assertTrue(configuration.delete());
+            assertTrue(configuration.mkdir());
+            fixture.device.duringStateFileRead = () -> Thread.currentThread().interrupt();
+
+            FolderOperationException cancelled;
+            try {
+                cancelled = assertThrows(
+                        FolderOperationException.class,
+                        () -> fixture.backend.discoverConflicts(
+                                ConfiguredFolderReference.of("folder-1")
+                        )
+                );
+            } finally {
+                // The interrupt belongs to the scenario, not to the surrounding test run.
+                Thread.interrupted();
+            }
+
+            assertEquals(
+                    FolderOperationFailure.FOLDER_OPERATION_CANCELLED,
+                    cancelled.failure()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void supersededFolderOperationActivationIsReportedAsCancelled() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            // A newer request won the activation race, so this operation is obsolete.
+            fixture.device.activationFailure = RootFailure.ROOT_ACTIVATION_OBSOLETE;
+
+            FolderOperationException cancelled = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.loadFolderIgnoreList(
+                            ConfiguredFolderReference.of("folder-1")
+                    )
+            );
+
+            assertEquals(FolderOperationFailure.FOLDER_OPERATION_CANCELLED, cancelled.failure());
+            assertTrue(
+                    "the typed root cause stays available for diagnostics",
+                    cancelled.getCause() instanceof RootTransportException
+            );
+            assertEquals(
+                    "a superseded activation never reached a privileged ignore-list read",
+                    0,
+                    countOperations(fixture.device, "readFolderIgnoreList:/configured/folder")
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void deniedFolderTransportIsReportedAsTypedFolderAccessFailure() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            fixture.device.rootAvailable = false;
+
+            FolderOperationException failure = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.discoverConflicts(
+                            ConfiguredFolderReference.of("folder-1")
+                    )
+            );
+
+            assertEquals(FolderOperationFailure.FOLDER_ACCESS_FAILED, failure.failure());
+            assertTrue(
+                    "a denied root transport never escapes as an unchecked failure",
+                    failure.getCause() instanceof RootTransportException
+            );
         } finally {
             fixture.close();
         }
@@ -790,6 +1065,135 @@ public class RootBackendTest {
     }
 
     @Test
+    public void ioPriorityTargetsOnlyTheIdentifierTheSameSessionJustVerified() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            PrivilegeBackend.Execution execution =
+                    fixture.backend.start(SyncthingCommand.SERVE, environment());
+            int launchedPid = execution.identity().pid();
+            int afterLaunch = fixture.device.acquisitions;
+            int closesAfterLaunch = fixture.device.shellCloses;
+            fixture.device.ioPriorityOutcome = TuningOutcome.applied("Simulated tuning");
+
+            TuningOutcome outcome = fixture.backend.applyIoPriority(execution.identity());
+
+            assertEquals(TuningOutcome.Status.APPLIED, outcome.status());
+            assertEquals(launchedPid, fixture.device.onlyLiveProcess().pid);
+            assertEquals(
+                    "the exact identifier the same session verified is the only one targeted",
+                    Collections.singletonList(launchedPid),
+                    fixture.device.ioPriorityPids
+            );
+            assertEquals(
+                    "the recorded start time is what the privileged command re-verifies",
+                    Collections.singletonList(execution.identity().processStartTimeTicks()),
+                    fixture.device.ioPriorityStartTimes
+            );
+            assertEquals(
+                    "one bounded helper session serves the verification and the command",
+                    afterLaunch + 1,
+                    fixture.device.acquisitions
+            );
+            assertEquals(
+                    "the tuning session is closed exactly once before the caller returns",
+                    closesAfterLaunch + 1,
+                    fixture.device.shellCloses
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void ioPriorityNeverTargetsAnIdentifierThatIsNotProvablyOwned() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            PrivilegeBackend.Execution execution =
+                    fixture.backend.start(SyncthingCommand.SERVE, environment());
+            ExecutionIdentity recorded = execution.identity();
+            ExecutionIdentity reused = new ExecutionIdentity(
+                    recorded.pid(),
+                    recorded.processStartTimeTicks() + 1,
+                    recorded.bootId(),
+                    recorded.executablePath(),
+                    recorded.runToken()
+            );
+
+            assertEquals(
+                    "a reused process identifier is never tuned",
+                    TuningOutcome.Status.NOT_APPLICABLE,
+                    fixture.backend.applyIoPriority(reused).status()
+            );
+            assertEquals(
+                    "a request without an owned execution is never tuned",
+                    TuningOutcome.Status.NOT_APPLICABLE,
+                    fixture.backend.applyIoPriority(null).status()
+            );
+            assertTrue(
+                    "no process identifier reaches the tuning command without exact proof",
+                    fixture.device.ioPriorityPids.isEmpty()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void ioPriorityFailureIsReportedInsteadOfRaised() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            PrivilegeBackend.Execution execution =
+                    fixture.backend.start(SyncthingCommand.SERVE, environment());
+            fixture.device.tuningFailure = new IOException("Simulated tuning failure");
+
+            assertEquals(
+                    "an optional optimization never raises into its caller",
+                    TuningOutcome.Status.FAILED,
+                    fixture.backend.applyIoPriority(execution.identity()).status()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void inotifyTuningUsesOneBoundedSessionAndNeverRaises() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.inotifyTuningOutcome = TuningOutcome.applied("Simulated tuning");
+            int before = fixture.device.acquisitions;
+
+            TuningOutcome outcome = fixture.backend.applyInotifyWatchLimit();
+
+            assertEquals(TuningOutcome.Status.APPLIED, outcome.status());
+            assertEquals(
+                    "the explicit maintenance request targets the approved system limit",
+                    Collections.singletonList(InotifyWatchLimit.TARGET),
+                    fixture.device.inotifyWatchLimits
+            );
+            assertEquals(
+                    "explicit maintenance acquires exactly one bounded helper session",
+                    before + 1,
+                    fixture.device.acquisitions
+            );
+            assertEquals(
+                    "the helper session is closed before the caller returns",
+                    fixture.device.acquisitions,
+                    fixture.device.shellCloses
+            );
+
+            fixture.device.tuningFailure = new IOException("Simulated tuning failure");
+            assertEquals(
+                    "a tuning failure is reported instead of raised",
+                    TuningOutcome.Status.FAILED,
+                    fixture.backend.applyInotifyWatchLimit().status()
+            );
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
     public void activationDeadlineIsTheConfiguredBoundAndLateShellsAreClosed() throws Exception {
         assertEquals(
                 "the caller-visible activation deadline is the canonical bound",
@@ -1031,11 +1435,12 @@ public class RootBackendTest {
                     unappendableLog,
                     fixture.directory,
                     fixture.factory,
-                    fixture.locations,
-                    60_000,
-                    RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
-                    TEST_CLEANUP_EXIT_WAIT_MILLIS
-            );
+                fixture.locations,
+                60_000,
+                RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
+                TEST_CLEANUP_EXIT_WAIT_MILLIS,
+                TEST_TILDE_BASE
+        );
 
             PrivilegeBackend.Execution execution =
                     backend.start(SyncthingCommand.SERVE, environment());
@@ -3887,9 +4292,18 @@ public class RootBackendTest {
         return worker;
     }
 
-    private static void assertNotImplemented(Runnable operation) {
-        RootTransportException failure = assertThrows(RootTransportException.class, operation::run);
-        assertEquals(RootFailure.PRIVILEGED_STATE_NOT_IMPLEMENTED, failure.failure());
+    /**
+     * Writes an authoritative configuration document that carries exactly one configured folder.
+     */
+    private static void writeFolderConfiguration(Fixture fixture, String folderId, String path)
+            throws IOException {
+        String document = "<configuration><folder id=\"" + folderId
+                + "\" label=\"test\" path=\"" + path
+                + "\" type=\"sendreceive\"></folder></configuration>";
+        Files.write(
+                fixture.locations.member(ManagedStateMember.CONFIG).toPath(),
+                document.getBytes(StandardCharsets.UTF_8)
+        );
     }
 
     private static void assertNoLibsuType(Class<?> type, String owner) {
@@ -4169,7 +4583,8 @@ public class RootBackendTest {
                     locations,
                     activationTimeoutMillis,
                     creationConfirmationTimeoutMillis,
-                    cleanupExitWaitMillis
+                    cleanupExitWaitMillis,
+                    TEST_TILDE_BASE
             );
         }
 
@@ -4185,7 +4600,8 @@ public class RootBackendTest {
                     locations,
                     60_000,
                     RootBackend.CREATION_CONFIRMATION_TIMEOUT_MILLIS,
-                    TEST_CLEANUP_EXIT_WAIT_MILLIS
+                    TEST_CLEANUP_EXIT_WAIT_MILLIS,
+                    TEST_TILDE_BASE
             );
         }
 
