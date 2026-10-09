@@ -6,6 +6,7 @@ import android.util.Log;
 import com.nutomic.syncthingandroid.model.Device;
 import com.nutomic.syncthingandroid.model.Folder;
 import com.nutomic.syncthingandroid.model.FolderIgnoreList;
+import com.nutomic.syncthingandroid.runtime.FolderOperationException;
 import com.nutomic.syncthingandroid.model.Gui;
 import com.nutomic.syncthingandroid.model.Options;
 import com.nutomic.syncthingandroid.service.RestApi;
@@ -118,9 +119,16 @@ public class ConfigRouter {
     }
 
     /**
-     * Gets ignore list for given folder.
+     * Gets the ignore list of one configured folder from the authoritative source.
+     *
+     * <p>When Syncthing is not reachable the list is read through the selected backend, which
+     * resolves the authoritative path of the folder itself. A read that fails raises instead of
+     * delivering an empty list, so a read failure is never shown as an empty ignore list.</p>
+     *
+     * @throws FolderOperationException when the ignore list exists but cannot be read
      */
-    public void getFolderIgnoreList(RestApi restApi, Folder folder, OnResultListener1<FolderIgnoreList> listener) {
+    public void getFolderIgnoreList(RestApi restApi, Folder folder, OnResultListener1<FolderIgnoreList> listener)
+            throws FolderOperationException {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
             configXml.loadConfig();
@@ -133,9 +141,12 @@ public class ConfigRouter {
     }
 
     /**
-     * Stores ignore list for given folder.
+     * Stores the ignore list of one configured folder in the authoritative source.
+     *
+     * @throws FolderOperationException when the ignore list cannot be written
      */
-    public void postFolderIgnoreList(RestApi restApi, Folder folder, String[] ignore) {
+    public void postFolderIgnoreList(RestApi restApi, Folder folder, String[] ignore)
+            throws FolderOperationException {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
             configXml.loadConfig();

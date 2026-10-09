@@ -116,6 +116,35 @@ final class SessionOwnedRootShell implements RootShell {
     public void repairManagedStateAccess() throws IOException {
         sessionShell.repairManagedStateAccess();
     }
+    @Override
+    public FolderWriteability probeFolderWriteability(String candidatePath) throws IOException {
+        return sessionShell.probeFolderWriteability(candidatePath);
+    }
+    @Override
+    public ConflictDiscoveryResult discoverConflictFiles(String folderRoot) throws IOException {
+        return sessionShell.discoverConflictFiles(folderRoot);
+    }
+    @Override
+    public FolderIgnoreResult readFolderIgnoreList(String folderRoot) throws IOException {
+        return sessionShell.readFolderIgnoreList(folderRoot);
+    }
+    @Override
+    public void writeFolderIgnoreList(String folderRoot, byte[] contents) throws IOException {
+        sessionShell.writeFolderIgnoreList(folderRoot, contents);
+    }
+    @Override
+    public List<FolderScriptOutcome> runFolderScriptSet(String folderRoot, String eventArgument)
+            throws IOException {
+        return sessionShell.runFolderScriptSet(folderRoot, eventArgument);
+    }
+    @Override
+    public TuningOutcome applyIoPriority(ExecutionIdentity identity) throws IOException {
+        return sessionShell.applyIoPriority(identity);
+    }
+    @Override
+    public TuningOutcome applyInotifyWatchLimit(int watchLimit) throws IOException {
+        return sessionShell.applyInotifyWatchLimit(watchLimit);
+    }
 
     /** Ignored on purpose; the session that created the real shell closes it. */
     @Override

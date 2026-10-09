@@ -3,12 +3,15 @@ package com.nutomic.syncthingandroid.runtime;
 import com.topjohnwu.superuser.Shell;
 import com.google.common.io.BaseEncoding;
 
+import com.nutomic.syncthingandroid.service.Constants;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -78,6 +81,68 @@ final class LibsuRootShell implements RootShell {
     static final int STATE_MISSING_EXIT_CODE = 3;
     /** Exit status of a state operation whose member is a symbolic link or has the wrong kind. */
     static final int STATE_UNSAFE_MEMBER_EXIT_CODE = 4;
+    /** Exit status used when a folder or folder member needed by an operation is absent. */
+    static final int FOLDER_MISSING_EXIT_CODE = 3;
+    /** Exit status used when a folder member has an unsafe kind, such as a symbolic link. */
+    static final int FOLDER_UNSAFE_EXIT_CODE = 4;
+    /** Exit status used when a probe proved that the folder is not writable. */
+    static final int FOLDER_READ_ONLY_EXIT_CODE = 5;
+    /** Exit status used when a probe could not decide whether the folder is writable. */
+    static final int FOLDER_UNKNOWN_EXIT_CODE = 6;
+    /** Exit status used when a bounded folder scan ran out of one of its budgets. */
+    static final int FOLDER_LIMIT_EXIT_CODE = 7;
+    /** Exit status used when a folder operation could not be completed. */
+    static final int FOLDER_ACCESS_EXIT_CODE = 8;
+    /** Exit status used when an optional tuning request cannot apply to this state. */
+    static final int TUNING_NOT_APPLICABLE_EXIT_CODE = 9;
+    /** Exit status used when a tuning command refuses an identifier it could not re-verify. */
+    static final int TUNING_IDENTITY_MISMATCH_EXIT_CODE = 10;
+    /**
+     * Bound for one sync-completion script dispatch.
+     *
+     * <p>Deliberately independent of {@link #OPERATION_TIMEOUT_MILLIS}: a user script may
+     * legitimately run for minutes, while a plain helper operation must not keep a caller waiting
+     * that long.</p>
+     */
+    static final long SCRIPT_DISPATCH_TIMEOUT_MILLIS = 300_000;
+    /** Byte budget for the ignore-list member one operation reads or writes. */
+    static final int FOLDER_IGNORE_LIST_MAX_BYTES = 1_048_576;
+    /**
+     * Block size of the bounded reader one ignore-list read uses.
+     *
+     * <p>The reader stops after the size it checked plus at most two such blocks, so a member that
+     * grows while it is read can never make the helper buffer more than the checked size plus one
+     * block, however large the member becomes under the read.</p>
+     */
+    static final int FOLDER_IGNORE_LIST_READ_BLOCK_BYTES = 4_096;
+    /** Entry budget for one privileged conflict scan. */
+    static final int FOLDER_SCAN_MAX_ENTRIES = 200_000;
+    /** Match budget for one privileged conflict scan. */
+    static final int FOLDER_SCAN_MAX_MATCHES = 1_000;
+    /** Output budget in characters for one privileged conflict scan. */
+    static final int FOLDER_SCAN_MAX_OUTPUT_CHARS = 1_048_576;
+    /** Scan time budget in milliseconds the privileged conflict scan enforces inside the shell. */
+    static final int FOLDER_SCAN_BUDGET_MILLIS = 10_000;
+    /**
+     * Entries one privileged conflict scan processes before it reads the clock again.
+     *
+     * <p>Reading the clock runs a separate command, so the scan does not pay for it on every one
+     * of up to {@link #FOLDER_SCAN_MAX_ENTRIES} entries while one wide directory still cannot
+     * outrun the scan budget.</p>
+     */
+    static final int FOLDER_SCAN_TIME_CHECK_STRIDE = 2_048;
+    /** Output budget in characters for the report one script dispatch may return. */
+    static final int FOLDER_SCRIPT_MAX_OUTPUT_CHARS = 65_536;
+    /** Background I/O priority class applied to an owned Syncthing process. */
+    static final int IO_PRIORITY_CLASS = 2;
+    /** Background I/O priority level applied to an owned Syncthing process. */
+    static final int IO_PRIORITY_LEVEL = 7;
+    /** Fixed ignore-list member name inside one configured folder root. */
+    static final String FOLDER_IGNORE_FILE_NAME = Constants.FILENAME_STIGNORE;
+    /** Fixed directory name inside one configured folder root that holds approved scripts. */
+    static final String FOLDER_SCRIPT_DIRECTORY_NAME = Constants.FILENAME_STFOLDER;
+    /** Versioning directory name a conflict scan never descends into. */
+    static final String FOLDER_VERSIONING_DIRECTORY_NAME = Constants.FOLDER_NAME_STVERSIONS;
     /** Operation-directory names this transport accepts, as ManagedStateStaging generates them. */
     static final Pattern OPERATION_NAME_PATTERN = Pattern.compile(
             "op-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -401,18 +466,211 @@ final class LibsuRootShell implements RootShell {
         runStateScript(repairManagedStateScript(), "repair Managed State access");
     }
 
+    @Override
+    public FolderWriteability probeFolderWriteability(String candidatePath) throws IOException {
+        requireAbsoluteFolderPath(candidatePath);
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                folderWriteabilityScript(candidatePath),
+                output,
+                "probe the writeability of a candidate folder"
+        );
+        switch (result.getCode()) {
+            case 0:
+                return FolderWriteability.WRITABLE;
+            case FOLDER_READ_ONLY_EXIT_CODE:
+                return FolderWriteability.READ_ONLY;
+            case FOLDER_UNKNOWN_EXIT_CODE:
+                return FolderWriteability.UNKNOWN;
+            default:
+                throw folderOperationFailure(result, "probe the writeability of a candidate folder");
+        }
+    }
+
+    @Override
+    public ConflictDiscoveryResult discoverConflictFiles(String folderRoot) throws IOException {
+        requireAbsoluteFolderPath(folderRoot);
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                conflictDiscoveryScript(folderRoot),
+                output,
+                "scan a configured folder for conflict files"
+        );
+        if (result.getCode() != 0) {
+            if (result.getCode() == 124) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                        "The conflict scan exceeded its time budget"
+                );
+            }
+            throw folderOperationFailure(result, "scan a configured folder for conflict files");
+        }
+        return decodeConflictDiscovery(output);
+    }
+
+    @Override
+    public FolderIgnoreResult readFolderIgnoreList(String folderRoot) throws IOException {
+        requireAbsoluteFolderPath(folderRoot);
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                readFolderIgnoreListScript(folderRoot),
+                output,
+                "read a folder ignore list"
+        );
+        if (result.getCode() == FOLDER_MISSING_EXIT_CODE) {
+            return FolderIgnoreResult.of(null);
+        }
+        if (result.getCode() != 0) {
+            throw folderOperationFailure(result, "read a folder ignore list");
+        }
+        byte[] content = decodeFolderBase64(output, "read a folder ignore list");
+        if (content.length > FOLDER_IGNORE_LIST_MAX_BYTES) {
+            throw new RootFolderOperationException(
+                    FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                    "The folder ignore list exceeds the byte budget"
+            );
+        }
+        return FolderIgnoreResult.of(new String(content, StandardCharsets.UTF_8).split("\n"));
+    }
+
+    @Override
+    public void writeFolderIgnoreList(String folderRoot, byte[] contents) throws IOException {
+        requireAbsoluteFolderPath(folderRoot);
+        Objects.requireNonNull(contents, "The ignore-list content is required");
+        if (contents.length > FOLDER_IGNORE_LIST_MAX_BYTES) {
+            throw new RootFolderOperationException(
+                    FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                    "The folder ignore list exceeds the byte budget"
+            );
+        }
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                writeFolderIgnoreListScript(folderRoot, STATE_BASE64.encode(contents)),
+                output,
+                "write a folder ignore list"
+        );
+        if (result.getCode() != 0) {
+            throw folderOperationFailure(result, "write a folder ignore list");
+        }
+    }
+
+    @Override
+    public List<FolderScriptOutcome> runFolderScriptSet(String folderRoot, String eventArgument)
+            throws IOException {
+        requireAbsoluteFolderPath(folderRoot);
+        Objects.requireNonNull(eventArgument, "The folder event argument is required");
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runBoundedJob(
+                folderScriptSetScript(folderRoot, eventArgument),
+                output,
+                SCRIPT_DISPATCH_TIMEOUT_MILLIS,
+                "run the approved folder scripts"
+        );
+        if (result.getCode() == 124) {
+            throw new RootFolderOperationException(
+                    FolderOperationFailure.SCRIPT_DISPATCH_FAILED,
+                    "The script dispatch exceeded its deadline"
+            );
+        }
+        if (result.getCode() != 0) {
+            throw folderOperationFailure(result, "run the approved folder scripts");
+        }
+        return decodeFolderScriptOutcomes(output);
+    }
+
+    @Override
+    public TuningOutcome applyIoPriority(ExecutionIdentity identity) throws IOException {
+        Objects.requireNonNull(identity, "The owned execution is required");
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                ioPriorityScript(identity.pid(), identity.processStartTimeTicks()),
+                output,
+                "apply the background I/O priority"
+        );
+        if (result.getCode() == TUNING_NOT_APPLICABLE_EXIT_CODE) {
+            return TuningOutcome.notApplicable("The device does not provide the ionice command");
+        }
+        if (result.getCode() == TUNING_IDENTITY_MISMATCH_EXIT_CODE) {
+            return TuningOutcome.notApplicable(
+                    "The recorded execution no longer owns that process identifier"
+            );
+        }
+        if (result.getCode() != 0) {
+            throw folderOperationFailure(result, "apply the background I/O priority");
+        }
+        return TuningOutcome.applied(
+                "Applied I/O priority class " + IO_PRIORITY_CLASS
+                        + " level " + IO_PRIORITY_LEVEL + " to process " + identity.pid()
+        );
+    }
+
+    @Override
+    public TuningOutcome applyInotifyWatchLimit(int watchLimit) throws IOException {
+        if (watchLimit <= 0) {
+            throw new IllegalArgumentException("The inotify watch limit must be positive");
+        }
+        List<String> output = new ArrayList<>();
+        Shell.Result result = runFolderJob(
+                inotifyWatchLimitScript(watchLimit),
+                output,
+                "raise the inotify watch limit"
+        );
+        if (result.getCode() == TUNING_NOT_APPLICABLE_EXIT_CODE) {
+            return TuningOutcome.notApplicable("The kernel does not expose the inotify watch limit");
+        }
+        if (result.getCode() != 0) {
+            throw folderOperationFailure(result, "raise the inotify watch limit");
+        }
+        return TuningOutcome.applied("The inotify watch limit is at least " + watchLimit);
+    }
+
     /** Runs one state command and maps a failed transport to its own typed root failure. */
     private Shell.Result runStateJob(String command, List<String> stdout, String operation)
             throws IOException {
+        return runBoundedJob(command, stdout, operationTimeoutMillis, operation);
+    }
+
+    /**
+     * Runs one folder-operation command inside the plain helper-operation deadline.
+     *
+     * <p>Only a sync-completion script dispatch may run longer than this bound; every other
+     * privileged folder operation keeps the same deadline as the rest of the root transport.</p>
+     */
+    private Shell.Result runFolderJob(String command, List<String> stdout, String operation)
+            throws IOException {
+        return runBoundedJob(command, stdout, operationTimeoutMillis, operation);
+    }
+
+    /**
+     * Runs one privileged script inside a bounded child shell and maps transport problems to the
+     * typed root transport failure.
+     *
+     * <p>Top-level exit commands stay inside a child shell so libsu's persistent shell survives
+     * long enough to deliver its job framing and status. Android Toybox's {@code timeout} owns a
+     * separate process group and waits for it after TERM/KILL, so a timed out script cannot keep
+     * mutating files after this transport reports failure. The in-script supervisor fires before
+     * the job deadline, so a script that runs out of time reports its own status instead of
+     * tearing the transport down.</p>
+     *
+     * @param timeoutMillis deadline for the whole job, including result transport
+     */
+    private Shell.Result runBoundedJob(
+            String command,
+            List<String> stdout,
+            long timeoutMillis,
+            String operation
+    ) throws IOException {
         try {
             // Keep top-level exit commands inside a child shell so libsu's persistent shell
             // survives long enough to deliver its job framing and status. Android Toybox's
             // timeout owns a separate process group and waits for it after TERM/KILL, so a timed
             // out state script cannot keep mutating files after this transport reports failure.
             Shell.Result result = runJob(
-                    "(\n" + boundedStateCommand(command) + "\n)",
+                    "(" + STATE_LINE + boundedStateCommand(command, timeoutMillis)
+                            + STATE_LINE + ")",
                     stdout,
-                    new ArrayList<>()
+                    new ArrayList<>(),
+                    timeoutMillis
             );
             if (result == null || result.getCode() == Shell.Result.JOB_NOT_EXECUTED) {
                 closeAfterFailedOperation();
@@ -440,11 +698,21 @@ final class LibsuRootShell implements RootShell {
 
     /** Bounds one privileged state script before the outer shell-transport deadline expires. */
     String boundedStateCommand(String script) {
-        long killGraceMillis = Math.min(1_000, Math.max(1, operationTimeoutMillis / 10));
-        long transportReserveMillis = Math.min(1_000, Math.max(1, operationTimeoutMillis / 10));
+        return boundedStateCommand(script, operationTimeoutMillis);
+    }
+
+    /**
+     * Bounds one privileged script so the transport deadline still has room to report a result.
+     *
+     * @param script        privileged script text the supervisor runs
+     * @param timeoutMillis outer deadline the caller applies to the whole job
+     */
+    String boundedStateCommand(String script, long timeoutMillis) {
+        long killGraceMillis = Math.min(1_000, Math.max(1, timeoutMillis / 10));
+        long transportReserveMillis = Math.min(1_000, Math.max(1, timeoutMillis / 10));
         long scriptTimeoutMillis = Math.max(
                 1,
-                operationTimeoutMillis - killGraceMillis - transportReserveMillis
+                timeoutMillis - killGraceMillis - transportReserveMillis
         );
         String delimiter;
         do {
@@ -1332,11 +1600,28 @@ final class LibsuRootShell implements RootShell {
 
     private Shell.Result runJob(String command, List<String> stdout, List<String> stderr)
             throws IOException {
+        return runJob(command, stdout, stderr, operationTimeoutMillis);
+    }
+
+    /**
+     * Runs one job with an explicit deadline.
+     *
+     * <p>A job that exceeds its deadline invalidates the transport, because a shell that ignored
+     * one deadline cannot be trusted to answer later operations in order.</p>
+     *
+     * @param timeoutMillis deadline for the job and for its result to arrive
+     */
+    private Shell.Result runJob(
+            String command,
+            List<String> stdout,
+            List<String> stderr,
+            long timeoutMillis
+    ) throws IOException {
         Future<Shell.Result> future = OPERATION_EXECUTOR.submit(
                 () -> shell.newJob().add(command).to(stdout, stderr).exec()
         );
         try {
-            return future.get(operationTimeoutMillis, TimeUnit.MILLISECONDS);
+            return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
             closeAfterFailedOperation();
@@ -1455,6 +1740,962 @@ final class LibsuRootShell implements RootShell {
     }
 
     /** Finds the private run token inside one NUL-separated environment listing. */
+    /**
+     * Requires one caller-supplied folder path to be usable as a privileged shell argument.
+     *
+     * <p>Only an absolute path names a folder the transport can work with, and a path carrying a
+     * NUL byte has no shell representation at all. The path is single-quoted before it reaches the
+     * shell, so no further content check is needed.</p>
+     */
+    private static void requireAbsoluteFolderPath(String path) {
+        Objects.requireNonNull(path, "The folder path is required");
+        if (path.isEmpty() || path.charAt(0) != '/' || path.indexOf(0) >= 0) {
+            throw new IllegalArgumentException("The folder path must be an absolute path");
+        }
+    }
+
+    /**
+     * Maps one failed folder-operation status to its stable failure reason.
+     *
+     * <p>The status values come from the scripts this transport builds. Every other value -
+     * including a shell that did not run as real UID 0 - reports an access failure, because the
+     * operation produced no trustworthy verdict.</p>
+     */
+    private static RootFolderOperationException folderOperationFailure(
+            Shell.Result result,
+            String operation
+    ) {
+        int code = result == null ? Shell.Result.JOB_NOT_EXECUTED : result.getCode();
+        FolderOperationFailure failure;
+        switch (code) {
+            case STATE_UID_GUARD_EXIT_CODE:
+                failure = FolderOperationFailure.FOLDER_ACCESS_FAILED;
+                break;
+            case FOLDER_UNSAFE_EXIT_CODE:
+                failure = FolderOperationFailure.FOLDER_MEMBER_UNSAFE;
+                break;
+            case FOLDER_LIMIT_EXIT_CODE:
+                failure = FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED;
+                break;
+            case 124:
+                failure = FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED;
+                break;
+            default:
+                failure = FolderOperationFailure.FOLDER_ACCESS_FAILED;
+        }
+        return new RootFolderOperationException(
+                failure,
+                "The root shell could not " + operation + " (exit " + code + ")"
+        );
+    }
+
+    /**
+     * Decodes the base64 payload one folder operation returned.
+     *
+     * <p>Base64 keeps every byte of the member intact, including a missing final newline, and
+     * keeps the transport line-oriented for any member content.</p>
+     */
+    private static byte[] decodeFolderBase64(List<String> output, String operation)
+            throws IOException {
+        StringBuilder encoded = new StringBuilder();
+        for (String line : output) {
+            encoded.append(line.trim());
+        }
+        try {
+            return STATE_BASE64.decode(encoded);
+        } catch (IllegalArgumentException malformed) {
+            throw new RootFolderOperationException(
+                    FolderOperationFailure.FOLDER_ACCESS_FAILED,
+                    "The root shell returned an unreadable payload for " + operation,
+                    malformed
+            );
+        }
+    }
+
+    /**
+     * Decodes the relative conflict paths one privileged scan returned.
+     *
+     * <p>Each result is verified to stay inside the scanned folder and to name a real entry, so a
+     * script that returned anything unexpected cannot widen what the caller reports. Paths beyond
+     * the match or output budget fail the whole result instead of shortening it.</p>
+     */
+    private static ConflictDiscoveryResult decodeConflictDiscovery(List<String> output)
+            throws IOException {
+        List<String> relativePaths = new ArrayList<>();
+        int totalCharacters = 0;
+        for (String line : output) {
+            String encoded = line.trim();
+            if (encoded.isEmpty()) {
+                continue;
+            }
+            totalCharacters += encoded.length();
+            if (totalCharacters > FOLDER_SCAN_MAX_OUTPUT_CHARS) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                        "The conflict scan exceeded its output budget"
+                );
+            }
+            String relativePath = new String(
+                    decodeFolderBase64(Collections.singletonList(encoded), "scan for conflict files"),
+                    StandardCharsets.UTF_8
+            );
+            if (!isSafeRelativePath(relativePath)) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.FOLDER_MEMBER_UNSAFE,
+                        "The conflict scan returned a path outside the configured folder"
+                );
+            }
+            if (relativePaths.size() >= FOLDER_SCAN_MAX_MATCHES) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.FOLDER_OPERATION_LIMIT_EXCEEDED,
+                        "The conflict scan exceeded its match budget"
+                );
+            }
+            relativePaths.add(relativePath);
+        }
+        return ConflictDiscoveryResult.of(relativePaths);
+    }
+
+    /** Reports whether one scan result stays inside its folder and could name a real entry. */
+    private static boolean isSafeRelativePath(String path) {
+        if (path.isEmpty() || path.charAt(0) == '/' || path.endsWith("/")
+                || path.indexOf(0) >= 0) {
+            return false;
+        }
+        for (String segment : path.split("/")) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Decodes the script report one dispatch returned.
+     *
+     * <p>Every line carries one base64-encoded script name and its exit status, so a name with a
+     * space cannot be confused with the status and the caller can attribute a failure to the
+     * script that produced it.</p>
+     */
+    private static List<FolderScriptOutcome> decodeFolderScriptOutcomes(List<String> output)
+            throws IOException {
+        List<FolderScriptOutcome> outcomes = new ArrayList<>();
+        int totalCharacters = 0;
+        for (String line : output) {
+            String report = line.trim();
+            if (report.isEmpty()) {
+                continue;
+            }
+            totalCharacters += report.length();
+            if (totalCharacters > FOLDER_SCRIPT_MAX_OUTPUT_CHARS) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.SCRIPT_DISPATCH_FAILED,
+                        "The script dispatch returned more output than its budget allows"
+                );
+            }
+            int separator = report.indexOf(' ');
+            if (separator <= 0) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.SCRIPT_DISPATCH_FAILED,
+                        "The script dispatch returned an unreadable result"
+                );
+            }
+            String scriptName = new String(
+                    decodeFolderBase64(
+                            Collections.singletonList(report.substring(0, separator)),
+                            "run the approved folder scripts"
+                    ),
+                    StandardCharsets.UTF_8
+            );
+            // A file name may legally contain a line break, and the report carries the name
+            // base64-encoded, so one record still names exactly one script. Only a name that
+            // could not have come from a direct child entry is refused.
+            if (scriptName.isEmpty() || scriptName.indexOf('/') >= 0
+                    || scriptName.indexOf(0) >= 0) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.SCRIPT_DISPATCH_FAILED,
+                        "The script dispatch returned an unusable script name"
+                );
+            }
+            int exitStatus;
+            try {
+                exitStatus = Integer.parseInt(report.substring(separator + 1).trim());
+            } catch (NumberFormatException notANumber) {
+                throw new RootFolderOperationException(
+                        FolderOperationFailure.SCRIPT_DISPATCH_FAILED,
+                        "The script dispatch returned an unreadable exit status"
+                );
+            }
+            outcomes.add(FolderScriptOutcome.of(scriptName, exitStatus));
+        }
+        return outcomes;
+    }
+
+    /**
+     * Builds the read-only writeability probe for one candidate folder.
+     *
+     * <p>The probe creates nothing inside the candidate. A read-only mount still fails the write
+     * test for the root identity, because the kernel refuses write access to a directory on a
+     * read-only filesystem even for a privileged caller.</p>
+     */
+    String folderWriteabilityScript(String candidatePath) {
+        return stateUidGuard()
+                + "standroid_folder=" + quote(candidatePath) + STATE_LINE
+                + "if [ ! -d \"$standroid_folder\" ]; then exit "
+                + FOLDER_UNKNOWN_EXIT_CODE + "; fi" + STATE_LINE
+                + "if [ ! -w \"$standroid_folder\" ] || [ ! -x \"$standroid_folder\" ]; then exit "
+                + FOLDER_READ_ONLY_EXIT_CODE + "; fi" + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
+    /**
+     * Builds the bounded conflict scan for one configured folder.
+     *
+     * <p>The walk uses shell pathname expansion instead of {@code find}, so it needs no command
+     * beyond the compatibility floor of the supported Android versions. Every entry stays inside
+     * the folder: symbolic links are neither followed nor reported, the versioning directory of the
+     * folder root is skipped, and the entry, match, output, and time budgets end the whole scan
+     * with a typed limit failure instead of a shorter list. Each budget is enforced while the walk
+     * runs, so a directory holding millions of entries cannot make the transport collect more
+     * output than the budget allows.</p>
+     *
+     * <p>Work is done relative to a directory identity rather than to a pathname the caller can
+     * exchange. The walk records the identity of the object the configured pathname names, moves
+     * its working directory into that pathname, and compares the identity of the working directory
+     * the kernel then reports with the recorded one; the rest of the scan runs inside that pinned
+     * directory and enters a nested directory only by its name inside an already pinned parent,
+     * after recording the identity of the name it is about to use and comparing that identity with
+     * the working directory it reached. A caller who controls the folder and exchanges an entry for
+     * a symbolic link or a different object between those steps therefore ends the scan with the
+     * typed unsafe failure instead of redirecting the walk out of the folder, and the comparison is
+     * repeated after the walk returns from a directory, so a directory exchanged while the walk was
+     * inside it cannot make the walk continue in its replacement. The configured folder is treated the same way: the name is read without following a link, a name that is not a plain directory (a symbolic link included) ends the scan with the typed unsafe failure, and the object the walk then enters by that name must be the object whose identity was recorded. A folder the caller configured as a link to its real location therefore cannot be scanned, because the walk cannot tell such a link apart from one a concurrent writer put there; the caller has to configure the real directory. Only the identity of an object is compared, so a directory that is renamed out of the folder and reached again through a link of the same name is indistinguishable from one that never moved; the walk guarantees that it only ever enters objects it saw under the folder's own names. Only the identity
+     * of an object is compared, so a directory that is renamed out of the folder and reached again
+     * through a link of the same name is indistinguishable from one that never moved; the walk
+     * guarantees that it only ever enters objects it saw under the folder's own names.</p>
+     *
+     * <p>Matched paths travel as one base64 record per line, relative to the configured folder, so
+     * names that contain spaces, quotes, or line breaks survive the transport unchanged. The
+     * encoder removes the line breaks a Base64 implementation may insert, because the decoder reads
+     * exactly one record per line and a wrapped record would arrive as several unusable ones.
+     * Toybox Base64 wraps long input by default and its option set is not guaranteed across the
+     * supported Android versions, so only {@code tr}, a command every Android tool environment
+     * provides, performs the unwrapping. The kind of a matched member is checked once more
+     * immediately before its record is emitted, so a member exchanged for a symbolic link while the
+     * walk encoded it is dropped instead of being reported.</p>
+     *
+     * <p>Every directory spends the entry budget before its pathname expansion runs, so the names
+     * one expansion builds are bounded by that budget, and the count that guards it reads the
+     * listing through a pipe, which buffers no more than one line at a time. Two bounds are
+     * reported rather than claimed: the wall-clock budget is checked before and after the count of
+     * a directory but cannot interrupt it, so one directory can hold the walk for the duration of
+     * one listing, and the expansion of that listing builds all of its names before the loop body
+     * can stop, so the peak allocation of a directory is its entry budget worth of names. Closing
+     * both needs an enumeration that reports entries in framed records as it reads them; the
+     * compatibility floor has no approved command for that, and the commands that could stream a
+     * listing cannot carry a name that contains a line break. The narrowest viable alternative is a
+     * primitive that frames each name with a NUL byte, which no filename can contain, so a reader
+     * could consume a listing incrementally without ambiguity; the approved transport has no such
+     * primitive, and adding one is a scope extension rather than part of this walk.</p>
+     */
+    String conflictDiscoveryScript(String folderRoot) {
+        long budgetSeconds = Math.max(1, FOLDER_SCAN_BUDGET_MILLIS / 1_000);
+        String conflictName = "*.sync-conflict-"
+                + "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
+                + "-[0-9][0-9][0-9][0-9][0-9][0-9]"
+                + "-[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]*";
+        return stateUidGuard()
+                + "standroid_folder=" + quote(folderRoot) + STATE_LINE
+                + "if [ ! -d \"$standroid_folder\" ]; then exit " + FOLDER_ACCESS_EXIT_CODE + "; fi" + STATE_LINE
+                + "standroid_deadline=$(( $(date +%s) + " + budgetSeconds + " ))" + STATE_LINE
+                + "command -v base64 >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v tr >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v ls >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v wc >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_entries=0" + STATE_LINE
+                + "standroid_matches=0" + STATE_LINE
+                + "standroid_output=0" + STATE_LINE
+                + "standroid_identity() {" + STATE_LINE
+                + "set -- $(ls -lnid \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ -n \"$1\" ] || return 1" + STATE_LINE
+                + "echo \"$1 $2\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_folder_identity=$(standroid_identity \"$standroid_folder\") || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_folder_identity\" in *\" d\"*) : ;; *) exit " + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "cd \"$standroid_folder\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_folder_here=$(standroid_identity .) || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_folder_here\" = \"$standroid_folder_identity\" ] || exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "standroid_listed=." + STATE_LINE
+                + "standroid_scan() {" + STATE_LINE
+                + "if [ \"$(date +%s)\" -gt \"$standroid_deadline\" ]; then exit " + FOLDER_LIMIT_EXIT_CODE + "; fi" + STATE_LINE
+                + "standroid_count=$(ls -a . | wc -l) || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_count\" -ge 2 ] || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_count=$(( standroid_count - 2 ))" + STATE_LINE
+                + "[ \"$(( standroid_entries + standroid_count ))\" -le " + FOLDER_SCAN_MAX_ENTRIES + " ] || exit " + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "if [ \"$(date +%s)\" -gt \"$standroid_deadline\" ]; then exit " + FOLDER_LIMIT_EXIT_CODE + "; fi" + STATE_LINE
+                + "for standroid_entry in \"$standroid_listed\"/* \"$standroid_listed\"/.[!.]* \"$standroid_listed\"/..?*; do" + STATE_LINE
+                + "[ -e \"$standroid_entry\" ] || [ -L \"$standroid_entry\" ] || continue" + STATE_LINE
+                + "standroid_entries=$(( standroid_entries + 1 ))" + STATE_LINE
+                + "[ \"$standroid_entries\" -le " + FOLDER_SCAN_MAX_ENTRIES + " ] || exit " + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "if [ \"$(( standroid_entries % " + FOLDER_SCAN_TIME_CHECK_STRIDE + " ))\" -eq 0 ] && [ \"$(date +%s)\" -gt \"$standroid_deadline\" ]; then exit " + FOLDER_LIMIT_EXIT_CODE + "; fi" + STATE_LINE
+                + "[ -L \"$standroid_entry\" ] && continue" + STATE_LINE
+                + "if [ -d \"$standroid_entry\" ]; then" + STATE_LINE
+                + "if [ \"$1\" = \"1\" ]; then" + STATE_LINE
+                + "case \"${standroid_entry##*/}\" in" + STATE_LINE
+                + FOLDER_VERSIONING_DIRECTORY_NAME + ") continue ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "fi" + STATE_LINE
+                + "standroid_child_identity=$(standroid_identity \"$standroid_entry\") || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ ! -L \"$standroid_entry\" ] || exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "[ -d \"$standroid_entry\" ] || continue" + STATE_LINE
+                + "standroid_child_name=${standroid_entry#./}" + STATE_LINE
+                + "cd \"$standroid_entry\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_child_here=$(standroid_identity .) || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_child_here\" = \"$standroid_child_identity\" ] || exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "standroid_scan 0 \"$standroid_child_identity\" \"$3$standroid_child_name/\"" + STATE_LINE
+                + "cd .. || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_parent_here=$(standroid_identity .) || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_parent_here\" = \"$2\" ] || exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "continue" + STATE_LINE
+                + "fi" + STATE_LINE
+                + "[ -f \"$standroid_entry\" ] || continue" + STATE_LINE
+                + "case \"${standroid_entry##*/}\" in" + STATE_LINE
+                + "" + conflictName + ") ;;" + STATE_LINE
+                + "*) continue ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "standroid_matches=$(( standroid_matches + 1 ))" + STATE_LINE
+                + "[ \"$standroid_matches\" -le " + FOLDER_SCAN_MAX_MATCHES + " ] || exit " + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "standroid_encoded=$(printf '%s' \"$3${standroid_entry#./}\" | base64 | tr -d '\\n') || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_output=$(( standroid_output + ${#standroid_encoded} ))" + STATE_LINE
+                + "[ \"$standroid_output\" -le " + FOLDER_SCAN_MAX_OUTPUT_CHARS + " ] || exit " + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "[ -f \"$standroid_entry\" ] && [ ! -L \"$standroid_entry\" ] || continue" + STATE_LINE
+                + "printf '%s\\n' \"$standroid_encoded\"" + STATE_LINE
+                + "done" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_scan 1 \"$standroid_folder_here\" \"\"" + STATE_LINE
+                + "exit 0";
+    }
+
+    /**
+     * Builds the byte-exact read of one folder's ignore list.
+     *
+     * <p>The configured folder is pinned before anything is read. A folder whose last path
+     * component is not a real directory is refused instead of followed, and the shell then enters
+     * the directory and re-reads the identity of its own working directory, so a caller who
+     * controls the folder's parent directory cannot rename or replace that entry and have later
+     * pathnames resolve somewhere else. The member is addressed relative to the pinned
+     * directory.</p>
+     *
+     * <p>The member is opened by descriptor, and the inode that descriptor holds is compared with
+     * the inode the member name holds before anything is read, so a member exchanged for a
+     * symbolic link between the check and the read is refused instead of followed, and the bytes
+     * that are reported come from the descriptor that was verified and never from the name.</p>
+     *
+     * <p>An absent member reports its own status, while an unreadable member, a symbolic link, or
+     * a wrong entry kind fails the read. That keeps "this folder has no ignore list" separate
+     * from "the ignore list could not be read". The identity of the member is captured again
+     * around the read and the read fails closed when it changed or stopped being a regular file,
+     * so a member replaced while the helper reads it is never reported as its content. The member
+     * is read through a reader that stops after the size that was checked, and both the encoded
+     * length and the size are compared against that check afterwards, so a member that grew while
+     * it was read and a read that stopped early can neither buffer more than the checked size nor
+     * be reported as content the size check never covered.</p>
+     */
+    String readFolderIgnoreListScript(String folderRoot) {
+        return stateUidGuard()
+                + "standroid_identity() {" + STATE_LINE
+                + "set -- $(ls -lni \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "echo \"$1 $2\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_directory_identity() {" + STATE_LINE
+                + "set -- $(ls -lnid \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ -n \"$1\" ] || return 1" + STATE_LINE
+                + "echo \"$1 $2\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_folder=" + quote(folderRoot) + STATE_LINE
+                + "if [ ! -d \"$standroid_folder\" ]; then exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; fi" + STATE_LINE
+                + "standroid_folder_identity=$(standroid_directory_identity \"$standroid_folder\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_folder_identity\" in *\" d\"*) : ;; *) exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "cd \"$standroid_folder\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_folder_here=$(standroid_directory_identity .) || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_folder_here\" = \"$standroid_folder_identity\" ] || exit "
+                + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "standroid_member=\"./" + FOLDER_IGNORE_FILE_NAME + "\"" + STATE_LINE
+                + "if [ ! -e \"$standroid_member\" ] && [ ! -L \"$standroid_member\" ]; then exit "
+                + FOLDER_MISSING_EXIT_CODE + "; fi" + STATE_LINE
+                + "if [ -L \"$standroid_member\" ] || [ ! -f \"$standroid_member\" ]; then exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; fi" + STATE_LINE
+                + "if [ ! -r \"$standroid_member\" ]; then exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; fi" + STATE_LINE
+                + "standroid_size=$(wc -c < \"$standroid_member\" 2>/dev/null) || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_size\" -le " + FOLDER_IGNORE_LIST_MAX_BYTES + " ] || exit "
+                + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "command -v base64 >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v tr >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v dd >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_identity_before=$(standroid_identity \"$standroid_member\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_identity_before\" in *\" l\"*) exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "standroid_fd_path=\"/dev/fd/3\"" + STATE_LINE
+                + "[ -d /proc/self/fd ] && standroid_fd_path=\"/proc/self/fd/3\"" + STATE_LINE
+                + "standroid_file_inode() { set -- $(ls -lni \"$1\" 2>/dev/null) || return 1;"
+                + " [ $# -gt 0 ] || return 1; echo \"$1\"; }" + STATE_LINE
+                + "standroid_member_inode=$(standroid_file_inode \"$standroid_member\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "exec 3< \"$standroid_member\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_opened_inode=$(set -- $(ls -lniL \"$standroid_fd_path\" 2>/dev/null 3<&3);"
+                + " [ $# -gt 0 ] && echo \"$1\") || { exec 3<&-; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_member_inode\" = \"$standroid_opened_inode\" ] || { exec 3<&-; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                // The member is read through a reader that stops after the size that was just
+                // checked, so a member that grows while it is read can never buffer more than
+                // the checked size plus the one block of slack the reader allows for.
+                + "standroid_blocks=$(( standroid_size / " + FOLDER_IGNORE_LIST_READ_BLOCK_BYTES
+                + " + 2 ))" + STATE_LINE
+                + "standroid_encoded=$(dd if=\"$standroid_fd_path\" 3<&3 bs="
+                        + FOLDER_IGNORE_LIST_READ_BLOCK_BYTES
+                + " count=\"$standroid_blocks\""
+                + " 2>/dev/null | base64 | tr -d '\\n') || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "exec 3<&-" + STATE_LINE
+                // Base64 of the checked size is the only payload this read may report, so a longer
+                // one means the member grew after the check and a shorter one means the read stopped
+                // early; neither is reported as content.
+                + "standroid_expected=$(( ( ( standroid_size + 2 ) / 3 ) * 4 ))" + STATE_LINE
+                + "[ \"${#standroid_encoded}\" = \"$standroid_expected\" ] || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_size_after=$(wc -c < \"$standroid_member\" 2>/dev/null) || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_size_after\" = \"$standroid_size\" ] || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_identity_after=$(standroid_identity \"$standroid_member\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_identity_before\" = \"$standroid_identity_after\" ] || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "printf '%s\\n' \"$standroid_encoded\"" + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
+    /**
+     * Builds the atomic replacement of one folder's ignore list.
+     *
+     * <p>The replacement is created directly in the configured folder with one exclusive
+     * redirection: the shell turns on {@code noclobber} for the single {@code base64 -d > name}
+     * command that builds the staged file, so that command can neither follow a symbolic link nor
+     * overwrite an entry a caller put at that name. It fails closed when the name is taken, and the
+     * staged file is therefore always a file this operation created itself inside the folder.</p>
+     *
+     * <p>The operation opens that file once and keeps the descriptor for the rest of the
+     * replacement. The size, the mode, the ownership and the security context are then read,
+     * applied and verified through that descriptor - {@code /proc/self/fd/3}, or {@code /dev/fd/3}
+     * where {@code /proc} is not mounted - which the kernel resolves to the file this operation
+     * created rather than to whatever the name may point at later. The entry name and the
+     * descriptor are compared, and the entry has to be a regular file, before any of those
+     * accesses happen; a caller that replaces the staged entry afterwards cannot redirect them,
+     * because none of them resolves a path again. The shell this transport runs on does not hand a
+     * descriptor it opened itself to the commands it starts, so every command that has to act on the
+     * descriptor is handed that descriptor on its own command line; without it, those commands would
+     * resolve a descriptor path they do not hold, and the replacement of an existing list would fail
+     * instead of preserving its attributes.</p>
+     *
+     * <p>Mode and ownership of an existing member are read before the replacement is built and
+     * applied to the staged file through the descriptor, so the member keeps the attributes the
+     * folder gave it and the sync service can still read the list. The security context is
+     * compared the same way and repaired with {@code chcon} when the file system did not inherit
+     * it; a context that cannot be preserved fails the operation instead of silently relabelling
+     * the member.</p>
+     *
+     * <p>The staged file is renamed over the member from inside the directory the shell entered,
+     * so no reader observes a half-written list and the destination cannot leave the configured
+     * folder. The member is checked once more after the rename, because {@code mv} moves the
+     * replacement inside the member and still reports success when another writer replaced that
+     * member with a directory while this operation ran; such a stray replacement is removed again
+     * and the write fails closed.</p>
+     *
+     * <p>The residual exposure of this transport is the rename itself, which is the one remaining
+     * pathname operation of the replacement: a caller that replaces the staged entry between the
+     * last identity check and the rename can have an entry of its own renamed over the member.
+     * That is detected right after the rename and reported as a typed refusal instead of a saved
+     * list, and it grants the caller no write it could not already perform inside a folder it
+     * controls. This shell transport offers no descriptor-relative rename, and the approved design
+     * adds no such primitive.</p>
+     */
+    String writeFolderIgnoreListScript(String folderRoot, String encodedContent) {
+        String delimiter;
+        do {
+            delimiter = "STANDROID_STIGNORE_" + UUID.randomUUID().toString().replace("-", "");
+        } while (encodedContent.contains(delimiter));
+        String stagedName = FOLDER_IGNORE_FILE_NAME
+                + ".standroid-" + UUID.randomUUID().toString().replace("-", "");
+        String bareContent = encodedContent.replaceAll("\\s", "");
+        int stagedBytes = (bareContent.length() / 4) * 3;
+        if (bareContent.endsWith("==")) {
+            stagedBytes -= 2;
+        } else if (bareContent.endsWith("=")) {
+            stagedBytes -= 1;
+        }
+        return stateUidGuard()
+                // The first ten characters of a mode field are the file type and the permission
+                // letters; a file system or a listing tool may append its own flags after them, and
+                // those flags must not make two equal permissions look different.
+                + "standroid_mode_field() {" + STATE_LINE
+                + "standroid_mode_text=$1" + STATE_LINE
+                + "standroid_mode_tail=${standroid_mode_text#??????????}" + STATE_LINE
+                + "echo \"${standroid_mode_text%$standroid_mode_tail}\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_owner() {" + STATE_LINE
+                + "set -- $(ls -ln \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ $# -gt 3 ] || return 1" + STATE_LINE
+                + "echo \"$(standroid_mode_field \"$1\") $3 $4\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_identity() {" + STATE_LINE
+                + "set -- $(ls -lni \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ $# -gt 1 ] || return 1" + STATE_LINE
+                + "echo \"$1 $(standroid_mode_field \"$2\")\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_directory_identity() {" + STATE_LINE
+                + "set -- $(ls -lnid \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ $# -gt 1 ] || return 1" + STATE_LINE
+                + "echo \"$1 $(standroid_mode_field \"$2\")\"" + STATE_LINE
+                + "}" + STATE_LINE
+                // The inode of the file the shell holds a descriptor for. The descriptor is fd 3,
+                // and the kernel resolves the path below to the object behind it rather than to
+                // whatever name the operation used before.
+                + "standroid_descriptor_inode() {" + STATE_LINE
+                + "set -- $(ls -lniL \"$1\" 2>/dev/null 3<&3) || return 1" + STATE_LINE
+                + "[ $# -gt 0 ] || return 1" + STATE_LINE
+                + "echo \"$1\"" + STATE_LINE
+                + "}" + STATE_LINE
+                // Translates the permission letters of an "ls -l" mode field into the octal value
+                // chmod takes, including the set-user-ID, set-group-ID and sticky bits.
+                + "standroid_mode_octal() {" + STATE_LINE
+                + "[ ${#1} -ge 10 ] || return 1" + STATE_LINE
+                + "standroid_letters=${1#?}" + STATE_LINE
+                + "standroid_octal=\"\"" + STATE_LINE
+                + "standroid_special=0" + STATE_LINE
+                + "standroid_group_number=0" + STATE_LINE
+                + "while [ $standroid_group_number -lt 3 ]; do" + STATE_LINE
+                + "standroid_group=${standroid_letters%\"${standroid_letters#???}\"}" + STATE_LINE
+                + "standroid_letters=${standroid_letters#???}" + STATE_LINE
+                + "standroid_value=0" + STATE_LINE
+                + "case \"$standroid_group\" in *r*) standroid_value=4 ;; esac" + STATE_LINE
+                + "case \"$standroid_group\" in *w*) standroid_value=$(( standroid_value + 2 )) ;; esac"
+                + STATE_LINE
+                + "case \"$standroid_group\" in *[xst]*) standroid_value=$(( standroid_value + 1 )) ;; esac"
+                + STATE_LINE
+                + "case \"$standroid_group_number\" in" + STATE_LINE
+                + "0) case \"$standroid_group\" in *[sS]*) standroid_special=4 ;; esac ;;" + STATE_LINE
+                + "1) case \"$standroid_group\" in *[sS]*) standroid_special=$(( standroid_special + 2 )) ;; esac ;;"
+                + STATE_LINE
+                + "*) case \"$standroid_group\" in *[tT]*) standroid_special=$(( standroid_special + 1 )) ;; esac ;;"
+                + STATE_LINE
+                + "esac" + STATE_LINE
+                + "standroid_octal=\"$standroid_octal$standroid_value\"" + STATE_LINE
+                + "standroid_group_number=$(( standroid_group_number + 1 ))" + STATE_LINE
+                + "done" + STATE_LINE
+                + "echo \"$standroid_special$standroid_octal\"" + STATE_LINE
+                + "}" + STATE_LINE
+                // The security context of an entry this script names. "?" stands for "no context could be
+                // read here", which the caller compares rather than treating it as a match.
+                + "standroid_context() {" + STATE_LINE
+                + "[ -e /sys/fs/selinux/enforce ] || { echo \"?\"; return 0; }" + STATE_LINE
+                + "for standroid_field in $(ls -Zd$2 \"$1\" 2>/dev/null); do" + STATE_LINE
+                + "case \"$standroid_field\" in" + STATE_LINE
+                + "*:object_r:*) echo \"$standroid_field\"; return 0 ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "done" + STATE_LINE
+                + "echo \"?\"" + STATE_LINE
+                + "}" + STATE_LINE
+                // The same read for the file this operation opened: the command that lists the entry is
+                // handed the descriptor explicitly, because the shell of the compatibility floor does not
+                // hand descriptors it opened to the commands it starts, and it is asked to follow the
+                // descriptor, so the context reported is that of the opened file rather than that of the
+                // process file system entry standing for it.
+                + "standroid_descriptor_context() {" + STATE_LINE
+                + "[ -e /sys/fs/selinux/enforce ] || { echo \"?\"; return 0; }" + STATE_LINE
+                + "for standroid_field in $(ls -ZdL \"$1\" 2>/dev/null 3<&3); do" + STATE_LINE
+                + "case \"$standroid_field\" in" + STATE_LINE
+                + "*:object_r:*) echo \"$standroid_field\"; return 0 ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "done" + STATE_LINE
+                + "echo \"?\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_folder=" + quote(folderRoot) + STATE_LINE
+                + "if [ ! -d \"$standroid_folder\" ]; then exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; fi" + STATE_LINE
+                + "standroid_folder_identity=$(standroid_directory_identity \"$standroid_folder\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_folder_identity\" in *\" d\"*) : ;; *) exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "cd \"$standroid_folder\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_folder_here=$(standroid_directory_identity .) || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_folder_here\" = \"$standroid_folder_identity\" ] || exit "
+                + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "standroid_member=\"./" + FOLDER_IGNORE_FILE_NAME + "\"" + STATE_LINE
+                + "standroid_staged=\"./" + stagedName + "\"" + STATE_LINE
+                + "standroid_fd_path=\"/dev/fd/3\"" + STATE_LINE
+                + "[ -d /proc/self/fd ] && standroid_fd_path=\"/proc/self/fd/3\"" + STATE_LINE
+                + "standroid_descriptor_open=\"\"" + STATE_LINE
+                // Every failure path leaves through this function: the staged entry this operation
+                // created is removed again and the descriptor it holds is closed. Both address only
+                // a name inside the pinned folder, which cannot follow a link or leave that folder.
+                + "standroid_cleanup() {" + STATE_LINE
+                + "rm -f \"$standroid_staged\" 2>/dev/null" + STATE_LINE
+                + "[ -n \"$standroid_descriptor_open\" ] || return 0" + STATE_LINE
+                + "exec 3<&-" + STATE_LINE
+                + "return 0" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_check_folder() {" + STATE_LINE
+                + "[ \"$(standroid_directory_identity .)\" = \"$standroid_folder_identity\" ]"
+                + " || { standroid_cleanup; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "}" + STATE_LINE
+                + "command -v base64 >/dev/null 2>&1 || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_member_present=0" + STATE_LINE
+                + "standroid_member_identity=\"\"" + STATE_LINE
+                + "standroid_member_owner=\"\"" + STATE_LINE
+                + "standroid_member_context=\"\"" + STATE_LINE
+                + "standroid_member_mode=\"\"" + STATE_LINE
+                + "if [ -e \"$standroid_member\" ] || [ -L \"$standroid_member\" ]; then" + STATE_LINE
+                + "[ -f \"$standroid_member\" ] && [ ! -L \"$standroid_member\" ] || { standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_size=$(wc -c < \"$standroid_member\" 2>/dev/null) || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_size\" -le " + FOLDER_IGNORE_LIST_MAX_BYTES
+                + " ] || { standroid_cleanup; exit " + FOLDER_LIMIT_EXIT_CODE + "; }" + STATE_LINE
+                // The member is identified after its size was read, because that size came from
+                // the member name: a member the caller replaced with a symbolic link in between
+                // must not be measured through, which would read a file outside the folder.
+                + "standroid_member_identity=$(standroid_identity \"$standroid_member\") || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "case \"$standroid_member_identity\" in *\" l\"*) standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "standroid_member_owner=$(standroid_owner \"$standroid_member\") || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_member_context=$(standroid_context \"$standroid_member\")" + STATE_LINE
+                + "set -- $standroid_member_identity" + STATE_LINE
+                + "standroid_member_mode=$(standroid_mode_octal \"$2\") || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_member_present=1" + STATE_LINE
+                + "fi" + STATE_LINE
+                // The staged file is created by the one command that also writes it. Noclobber
+                // makes that redirection exclusive, so it refuses a name the caller occupied - a
+                // symbolic link included - instead of writing through it, and the file it creates
+                // can only appear inside the pinned folder.
+                + "(umask 077 && set -C && base64 -d > \"$standroid_staged\" <<'" + delimiter + "'"
+                + STATE_LINE
+                + encodedContent
+                + (encodedContent.endsWith(STATE_LINE) ? "" : STATE_LINE)
+                + delimiter + STATE_LINE
+                + ") || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                // The descriptor is opened from the entry that was just created and compared with
+                // it, so from here on this operation holds the file itself, not a name a caller
+                // controlling the folder could repoint at another file. The type of the entry is
+                // checked as well, so a link, a directory or a fifo left at that name is refused
+                // before this operation opens or writes anything.
+                + "standroid_staged_entry=$(standroid_identity \"$standroid_staged\") || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "case \"$standroid_staged_entry\" in *\" -\"*) : ;; *) standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "exec 3< \"$standroid_staged\" || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_descriptor_open=1" + STATE_LINE
+                + "set -- $standroid_staged_entry" + STATE_LINE
+                + "standroid_staged_inode=$1" + STATE_LINE
+                + "standroid_staged_now=$(standroid_descriptor_inode \"$standroid_fd_path\")"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_staged_now\" = \"$standroid_staged_inode\" ] || { standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_staged_size=$(wc -c 3<&3 < \"$standroid_fd_path\" 2>/dev/null)"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_staged_size\" -eq " + stagedBytes + " ] || { standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "if [ \"$standroid_member_present\" = 1 ]; then" + STATE_LINE
+                + "command -v chmod >/dev/null 2>&1 || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                // The descriptor is named on every command below, because the shell of the compatibility
+                // floor keeps a descriptor it opened itself to itself: without the forwarding, chmod,
+                // chown and chcon would each resolve a descriptor path their own process does not hold,
+                // and replacing an existing list would fail on those devices.
+                + "chmod \"$standroid_member_mode\" \"$standroid_fd_path\" 3<&3"
+                + " || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "command -v chown >/dev/null 2>&1 || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "set -- $standroid_member_owner" + STATE_LINE
+                + "chown \"$2:$3\" \"$standroid_fd_path\" 3<&3 || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                // Mode and ownership are read back from the staged entry, which is the entry the
+                // descriptor was identified against, so a replacement either carries the
+                // attributes of the member or the write fails instead of relabelling the list.
+                + "standroid_staged_owner=$(standroid_owner \"$standroid_staged\")"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_staged_owner\" = \"$standroid_member_owner\" ] || { standroid_cleanup; exit "
+                + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_staged_context=$(standroid_descriptor_context"
+                + " \"$standroid_fd_path\")" + STATE_LINE
+                + "if [ \"$standroid_member_context\" != \"$standroid_staged_context\" ]; then" + STATE_LINE
+                + "command -v chcon >/dev/null 2>&1"
+                + " && chcon \"$standroid_member_context\" \"$standroid_fd_path\" 3<&3 2>/dev/null"
+                + STATE_LINE
+                + "standroid_staged_context=$(standroid_descriptor_context"
+                + " \"$standroid_fd_path\")" + STATE_LINE
+                + "[ \"$standroid_member_context\" = \"$standroid_staged_context\" ]"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "fi" + STATE_LINE
+                + "fi" + STATE_LINE
+                // "mv" moves the replacement inside the member instead of over it when another
+                // writer replaced the member with a directory while this operation ran, and that
+                // still exits zero, so such a destination is refused before the rename and the
+                // stray copy is removed again afterwards. The member is then checked to be the file
+                // that was just renamed before the list counts as saved.
+                + "standroid_check_folder" + STATE_LINE
+                + "[ ! -d \"$standroid_member\" ] || { standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "if [ \"$standroid_member_present\" = 1 ]; then" + STATE_LINE
+                + "[ \"$(standroid_identity \"$standroid_member\")\" = \"$standroid_member_identity\" ]"
+                + " || { standroid_cleanup; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "fi" + STATE_LINE
+                + "standroid_staged_entry=$(standroid_identity \"$standroid_staged\")"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "set -- $standroid_staged_entry" + STATE_LINE
+                + "[ \"$1\" = \"$standroid_staged_inode\" ] || { standroid_cleanup; exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_staged_identity=\"$standroid_staged_entry\"" + STATE_LINE
+                + "mv -f \"$standroid_staged\" \"$standroid_member\""
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "if [ -f \"$standroid_member\" ] && [ ! -L \"$standroid_member\" ]; then :; else" + STATE_LINE
+                + "if [ -d \"$standroid_member\" ] && [ ! -L \"$standroid_member\" ]; then" + STATE_LINE
+                + "rm -f \"$standroid_member/" + stagedName + "\" 2>/dev/null" + STATE_LINE
+                + "fi" + STATE_LINE
+                + "standroid_cleanup" + STATE_LINE
+                + "exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "fi" + STATE_LINE
+                + "standroid_cleanup" + STATE_LINE
+                + "standroid_member_now=$(standroid_identity \"$standroid_member\")"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_member_now\" = \"$standroid_staged_identity\" ]"
+                + " || { standroid_cleanup; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_member_size=$(wc -c < \"$standroid_member\" 2>/dev/null)"
+                + " || { standroid_cleanup; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_member_size\" -eq \"$standroid_staged_size\" ]"
+                + " || { standroid_cleanup; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
+    /**
+     * Builds the approved sync-completion script dispatch for one configured folder.
+     *
+     * <p>Only regular files whose name ends in {@code .sh} directly inside the marker directory
+     * run; symbolic links are never executed and other entry kinds are skipped. A marker directory
+     * that is itself a symbolic link is refused, because running its scripts would execute code
+     * from outside the configured folder. Each script starts through {@code /system/bin/sh} with
+     * the folder root as its working directory, the script path as the interpreter name, and the
+     * event name as its only argument, so a script sees the same {@code $0} and {@code $1} as it
+     * does in Normal Mode, and its own
+     * output is discarded so an unbounded script cannot grow the transport result. One report line
+     * per script carries the base64-encoded name and the exit status, with the line breaks a Base64
+     * implementation may insert removed, so one line always carries exactly one report. The size of
+     * the reports is counted as they are produced and the dispatch stops with the limit status
+     * before the transport result can grow past that budget.</p>
+     * <p>The marker directory carries the identity it had when this dispatch enumerated it, and
+     * that identity is checked again directly before every script runs. A caller that controls
+     * the folder can rename that entry and leave a directory or a symbolic link of its own in its
+     * place, and a name this dispatch already enumerated would then resolve to a program outside
+     * the configured folder; the re-check refuses that swap instead of running it.</p>
+     *
+     * <p>Each script is then opened, and the identity of the opened descriptor is compared with
+     * the identity recorded for the entry that was enumerated as a regular file. The interpreter
+     * reads that descriptor rather than the name again, so a caller that replaces the entry
+     * between the check and the execution can only make this dispatch open the file it put there;
+     * the recorded identity does not match it, and the dispatch refuses instead of running a
+     * program from outside the configured folder. The descriptor is followed when its identity is
+     * read, because a process file system entry reports an inode of its own rather than the inode of
+     * the file it stands for, and it is named explicitly on the identity read and on the interpreter
+     * command, because the shell of the compatibility floor does not pass descriptors it opened on
+     * to the commands it starts. The descriptor is reached through {@code /proc/self/fd/3} where the
+     * kernel provides it and through {@code /dev/fd/3} otherwise.</p>
+     *
+     * <p>The interpreter is started with a constant command string that sources the opened
+     * descriptor and with the script's own path as its name, so the commands come from the verified
+     * file while the script still sees the path it was loaded from in {@code $0} and the event name
+     * in {@code $1}, exactly as it does in Normal Mode.</p>
+     *
+     * <p>The configured folder is pinned before the marker directory is looked at. A folder whose
+     * last path component is not a real directory is refused instead of followed, and the shell
+     * then enters the directory and re-reads the identity of its own working directory, so a caller
+     * who controls the folder's parent directory cannot rename or replace that entry and have the
+     * marker, the enumerated scripts or the interpreter's working directory resolve somewhere else.
+     * The interpreter itself is started without resolving the folder pathname again, because the
+     * shell already stands in the pinned folder.</p>
+     *
+     */
+    String folderScriptSetScript(String folderRoot, String eventArgument) {
+        return stateUidGuard()
+                + "standroid_directory_identity() {" + STATE_LINE
+                + "set -- $(ls -lnid \"$1\" 2>/dev/null) || return 1" + STATE_LINE
+                + "[ -n \"$1\" ] || return 1" + STATE_LINE
+                + "echo \"$1 $2\"" + STATE_LINE
+                + "}" + STATE_LINE
+                + "standroid_folder=" + quote(folderRoot) + STATE_LINE
+                + "standroid_folder_identity=$(standroid_directory_identity \"$standroid_folder\") || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_folder_identity\" in *\" d\"*) : ;; *) exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "cd \"$standroid_folder\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_folder_here=$(standroid_directory_identity .) || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_folder_here\" = \"$standroid_folder_identity\" ] || exit "
+                + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "standroid_marker=\"./" + FOLDER_SCRIPT_DIRECTORY_NAME + "\"" + STATE_LINE
+                + "if [ -L \"$standroid_marker\" ]; then exit "
+                + FOLDER_UNSAFE_EXIT_CODE + "; fi" + STATE_LINE
+                + "command -v base64 >/dev/null 2>&1 || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "command -v tr >/dev/null 2>&1 || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_output=0" + STATE_LINE
+                + "if [ ! -d \"$standroid_marker\" ]; then exit 0; fi" + STATE_LINE
+                // The marker directory is enumerated by name below, so the identity it has now is
+                // re-checked directly before every script runs: a caller that controls the folder can rename
+                // this entry and leave a symbolic link in its place, and a script resolved through such a
+                // link would be a program from outside the configured folder running with root privileges.
+                + "standroid_fd_path=\"/dev/fd/3\"" + STATE_LINE
++ "[ -d /proc/self/fd ] && standroid_fd_path=\"/proc/self/fd/3\"" + STATE_LINE
++ "standroid_file_inode() { set -- $(ls -lni \"$1\" 2>/dev/null) || return 1; echo \"$1\"; }" + STATE_LINE
+                // The command below is handed the descriptor explicitly and reads it by following
+                // it. Following the descriptor reports the opened file rather than the process file
+                // system entry that stands for it on the compatibility floor, which is the identity
+                // that has to match the enumerated script, and the descriptor is passed explicitly
+                // because that shell does not hand descriptors it opened to the commands it starts.
+                + "standroid_opened_file_inode() { set -- $(ls -lniL \"$1\" 2>/dev/null 3<&3); [ $# -gt 0 ] || return 1; echo \"$1\"; }" + STATE_LINE
++ "standroid_marker_identity=$(standroid_directory_identity \"$standroid_marker\")"
+                + " || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "case \"$standroid_marker_identity\" in *\" d\"*) : ;; *) exit "
+                + FOLDER_UNSAFE_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "for standroid_script in \"$standroid_marker\"/*"
+                + " \"$standroid_marker\"/.[!.]* \"$standroid_marker\"/..?*; do" + STATE_LINE
+                + "[ -e \"$standroid_script\" ] || [ -L \"$standroid_script\" ] || continue" + STATE_LINE
+                + "[ -L \"$standroid_script\" ] && continue" + STATE_LINE
+                + "[ -f \"$standroid_script\" ] || continue" + STATE_LINE
+                + "standroid_name=\"" + "${standroid_script##*/}" + "\"" + STATE_LINE
+                + "case \"$standroid_name\" in" + STATE_LINE
+                + "*.sh|*.SH|*.sH|*.Sh) ;;" + STATE_LINE
+                + "*) continue ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                // The program that runs is the file whose identity was enumerated as a regular
+                // entry of the marker directory: that file is opened and the opened descriptor is
+                // what the interpreter reads, so a caller that renames the marker directory or the
+                // entry between the check and the execution cannot substitute a program from
+                // outside the configured folder. The descriptor is handed to the interpreter for the
+                // same reason, and it is read by following it, so the identity compared is the opened
+                // file and not the process file system entry that stands for it.
+                + "standroid_script_inode=$(standroid_file_inode \"$standroid_script\") || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_marker_now=$(standroid_directory_identity \"$standroid_marker\") || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "[ \"$standroid_marker_now\" = \"$standroid_marker_identity\" ] || exit " + FOLDER_UNSAFE_EXIT_CODE + STATE_LINE
+                + "exec 3< \"$standroid_script\" || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_opened_inode=$(standroid_opened_file_inode \"$standroid_fd_path\") || { exec 3<&-; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_opened_inode\" = \"$standroid_script_inode\" ] || { exec 3<&-; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                + "standroid_marker_after=$(standroid_directory_identity \"$standroid_marker\") || { exec 3<&-; exit " + FOLDER_ACCESS_EXIT_CODE + "; }" + STATE_LINE
+                + "[ \"$standroid_marker_after\" = \"$standroid_marker_identity\" ] || { exec 3<&-; exit " + FOLDER_UNSAFE_EXIT_CODE + "; }" + STATE_LINE
+                // The interpreter is named after the script path, so a script that uses "$0" to find
+                // companion files keeps working, and it is handed a constant command string that
+                // sources the opened descriptor, so the commands still come from the verified file
+                // and never from a pathname a caller could have replaced after the checks above.
+                // The shell already stands in the pinned folder, so the interpreter is started
+                // without resolving the folder pathname again, and the name it is given is the
+                // absolute path the approved script expects to see as "$0".
+                + "standroid_script_path=\"$standroid_folder/"
+                + FOLDER_SCRIPT_DIRECTORY_NAME + "/$standroid_name\"" + STATE_LINE
+                + "( /system/bin/sh -c \". $standroid_fd_path\" \"$standroid_script_path\" " + quote(eventArgument) + " 3<&3 ) >/dev/null 2>&1" + STATE_LINE
++ "standroid_status=$?" + STATE_LINE
++ "exec 3<&-" + STATE_LINE
+                + "standroid_encoded=$(printf '%s' \"$standroid_name\""
+                + " | base64 | tr -d '\\n') || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_output=$(( standroid_output + ${#standroid_encoded}"
+                + " + ${#standroid_status} + 2 ))" + STATE_LINE
+                + "[ \"$standroid_output\" -le " + FOLDER_SCRIPT_MAX_OUTPUT_CHARS + " ] || exit "
+                + FOLDER_LIMIT_EXIT_CODE + STATE_LINE
+                + "printf '%s %s\\n' \"$standroid_encoded\" \"$standroid_status\"" + STATE_LINE
+                + "done" + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
+    /**
+     * Builds the exact-process I/O priority command.
+     *
+     * <p>The command re-reads the recorded process' own {@code stat} entry and compares its start
+     * time with the execution the session verified, so an identifier the kernel reused for some
+     * other process after that verification cannot reach the platform's {@code ionice}. A stat
+     * entry that cannot be read, or a start time that differs from the recorded one, is refused
+     * with its own status instead of tuning whatever the identifier now names.</p>
+     *
+     * <p>The command never selects a process by name, keeps the target identifier in one variable,
+     * and uses the best-effort class and level Android supports.</p>
+     *
+     * <p>The recorded entry is compared column by column, so the compared column is the same one
+     * {@link #parseStartTimeTicks(String)} reads after the executable name.</p>
+     */
+    String ioPriorityScript(int pid, long expectedStartTimeTicks) {
+        return stateUidGuard()
+                + "command -v ionice >/dev/null 2>&1 || exit "
+                + TUNING_NOT_APPLICABLE_EXIT_CODE + STATE_LINE
+                + "standroid_pid=" + pid + STATE_LINE
+                + "standroid_stat=$(cat " + quote("/proc/" + pid + "/stat")
+                + " 2>/dev/null)" + STATE_LINE
+                + "case \"$standroid_stat\" in *\") \"*) ;; *) exit "
+                + TUNING_IDENTITY_MISMATCH_EXIT_CODE + " ;; esac" + STATE_LINE
+                + "set -- ${standroid_stat##*\") \"}" + STATE_LINE
+                + "standroid_fields=" + START_TIME_FIELD_INDEX + STATE_LINE
+                + "while [ \"$standroid_fields\" -gt 0 ]; do shift 1 2>/dev/null; "
+                + "standroid_fields=$(( standroid_fields - 1 )); done" + STATE_LINE
+                + "[ \"${1:-}\" = " + quote(Long.toString(expectedStartTimeTicks))
+                + " ] || exit " + TUNING_IDENTITY_MISMATCH_EXIT_CODE + STATE_LINE
+                + "ionice -c " + IO_PRIORITY_CLASS + " -n " + IO_PRIORITY_LEVEL
+                + " -p \"$standroid_pid\""
+                + " || exit " + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
+    /**
+     * Builds the explicit inotify watch-limit maintenance command.
+     *
+     * <p>The command only raises the limit. A limit that is already sufficient is reported as
+     * success without a write, even when the kernel file cannot be written, so a device whose
+     * limit is already high enough is never mistaken for a device without the setting. Every
+     * write is read back, so a setting the kernel silently rejected never reports success.</p>
+     */
+    String inotifyWatchLimitScript(int watchLimit) {
+        return stateUidGuard()
+                + "standroid_limit=" + quote("/proc/sys/fs/inotify/max_user_watches") + STATE_LINE
+                + "standroid_current=$(cat \"$standroid_limit\" 2>/dev/null)" + STATE_LINE
+                + "standroid_sufficient=0" + STATE_LINE
+                + "case \"$standroid_current\" in" + STATE_LINE
+                + "''|*[!0-9]*) ;;" + STATE_LINE
+                + "*) if [ \"$standroid_current\" -ge " + watchLimit
+                + " ]; then standroid_sufficient=1; fi ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "if [ \"$standroid_sufficient\" -eq 1 ]; then exit 0; fi" + STATE_LINE
+                + "if [ ! -w \"$standroid_limit\" ]; then exit "
+                + TUNING_NOT_APPLICABLE_EXIT_CODE + "; fi" + STATE_LINE
+                + "case \"$standroid_current\" in" + STATE_LINE
+                + "''|*[!0-9]*) exit " + FOLDER_ACCESS_EXIT_CODE + " ;;" + STATE_LINE
+                + "esac" + STATE_LINE
+                + "echo " + watchLimit + " > \"$standroid_limit\" || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "standroid_applied=$(cat \"$standroid_limit\" 2>/dev/null)" + STATE_LINE
+                + "[ \"$standroid_applied\" = \"" + watchLimit + "\" ] || exit "
+                + FOLDER_ACCESS_EXIT_CODE + STATE_LINE
+                + "exit 0" + STATE_LINE;
+    }
+
     static String parseRunToken(List<String> lines) {
         String prefix = RUN_TOKEN_ENVIRONMENT + "=";
         for (String line : lines) {

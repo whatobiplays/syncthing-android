@@ -4,6 +4,7 @@ import android.content.Context;
 import android.util.Log;
 
 import com.nutomic.syncthingandroid.service.Constants;
+import com.nutomic.syncthingandroid.util.FileUtils;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -11,6 +12,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -122,6 +124,8 @@ public final class RootBackend implements PrivilegeBackend {
     private final RootRunSpoolReconciler reconciler;
     /** Fixed application-private locations of Managed State and its transfer area. */
     private final ManagedStateLocations managedStateLocations;
+    /** Absolute path a configured {@code ~} expands to. */
+    private final String tildeBase;
     /** Configuration document storage served through the root transport. */
     private final ConfigStorage rootConfigStorage;
     /** Managed State transfer served through the root transport. */
@@ -152,7 +156,8 @@ public final class RootBackend implements PrivilegeBackend {
                 ManagedStateLocations.forApplication(context.getApplicationContext()),
                 ACTIVATION_TIMEOUT_MILLIS,
                 CREATION_CONFIRMATION_TIMEOUT_MILLIS,
-                OwnedExecutionShutdown.SIGKILL_WAIT_MS
+                OwnedExecutionShutdown.SIGKILL_WAIT_MS,
+                FileUtils.getSyncthingTildeAbsolutePath()
         );
     }
 
@@ -173,6 +178,7 @@ public final class RootBackend implements PrivilegeBackend {
      *     created its process
      * @param cleanupExitWaitMillis bounded wait for a failed launch process to exit after its
      *     exact-ownership signal, in milliseconds
+     * @param tildeBase absolute path a configured {@code ~} expands to
      */
     RootBackend(
             Context context,
@@ -184,7 +190,8 @@ public final class RootBackend implements PrivilegeBackend {
             ManagedStateLocations managedStateLocations,
             long activationTimeoutMillis,
             long creationConfirmationTimeoutMillis,
-            long cleanupExitWaitMillis
+            long cleanupExitWaitMillis,
+            String tildeBase
     ) {
         this.context = context;
         this.binary = Objects.requireNonNull(binary);
@@ -193,6 +200,7 @@ public final class RootBackend implements PrivilegeBackend {
         this.activationTimeoutMillis = activationTimeoutMillis;
         this.creationConfirmationTimeoutMillis = creationConfirmationTimeoutMillis;
         this.cleanupExitWaitMillis = cleanupExitWaitMillis;
+        this.tildeBase = Objects.requireNonNull(tildeBase);
         this.managedStateLocations = Objects.requireNonNull(managedStateLocations);
         this.rootConfigStorage = new RootConfigStorage();
         this.rootManagedStateTransfer = new RootManagedStateTransfer();
@@ -451,28 +459,234 @@ public final class RootBackend implements PrivilegeBackend {
     }
 
     @Override
-    public FolderWriteability validateCandidateFolder(String path) {
-        throw notImplemented("Validating a folder for root execution");
+    public FolderWriteability validateCandidateFolder(String path) throws FolderOperationException {
+        return runFolderOperation(shell -> shell.probeFolderWriteability(path));
     }
 
     @Override
-    public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder) {
-        throw notImplemented("Discovering conflicts as root");
+    public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder)
+            throws FolderOperationException {
+        return runConfiguredFolderOperation(
+                folder,
+                (shell, folderRoot) -> shell.discoverConflictFiles(folderRoot)
+        );
     }
 
     @Override
-    public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder) {
-        throw notImplemented("Reading a folder ignore list as root");
+    public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder)
+            throws FolderOperationException {
+        return runConfiguredFolderOperation(
+                folder,
+                (shell, folderRoot) -> shell.readFolderIgnoreList(folderRoot)
+        );
     }
 
     @Override
-    public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore) {
-        throw notImplemented("Writing a folder ignore list as root");
+    public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore)
+            throws FolderOperationException {
+        Objects.requireNonNull(ignore, "The ignore list is required");
+        // The list travels as bytes, so the exact member content is decided here, next to the
+        // application-UID encoding, and never by shell interpolation.
+        byte[] contents = IgnoreListEncoding.encode(ignore);
+        runConfiguredFolderOperation(folder, (shell, folderRoot) -> {
+            shell.writeFolderIgnoreList(folderRoot, contents);
+            return null;
+        });
     }
 
     @Override
-    public void runFolderScripts(ConfiguredFolderReference folder, FolderEvent event) {
-        throw notImplemented("Running folder scripts as root");
+    public List<FolderScriptOutcome> runFolderScripts(
+            ConfiguredFolderReference folder,
+            FolderEvent event
+    ) throws FolderOperationException {
+        Objects.requireNonNull(event, "The folder event is required");
+        return runConfiguredFolderOperation(
+                folder,
+                (shell, folderRoot) -> shell.runFolderScriptSet(folderRoot, event.argument())
+        );
+    }
+
+    @Override
+    public TuningOutcome applyIoPriority(ExecutionIdentity identity) {
+        if (identity == null) {
+            return TuningOutcome.notApplicable("No owned execution was named for I/O priority");
+        }
+        try {
+            return withShellSession(shell -> tuneExactOwnedExecution(shell, identity));
+        } catch (IOException | RuntimeException failure) {
+            // An optional optimization: a device that cannot tune the process keeps the default
+            // priority, and the caller never has to handle a tuning failure.
+            return TuningOutcome.failed(
+                    "The I/O priority of the owned execution could not be applied: " + failure
+            );
+        }
+    }
+
+    @Override
+    public TuningOutcome applyInotifyWatchLimit() {
+        try {
+            return withShellSession(
+                    shell -> shell.applyInotifyWatchLimit(InotifyWatchLimit.TARGET)
+            );
+        } catch (IOException | RuntimeException failure) {
+            return TuningOutcome.failed(
+                    "The system inotify watch limit could not be applied: " + failure
+            );
+        }
+    }
+
+    /**
+     * Applies the I/O priority class to one process, but only while that process still provably
+     * belongs to the named execution.
+     *
+     * <p>The ownership check and the command run inside the same helper session, and the command
+     * re-verifies the recorded start time of the identifier it was given as the last step before
+     * it tunes that identifier. A process identifier that was reused between unrelated work and
+     * this call therefore cannot be tuned: the check rejects it, and a reuse that happens after
+     * the check is rejected by the command itself.</p>
+     */
+    private TuningOutcome tuneExactOwnedExecution(RootShell shell, ExecutionIdentity identity)
+            throws IOException {
+        ExecutionOwnershipManager manager = ownershipManagerFor(shell);
+        if (manager.observe(identity) != ExecutionOwnershipManager.Observation.OWNED) {
+            return TuningOutcome.notApplicable(
+                    "The recorded execution no longer owns that process identifier"
+            );
+        }
+        return shell.applyIoPriority(identity);
+    }
+
+    /** One privileged operation that only needs the session's shell. */
+    @FunctionalInterface
+    private interface ShellOperation<T> {
+        T run(RootShell shell) throws IOException;
+    }
+
+    /** One privileged folder operation that also needs the configured folder path. */
+    @FunctionalInterface
+    private interface ConfiguredFolderOperation<T> {
+        T run(RootShell shell, String folderRoot) throws IOException;
+    }
+
+    /**
+     * Runs one privileged operation inside a single bounded helper session and hands it the
+     * session's shell view.
+     *
+     * <p>The view cannot close the session, so the operation never ends the session early and the
+     * caller always closes it exactly once. Acquisition runs on the backend's activation worker,
+     * so an unanswered root prompt never blocks the calling thread.</p>
+     */
+    private <T> T withShellSession(ShellOperation<T> operation) throws IOException {
+        RootActivation.Request request = activation.begin();
+        RootShellSession session = acquireBounded(request);
+        try {
+            return operation.run(new SessionOwnedRootShell(session.shell()));
+        } finally {
+            closeQuietly(session);
+        }
+    }
+
+    /**
+     * Runs one privileged folder operation inside exactly one bounded helper session.
+     *
+     * <p>Every typed failure the transport reports becomes the caller-facing
+     * {@link FolderOperationException}, and a generic transport failure is reported as a failed
+     * access instead of as an empty result. An operation that was cancelled keeps its own typed
+     * outcome, so an abandoned request never looks like broken privileged access.</p>
+     */
+    private <T> T runFolderOperation(ShellOperation<T> operation) throws FolderOperationException {
+        try {
+            return withShellSession(operation);
+        } catch (RootFolderOperationException failure) {
+            throw new FolderOperationException(failure.failure(), failure.getMessage(), failure);
+        } catch (RootTransportException failure) {
+            throw new FolderOperationException(
+                    folderFailureFor(failure),
+                    "The privileged folder operation could not be completed",
+                    failure
+            );
+        } catch (IOException failure) {
+            throw new FolderOperationException(
+                    FolderOperationFailure.FOLDER_ACCESS_FAILED,
+                    "The privileged folder operation could not be completed",
+                    failure
+            );
+        }
+    }
+
+    /**
+     * Chooses the folder-operation failure that describes one typed transport failure.
+     *
+     * <p>Cancellation keeps its own outcome: an interrupted caller and an activation that a newer
+     * request superseded both mean the operation was abandoned, not that privileged access broke.
+     * Every other transport failure is reported as failed access, so no root transport failure can
+     * reach a caller as an empty or successful folder result.</p>
+     */
+    private static FolderOperationFailure folderFailureFor(RootTransportException failure) {
+        if (Thread.currentThread().isInterrupted()
+                || failure.failure() == RootFailure.ROOT_ACTIVATION_OBSOLETE) {
+            return FolderOperationFailure.FOLDER_OPERATION_CANCELLED;
+        }
+        return FolderOperationFailure.FOLDER_ACCESS_FAILED;
+    }
+
+    /**
+     * Runs one configured-folder operation inside exactly one bounded helper session.
+     *
+     * <p>The authoritative configuration is read inside that same session and the folder path is
+     * resolved from it there. Resolving through {@link #withStateSession} instead would open a
+     * second helper session while this one is still held, so the operation would no longer be a
+     * single bounded unit and the resolved path could no longer be proven to belong to the
+     * configuration the privileged work actually used.</p>
+     */
+    private <T> T runConfiguredFolderOperation(
+            ConfiguredFolderReference folder,
+            ConfiguredFolderOperation<T> operation
+    ) throws FolderOperationException {
+        Objects.requireNonNull(folder, "The configured folder reference is required");
+        return runFolderOperation(shell -> {
+            String folderRoot = resolveFolderPathInSession(shell, folder.id());
+            return operation.run(shell, folderRoot);
+        });
+    }
+
+    /**
+     * Resolves the authoritative path of one configured folder inside an open helper session.
+     *
+     * <p>A caller that was interrupted while the configuration was read keeps the cancellation
+     * outcome: the operation was abandoned, so the failure may not look like a configuration that
+     * cannot be read, which would name privileged access as the cause.</p>
+     *
+     * @throws RootFolderOperationException when the configuration cannot be read, cannot be
+     *     parsed, or carries no folder with that identifier
+     */
+    private String resolveFolderPathInSession(RootShell shell, String folderId) throws IOException {
+        byte[] configuration;
+        try {
+            configuration = shell.readStateFile(ManagedStateMember.CONFIG);
+        } catch (IOException failure) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new RootTransportException(
+                        RootFailure.ROOT_TRANSPORT_FAILED,
+                        "The authoritative configuration read was interrupted",
+                        failure
+                );
+            }
+            throw new RootFolderOperationException(
+                    FolderOperationFailure.FOLDER_CONFIGURATION_UNREADABLE,
+                    "The authoritative configuration could not be read as root",
+                    failure
+            );
+        }
+        try {
+            return ConfiguredFolderResolver.resolveFolderPath(configuration, folderId, tildeBase);
+        } catch (FolderOperationException failure) {
+            throw new RootFolderOperationException(
+                    failure.failure(),
+                    failure.getMessage(),
+                    failure
+            );
+        }
     }
 
     private File spoolRoot() {

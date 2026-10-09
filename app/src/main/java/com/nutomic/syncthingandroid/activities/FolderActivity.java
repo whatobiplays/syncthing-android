@@ -46,7 +46,12 @@ import com.nutomic.syncthingandroid.model.Folder;
 import com.nutomic.syncthingandroid.model.FolderIgnoreList;
 import com.nutomic.syncthingandroid.model.SharedWithDevice;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
+import com.nutomic.syncthingandroid.runtime.FolderOperationException;
+import com.nutomic.syncthingandroid.runtime.FolderTypePolicy;
 import com.nutomic.syncthingandroid.runtime.FolderWriteability;
+import com.nutomic.syncthingandroid.runtime.IgnoreListEditorGate;
+import com.nutomic.syncthingandroid.runtime.FolderEditorStartupLoad;
+import com.nutomic.syncthingandroid.runtime.FolderWorkQueue;
 import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.RestApi;
 import com.nutomic.syncthingandroid.service.SyncthingService;
@@ -59,6 +64,7 @@ import com.nutomic.syncthingandroid.util.Util;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -116,6 +122,23 @@ public class FolderActivity extends SyncthingActivity {
     // Indicates the result of the write test to mFolder.path on dialog init or after a path change.
     Boolean mCanWriteToPath = false;
 
+    /** Delivers results of folder work back to the main thread. */
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    /**
+     * Runs folder work away from the main thread.
+     *
+     * <p>Folder work touches the filesystem and, in superuser mode, acquires a bounded helper
+     * session, so it must never run on the thread that draws the editor. The queue also drops the
+     * results of superseded requests, which is what keeps a verdict computed for an older path from
+     * being applied after the user already chose another one.</p>
+     */
+    private final FolderWorkQueue mFolderWork =
+            new FolderWorkQueue(Executors.newSingleThreadExecutor(), mMainHandler::post);
+
+    /** Reads the configuration this editor opens with, on the same queue as its folder work. */
+    private final FolderEditorStartupLoad<EditorStartup> mEditorStartupLoad =
+            new FolderEditorStartupLoad<>(mFolderWork);
+
     private EditText mLabelView;
     private EditText mIdView;
     private TextView mPathView;
@@ -142,6 +165,7 @@ public class FolderActivity extends SyncthingActivity {
     private TextView mEditIgnoreListTitle;
     private EditText mEditIgnoreListContent;
     private View mSavingOverlay;
+    private ViewGroup mFolderTypeContainer;
 
     @Inject
     SharedPreferences mPreferences;
@@ -154,7 +178,35 @@ public class FolderActivity extends SyncthingActivity {
     private boolean mIsCreateMode;
     private boolean mFolderNeedsToUpdate = false;
     private boolean mIgnoreListNeedsToUpdate = false;
+    /** Whether the ignore-list editor holds the list that was read for its folder. */
+    private boolean mIgnoreListDelivered = false;
+    /** Path the ignore list was last requested for, or {@code null} while none was requested. */
+    private String mIgnoreListReadPath;
+    /**
+     * Path the list the ignore-list editor holds was read for, or {@code null} while the editor
+     * holds no list that was read.
+     */
+    private String mIgnoreListHeldPath;
+    /**
+     * Path the authoritative configuration holds for the edited folder, or {@code null} while no
+     * configured path is known.
+     *
+     * <p>An ignore-list read resolves the folder's path from the configuration instead of from the
+     * path the editor shows, so a read is only requested while both are the same, and a held list
+     * is only kept while the configuration still holds the path it was read for.</p>
+     */
+    private String mConfiguredFolderPath;
+    /**
+     * Whether the editor is busy: it is either waiting for the configuration it opens with or
+     * writing the folder. A busy editor accepts no edits and runs no save, removal or back press.
+     */
     private boolean mIsSaving = false;
+    /** The newest writeability verdict for the path the editor currently shows. */
+    private FolderWriteability mPathWriteability = FolderWriteability.UNKNOWN;
+    /** Whether the verdict for the path the editor currently shows is still on its way. */
+    private boolean mPathWriteabilityPending = false;
+    /** Whether a save is waiting for that verdict before it writes the folder. */
+    private boolean mSaveAwaitsWriteability = false;
 
     private Dialog mDeleteDialog;
     private Dialog mDiscardDialog;
@@ -319,8 +371,8 @@ public class FolderActivity extends SyncthingActivity {
         mPathView.setOnClickListener(view -> onPathViewClick());
         mCustomSyncConditionsDialog.setOnClickListener(view -> onCustomSyncConditionsDialogClick());
 
-        ViewGroup folderTypeContainer = findViewById(R.id.folderTypeContainer);
-        folderTypeContainer.setOnClickListener(v -> showFolderTypeDialog());
+        mFolderTypeContainer = findViewById(R.id.folderTypeContainer);
+        mFolderTypeContainer.setOnClickListener(v -> showFolderTypeDialog());
         mPullOrderContainer.setOnClickListener(v -> showPullOrderDialog());
         findViewById(R.id.versioningContainer).setOnClickListener(v -> showVersioningDialog());
 
@@ -337,38 +389,144 @@ public class FolderActivity extends SyncthingActivity {
                 Log.d(TAG, "Initializing create mode ...");
                 initFolder();
                 mFolderNeedsToUpdate = true;
+                // If the extra is set, we should automatically share the current folder with the
+                // given device.
+                applySharedDeviceExtra();
             } else {
-                // Edit mode.
-                String passedId = getIntent().getStringExtra(EXTRA_FOLDER_ID);
-                Log.d(TAG, "Initializing edit mode: folder.id=" + passedId);
-                // getApi() is unavailable (onCreate > onPostCreate > onServiceConnected)
-                List<Folder> folders = mConfig.getFolders(null);
-                mFolder = null;
-                for (Folder currentFolder : folders) {
-                    if (currentFolder.id.equals(passedId)) {
-                        mFolder = currentFolder;
-                        break;
-                    }
-                }
-                if (mFolder == null) {
-                    Log.w(TAG, "Folder not found in API update, maybe it was deleted?");
-                    setResult(Activity.RESULT_CANCELED);
-                    finish();
-                    return;
-                }
-                mConfig.getFolderIgnoreList(null, mFolder, this::onReceiveFolderIgnoreList);
-                mFolderNeedsToUpdate = false;
-            }
-
-            // If the extra is set, we should automatically share the current folder with the given device.
-            if (getIntent().hasExtra(EXTRA_DEVICE_ID)) {
-                SharedWithDevice device = new SharedWithDevice();
-                device.deviceID = getIntent().getStringExtra(EXTRA_DEVICE_ID);
-                mFolder.addDevice(device);
-                mFolderNeedsToUpdate = true;
+                // Edit mode. The folder is looked up in the authoritative configuration below, which
+                // in superuser mode can wait for a bounded helper session.
+                Log.d(TAG, "Initializing edit mode: folder.id="
+                        + getIntent().getStringExtra(EXTRA_FOLDER_ID));
             }
         }
 
+        // Show expert options conditionally.
+        mIgnoreDeleteContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
+        mRunScriptContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
+
+        // Register OnBackPressedCallback
+        getOnBackPressedDispatcher().addCallback(this, mBackPressedCallback);
+
+        // The editor opens with the configuration read this starts, so until its answer arrives the
+        // editor accepts no edits and cannot be saved.
+        startEditorStartupLoad();
+    }
+
+    private void restoreDialogStates(Bundle savedInstanceState) {
+        if (savedInstanceState.getBoolean(IS_SHOWING_DELETE_DIALOG)) {
+            showDeleteDialog();
+        } else if (savedInstanceState.getBoolean(IS_SHOW_DISCARD_DIALOG)) {
+            showDiscardDialog();
+        }
+
+    }
+    /**
+     * Opens this editor with the authoritative configuration.
+     *
+     * <p>Reading that configuration resolves configured folder paths through the selected backend,
+     * which in superuser mode can wait for a bounded helper session, so the read runs away from the
+     * main thread and reports back through the main handler. Until it answers, the editor accepts no
+     * edits and cannot be saved, so a field the answer fills in cannot be overwritten by an edit that
+     * started while the read was still running, and a save can never run against a folder that was
+     * not read yet.</p>
+     *
+     * <p>An editor the user left, a read a newer one replaced, and one whose activity is finishing
+     * all receive no answer.</p>
+     */
+    private void startEditorStartupLoad() {
+        // What the read has to produce is decided here, on the main thread, so that the worker never
+        // reads editor state this thread can still change.
+        final String folderIdToResolve = (mFolder == null && !mIsCreateMode)
+                ? getIntent().getStringExtra(EXTRA_FOLDER_ID)
+                : null;
+        setBusyState(true, R.string.state_loading);
+        mEditorStartupLoad.start(
+                () -> !isFinishing() && !isDestroyed(),
+                () -> readEditorStartup(mConfig, folderIdToResolve),
+                this::applyEditorStartup
+        );
+    }
+
+    /**
+     * Reads the configuration one folder editor opens with.
+     *
+     * <p>Runs on the queue's worker. A configuration that cannot be read reports no folder and no
+     * devices instead of throwing, so that the editor always receives an answer and can never be
+     * left waiting for one that will not come.</p>
+     *
+     * @param config configuration the editor reads through
+     * @param folderIdToResolve identifier of the folder to look up, or {@code null} when the editor
+     *                          already holds its folder and only the device list is needed
+     */
+    private static EditorStartup readEditorStartup(ConfigRouter config, String folderIdToResolve) {
+        Folder folder = null;
+        List<Device> devices = new ArrayList<>();
+        try {
+            if (folderIdToResolve != null) {
+                folder = FolderEditorStartupLoad.select(
+                        config.getFolders(null),
+                        folderIdToResolve,
+                        configured -> configured.id
+                );
+            }
+            devices = config.getDevices(null, false);
+        } catch (RuntimeException unreadableConfiguration) {
+            Log.w(TAG, "readEditorStartup: Could not read the configuration: "
+                    + unreadableConfiguration.getMessage());
+        }
+        return new EditorStartup(folder, devices);
+    }
+
+    /**
+     * Opens this editor once the configuration read it started answered.
+     *
+     * <p>Runs on the main thread, and only while this editor is still there: a read that this editor
+     * replaced, or that outlived the editor, never reaches it.</p>
+     *
+     * @param startup configuration this editor was waiting for
+     */
+    private void applyEditorStartup(EditorStartup startup) {
+        if (mFolder == null && !mIsCreateMode) {
+            mFolder = startup.folder;
+            if (mFolder == null) {
+                Log.w(TAG, "Folder not found in API update, maybe it was deleted?");
+                setResult(Activity.RESULT_CANCELED);
+                finish();
+                return;
+            }
+            mFolderNeedsToUpdate = false;
+            // The loaded folder carries the path the configuration holds, and the editor may only
+            // read and keep an ignore list for that path.
+            mConfiguredFolderPath = mFolder.path;
+            // The ignore list read resolves the folder path through the selected backend as well, so
+            // it runs away from the main thread and opens the editor once the list arrived.
+            loadFolderIgnoreList(mFolder);
+            applySharedDeviceExtra();
+        }
+        openEditor(startup.devices);
+    }
+
+    /**
+     * Shares this folder with the device this editor was opened for, when one was passed.
+     *
+     * <p>Runs only once the editor holds the folder the sharing belongs to.</p>
+     */
+    private void applySharedDeviceExtra() {
+        if (!getIntent().hasExtra(EXTRA_DEVICE_ID)) {
+            return;
+        }
+        SharedWithDevice device = new SharedWithDevice();
+        device.deviceID = getIntent().getStringExtra(EXTRA_DEVICE_ID);
+        mFolder.addDevice(device);
+        mFolderNeedsToUpdate = true;
+    }
+
+    /**
+     * Shows this editor once it knows the folder it edits.
+     *
+     * @param devices devices the configuration holds, which the editor lists as the folder's sharing
+     */
+    private void openEditor(List<Device> devices) {
         if (mIsCreateMode) {
             mEditIgnoreListTitle.setEnabled(false);
             mEditIgnoreListContent.setEnabled(false);
@@ -379,29 +537,37 @@ public class FolderActivity extends SyncthingActivity {
             mPathView.setFocusable(false);
             mPathView.setEnabled(false);
             mSelectAdvancedDirectory.setVisibility(View.GONE);
+            // The ignore list is still being read, so the editor starts closed to edits and opens
+            // once the list it shows has arrived. A draft restored after a rotation is the user's
+            // own list already, so that editor opens for editing right away.
+            mIgnoreListDelivered = mIgnoreListNeedsToUpdate;
+            applyIgnoreListEditorAvailability();
         }
-        folderTypeContainer.setEnabled(!mFolder.type.equals(Constants.FOLDER_TYPE_RECEIVE_ENCRYPTED));
+        mFolderTypeContainer.setEnabled(!mFolder.type.equals(Constants.FOLDER_TYPE_RECEIVE_ENCRYPTED));
         checkWriteAndUpdateUI();
-        updateViewsAndSetListeners();
+        updateViewsAndSetListeners(devices);
 
-        // Show expert options conditionally.
-        mIgnoreDeleteContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
-        mRunScriptContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
+        // The editor holds everything it edits now, so it accepts edits and can be saved.
+        setSavingState(false);
 
         // Open keyboard on label view in edit mode.
         mLabelView.requestFocus();
-
-        // Register OnBackPressedCallback
-        getOnBackPressedDispatcher().addCallback(this, mBackPressedCallback);
     }
 
-    private void restoreDialogStates(Bundle savedInstanceState) {
-        if (savedInstanceState.getBoolean(IS_SHOWING_DELETE_DIALOG)) {
-            showDeleteDialog();
-        } else if (savedInstanceState.getBoolean(IS_SHOW_DISCARD_DIALOG)) {
-            showDiscardDialog();
+    /** Configuration one folder editor opens with, read away from the main thread. */
+    private static final class EditorStartup {
+        /** Folder the editor was opened for, or {@code null} when it is not configured. */
+        private final Folder folder;
+
+        /** Devices of the configuration the folder was read from. */
+        private final List<Device> devices;
+
+        private EditorStartup(Folder folder, List<Device> devices) {
+            this.folder = folder;
+            this.devices = devices;
         }
     }
+
 
     /**
      * Invoked after user clicked on the {@link #mPathView} label.
@@ -476,10 +642,17 @@ public class FolderActivity extends SyncthingActivity {
             /**
              * Do not handle the click as the children in the folder type layout are disabled
              * and an explanation is already given on the UI why the only allowed folder type
-             * is "sendonly".
-            */
-            Toast.makeText(this, R.string.folder_path_readonly, Toast.LENGTH_LONG)
-                    .show();
+             * is "sendonly". Only a verdict that proved read-only access may say so; an
+             * undetermined verdict states the undetermined result instead of claiming a
+             * permission state the probe never established.
+             */
+            Toast.makeText(
+                    this,
+                    FolderTypePolicy.provesReadOnlyAccess(mPathWriteability)
+                            ? R.string.folder_path_readonly
+                            : R.string.state_unknown,
+                    Toast.LENGTH_LONG
+            ).show();
             return;
         }
         // The user selected folder path is writeable, offer to choose from all available folder types.
@@ -518,6 +691,9 @@ public class FolderActivity extends SyncthingActivity {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        // Stops accepting folder work and interrupts what is still running, so no result of
+        // this editor can reach a view after it was left.
+        mFolderWork.close();
         SyncthingService syncthingService = getService();
         if (syncthingService != null) {
             syncthingService.getNotificationHandler().cancelConsentNotification(getIntent().getIntExtra(EXTRA_NOTIFICATION_ID, 0));
@@ -561,9 +737,125 @@ public class FolderActivity extends SyncthingActivity {
             mEditIgnoreListContent.setText(ignoreList);
         }
         mEditIgnoreListContent.addTextChangedListener(mIgnoreListContentTextWatcher);
+        mIgnoreListDelivered = true;
+        applyIgnoreListEditorAvailability();
     }
 
-    private void updateViewsAndSetListeners() {
+    /**
+     * Reads one folder's ignore list away from the main thread and applies it there.
+     *
+     * <p>The read resolves the folder path through the selected backend, which can acquire a
+     * bounded helper session in superuser mode, so it must not run on the thread that draws the
+     * editor. A read that fails reports the ignore list as unavailable, because a failure must
+     * never appear as an empty or missing ignore list, and an answer that arrives after the editor
+     * was left is dropped instead of touching its views.</p>
+     */
+    private void loadFolderIgnoreList(final Folder folder) {
+        final String folderId = folder.id;
+        final String readPath = folder.path;
+        if (!IgnoreListEditorGate.mayReadListForShownPath(mConfiguredFolderPath, readPath)) {
+            // The configuration does not hold the path the editor shows yet. A read would resolve
+            // the configured path instead while its answer is tagged with the path shown, so
+            // another folder's rules would pass as the shown path's list. The read is therefore
+            // not requested, and the editor stays closed to edits.
+            closeIgnoreListToEdits();
+            return;
+        }
+        mIgnoreListReadPath = readPath;
+        // The read may take a while: in Superuser Mode it first acquires a bounded helper session
+        // and answers through a callback afterwards. It therefore runs as an asynchronous request,
+        // whose answer the queue hands back only while the request is still the newest one.
+        mFolderWork.<FolderIgnoreList>submitAsync(
+                answer -> {
+                    try {
+                        mConfig.getFolderIgnoreList(null, folder, answer::deliver);
+                    } catch (FolderOperationException | RuntimeException failure) {
+                        Log.w(TAG, "Could not read the ignore list of folder=[" + folderId
+                                + "]: " + failure.getMessage());
+                        // An answer that carries no list at all reports the failure, so the editor
+                        // can show the ignore list as unavailable instead of as an empty one.
+                        answer.deliver(null);
+                    }
+                },
+                result -> deliverFolderIgnoreList(folderId, readPath, result));
+    }
+
+    /**
+     * Applies one ignore-list read on the main thread, unless the editor moved on.
+     *
+     * <p>The answer belongs to the folder and to the path it was read for. An answer for a path
+     * the user replaced is dropped, because applying it would leave the editor showing the rules
+     * of the replaced path while the form holds the path chosen now.</p>
+     */
+    private void deliverFolderIgnoreList(
+            String folderId,
+            String readPath,
+            FolderIgnoreList folderIgnoreList
+    ) {
+        IgnoreListEditorGate.Verdict verdict = IgnoreListEditorGate.verdict(
+                !isFinishing() && !isDestroyed(),
+                IgnoreListEditorGate.readBelongsToShownFolder(
+                        folderId,
+                        readPath,
+                        mFolder == null ? null : mFolder.id,
+                        mFolder == null ? null : mFolder.path
+                ),
+                mIgnoreListNeedsToUpdate
+        );
+        if (verdict != IgnoreListEditorGate.Verdict.APPLY) {
+            return;
+        }
+        if (folderIgnoreList == null) {
+            showFolderIgnoreListUnavailable();
+            return;
+        }
+        mIgnoreListHeldPath = readPath;
+        onReceiveFolderIgnoreList(folderIgnoreList);
+    }
+
+    /**
+     * Reports one ignore list that could not be read, on the main thread.
+     *
+     * <p>The folder keeps the rules it has, and the editor stops accepting edits to a list it
+     * could not read, because an unreadable list must not look like a missing or empty one that
+     * the next save would replace.</p>
+     */
+    private void showFolderIgnoreListUnavailable() {
+        // The editor never holds this list, so it stays closed to edits even if a writeability
+        // verdict arrives later and would otherwise open it.
+        mIgnoreListDelivered = false;
+        applyIgnoreListEditorAvailability();
+        Toast.makeText(this, R.string.generic_error, Toast.LENGTH_LONG).show();
+    }
+
+    /**
+     * Reads the device list again after a device was added.
+     *
+     * <p>The editor shows the devices its folder is shared with, and the device the user just added
+     * is only in the configuration the editor is not holding yet. That configuration is read on the
+     * editor's worker queue: in Superuser Mode the read resolves the folder path through the
+     * selected backend, which can wait for a bounded privileged helper activation, so reading it
+     * here would block the thread that draws the editor whenever REST is not available.</p>
+     *
+     * <p>Only the device list of the answer is applied. The folder this editor holds is left
+     * untouched, so the edits the user has already made are not discarded, and an answer that this
+     * editor replaced, or one that arrives after it was left, never reaches any view.</p>
+     */
+    private void reloadDeviceList() {
+        mEditorStartupLoad.start(
+                () -> !isFinishing() && !isDestroyed(),
+                () -> readEditorStartup(mConfig, null),
+                startup -> updateViewsAndSetListeners(startup.devices)
+        );
+    }
+
+    /**
+     * Updates the views with the folder this editor holds.
+     *
+     * @param preloadedDevices device list that was read away from the main thread, or {@code null}
+     *                         to read it here
+     */
+    private void updateViewsAndSetListeners(List<Device> preloadedDevices) {
         mLabelView.removeTextChangedListener(mTextWatcher);
         mIdView.removeTextChangedListener(mTextWatcher);
         mFolderFileWatcher.setOnCheckedChangeListener(null);
@@ -601,8 +893,11 @@ public class FolderActivity extends SyncthingActivity {
         mCustomSyncConditionsDialog.setEnabled(mCustomSyncConditionsSwitch.isChecked());
 
         // Populate devicesList.
-        RestApi restApi = getApi();
-        List<Device> devicesList = mConfig.getDevices(restApi, false);
+        // Populate devicesList, from the configuration that was read with this editor when it
+        // carried one, so that opening the editor never reads the configuration on this thread.
+        List<Device> devicesList = (preloadedDevices != null)
+                ? preloadedDevices
+                : mConfig.getDevices(getApi(), false);
         mDevicesContainer.removeAllViews();
         if (devicesList.isEmpty()) {
             addEmptyDeviceListView();
@@ -660,15 +955,34 @@ public class FolderActivity extends SyncthingActivity {
     }
 
     private void setSavingState(boolean isSaving) {
-        mIsSaving = isSaving;
+        setBusyState(isSaving, R.string.state_saving);
+    }
+
+    /**
+     * Holds the editor busy, or releases it.
+     *
+     * <p>A busy editor accepts no edits, no save, no removal and no back press, and the overlay that
+     * covers it reports the wait through the given message. Saving a folder and waiting for the
+     * configuration the editor opens with are different waits, so each of them names itself.</p>
+     *
+     * @param busy whether the editor is busy
+     * @param message string resource naming the wait
+     */
+    private void setBusyState(boolean busy, int message) {
+        mIsSaving = busy;
         invalidateOptionsMenu();
         if (mSavingOverlay != null) {
-            mSavingOverlay.setVisibility(isSaving ? View.VISIBLE : View.GONE);
+            TextView messageView = mSavingOverlay.findViewById(R.id.savingText);
+            if (messageView != null) {
+                messageView.setText(message);
+            }
+            mSavingOverlay.setVisibility(busy ? View.VISIBLE : View.GONE);
         }
         ActionBar actionBar = getSupportActionBar();
         if (actionBar != null) {
-            actionBar.setHomeButtonEnabled(!isSaving);
-            // Keep the back icon visible while saving; clicks are blocked in onOptionsItemSelected.
+            actionBar.setHomeButtonEnabled(!busy);
+            // Keep the back icon visible while the editor is busy; clicks are blocked in
+            // onOptionsItemSelected.
             actionBar.setDisplayHomeAsUpEnabled(true);
         }
     }
@@ -677,20 +991,121 @@ public class FolderActivity extends SyncthingActivity {
         mDeleteDialog = new AlertDialog.Builder(this)
                 .setMessage(R.string.remove_folder_confirm)
                 .setPositiveButton(android.R.string.yes, (dialogInterface, i) -> {
-                    mConfig.removeFolder(getApi(), mFolder.id);
-                    if (mFolder.id.equals(Constants.syncthingCameraFolderId)) {
-                        // Remove consent to "Syncthing Camera" feature.
-                        SharedPreferences.Editor editor = mPreferences.edit();
-                        editor.putBoolean(Constants.PREF_ENABLE_SYNCTHING_CAMERA, false);
-                        editor.apply();
-                    }
-                    mFolderNeedsToUpdate = false;
-                    finish();
+                    final RestApi removeRestApi = getApi();
+                    final Folder removedFolder = mFolder;
+                    // Removing a folder is a configuration write the user confirmed, so it runs
+                    // away from the main thread without depending on the editor staying open. The
+                    // editor reports that the removal is under way and stays busy until the
+                    // completion arrives, so no other edit can race the configuration write.
+                    setSavingState(true);
+                    runConfirmedFolderWrite(
+                            () -> {
+                                try {
+                                    mConfig.removeFolder(removeRestApi, removedFolder.id);
+                                } catch (RuntimeException failure) {
+                                    Log.e(
+                                            TAG,
+                                            "Could not remove folder=[" + removedFolder.id + "]",
+                                            failure
+                                    );
+                                    return Boolean.FALSE;
+                                }
+                                return Boolean.TRUE;
+                            },
+                            removed -> completeFolderRemoval(removed, removedFolder));
                 })
                 .setNegativeButton(android.R.string.no, null)
                 .create();
         mDeleteDialog.show();
     }
+
+    /**
+     * Finishes the editor after a folder removal, on the main thread.
+     *
+     * <p>The removal itself runs away from the main thread, so its completion is what closes the
+     * editor. A completion that arrives after the editor was already left is dropped, and a removal
+     * that did not happen keeps the editor open, because closing it would claim a configuration
+     * change the folder list does not reflect.</p>
+     *
+     * @param removed whether the removal was written, or {@code null} when it failed unexpectedly
+     * @param removedFolder the folder the user confirmed, so a successful removal can withdraw
+     *     the consent that only exists while that folder stays configured
+     */
+    private void completeFolderRemoval(Boolean removed, Folder removedFolder) {
+        if (withdrawsSyncthingCameraConsent(removed, removedFolder.id)) {
+            // The removal really happened, so consent to the "Syncthing Camera" feature is
+            // withdrawn here, before the editor is looked at: the removal runs away from the main
+            // thread and the editor that asked for it can already be destroyed, for example by a
+            // rotation, while the removal was still running.
+            SharedPreferences.Editor editor = mPreferences.edit();
+            editor.putBoolean(Constants.PREF_ENABLE_SYNCTHING_CAMERA, false);
+            editor.apply();
+        }
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        if (removed == null || !removed) {
+            // The removal did not happen, so the editor becomes usable again and reports it.
+            setSavingState(false);
+            Toast.makeText(this, R.string.generic_error, Toast.LENGTH_LONG).show();
+            return;
+        }
+        mFolderNeedsToUpdate = false;
+        finish();
+    }
+
+    /**
+     * Returns whether one finished folder removal withdraws consent to the "Syncthing Camera"
+     * feature.
+     *
+     * <p>Only a confirmed removal of the camera folder withdraws the consent, because a removal
+     * that did not happen or failed unexpectedly keeps the folder configured. The rule lives here,
+     * away from the editor, because it has to hold whether or not the editor still exists.</p>
+     *
+     * @param removed removal result, {@code null} when the removal failed unexpectedly
+     * @param removedFolderId identifier of the folder the user confirmed for removal
+     * @return {@code true} only for a confirmed removal of the camera folder
+     */
+    static boolean withdrawsSyncthingCameraConsent(Boolean removed, String removedFolderId) {
+        return Boolean.TRUE.equals(removed)
+                && Constants.syncthingCameraFolderId.equals(removedFolderId);
+    }
+
+    /**
+     * Runs one configuration write the user confirmed away from the main thread.
+     *
+     * <p>A folder write goes through the selected backend, which in superuser mode acquires a
+     * bounded helper session, so it must not run on the thread that draws the editor. It must also
+     * not depend on the editor staying open: the user already confirmed the write, and a write that
+     * is interrupted while the editor is left is discarded without any result. The write therefore
+     * runs on an executor of its own, and only its completion returns to the main thread.</p>
+     *
+     * <p>A write that fails unexpectedly produces the {@code null} result, so its completion still
+     * runs and the editor is never left waiting for an answer that cannot arrive.</p>
+     *
+     * @param write the confirmed write
+     * @param onCompletion handler of the write result, run on the main thread
+     */
+    private <T> void runConfirmedFolderWrite(
+            FolderWorkQueue.Work<T> write,
+            FolderWorkQueue.OwnerDelivery<T> onCompletion
+    ) {
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.execute(() -> {
+            T result;
+            try {
+                result = write.run();
+            } catch (RuntimeException failure) {
+                Log.e(TAG, "A confirmed folder write did not complete", failure);
+                result = null;
+            }
+            T delivered = result;
+            mainHandler.post(() -> onCompletion.deliver(delivered));
+        });
+        executor.shutdown();
+    }
+
 
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -743,26 +1158,154 @@ public class FolderActivity extends SyncthingActivity {
             updatePullOrderDescription();
             mFolderNeedsToUpdate = true;
         } else if (resultCode == Activity.RESULT_OK && requestCode == DeviceActivity.DEVICE_ADD_CODE) {
-            updateViewsAndSetListeners();
+            reloadDeviceList();
         }
     }
 
     /**
      * Prerequisite: mFolder.path must be non-empty
+     *
+     * <p>The check runs off the main thread and its result is applied on the main thread. A verdict
+     * that a newer check already replaced, and one that arrives after the editor was left, are both
+     * discarded, and a probe that cannot reach a verdict leaves the editor with the read-only
+     * capabilities instead of enabling a folder type that may not be writable.</p>
      */
     private void checkWriteAndUpdateUI() {
         mPathView.setText(mFolder.path);
-        if (TextUtils.isEmpty(mFolder.path)) {
+        final String candidatePath = mFolder.path;
+        if (TextUtils.isEmpty(candidatePath)) {
+            // An empty path has no writeability to report, and it cancels every verdict that is
+            // still in flight for the path the user replaced it with. A save that was waiting for
+            // such a verdict is released, so it reports the missing path instead of waiting for a
+            // result that can no longer arrive.
+            mPathWriteabilityPending = false;
+            mFolderWork.cancelPending();
+            // The read of the ignore list belonged to the path the user replaced, so a path chosen
+            // later is read again instead of leaving the editor closed to ignore-list edits. The
+            // list the editor still holds is that path's list, so it may not keep accepting edits.
+            mIgnoreListReadPath = null;
+            closeIgnoreListToEdits();
+            if (mSaveAwaitsWriteability) {
+                mSaveAwaitsWriteability = false;
+                setSavingState(false);
+                onSave();
+            }
             return;
         }
+        mPathWriteabilityPending = true;
+        mFolderWork.submit(() -> {
+            try {
+                return mRuntime.validateCandidateFolder(candidatePath);
+            } catch (FolderOperationException | RuntimeException e) {
+                Log.w(TAG, "checkWriteAndUpdateUI: Could not check path '" + candidatePath
+                        + "': " + e.getMessage());
+                return FolderWriteability.UNKNOWN;
+            }
+        }, this::applyFolderWriteability);
+        // The editor may only keep accepting edits while the list it holds belongs to the path
+        // shown now. A list of the path the user replaced is closed here, so the read below
+        // restores the editor's edits for the path chosen now.
+        if (IgnoreListEditorGate.deliveredListIsForAnotherPath(
+                mIgnoreListDelivered,
+                candidatePath,
+                mIgnoreListReadPath
+        )) {
+            closeIgnoreListToEdits();
+        }
+        if (!mIgnoreListDelivered
+                && IgnoreListEditorGate.heldListBelongsToShownPath(
+                        mIgnoreListHeldPath,
+                        mConfiguredFolderPath,
+                        candidatePath
+                )) {
+            // The editor holds the list of the path shown now again, so it keeps editing it
+            // without another read.
+            mIgnoreListDelivered = true;
+            applyIgnoreListEditorAvailability();
+        }
+        reloadIgnoreListForCandidatePath(candidatePath);
+    }
+
+    /**
+     * Reads the ignore list again when the editor holds none for the path the user chose.
+     *
+     * <p>A read that was still in flight when the folder path changed is discarded, and the editor
+     * stays closed to edits until a list for the current path arrives. The chosen path therefore
+     * has to be read, or a folder that was confirmed for another path could never have its ignore
+     * list edited.</p>
+     *
+     * @param candidatePath path the user chose for the folder
+     */
+    private void reloadIgnoreListForCandidatePath(String candidatePath) {
+        if (mFolder == null
+                || !IgnoreListEditorGate.needsRead(
+                        mIsCreateMode,
+                        mIgnoreListDelivered,
+                        candidatePath,
+                        mIgnoreListReadPath
+                )) {
+            return;
+        }
+        loadFolderIgnoreList(mFolder);
+    }
+
+    /**
+     * Closes the ignore-list editor to edits until the list of the path shown now has arrived.
+     *
+     * <p>A save writes the ignore-list rules the editor holds to the folder path the form shows,
+     * so the editor may only accept edits while it holds the list that was read for that same
+     * path. This closes it once the path was replaced, and it stays closed until the read of the
+     * path shown now delivers its list.</p>
+     */
+    private void closeIgnoreListToEdits() {
+        if (!mIgnoreListDelivered) {
+            return;
+        }
+        mIgnoreListDelivered = false;
+        applyIgnoreListEditorAvailability();
+    }
+
+    /**
+     * Applies the ignore-list editor's availability.
+     *
+     * <p>The editor accepts edits only while it holds the list that was read for its folder and the
+     * folder was proven writable, so the patterns a user writes can only replace rules the user
+     * saw. A read that failed leaves the editor closed, and a later writeability verdict cannot
+     * reopen an editor whose list never arrived.</p>
+     */
+    private void applyIgnoreListEditorAvailability() {
+        boolean editable = IgnoreListEditorGate.acceptsEdits(
+                mIgnoreListDelivered,
+                mCanWriteToPath
+        );
+        mEditIgnoreListTitle.setEnabled(editable);
+        mEditIgnoreListContent.setEnabled(editable);
+    }
+
+    /**
+     * Applies one candidate-folder verdict to the folder editor on the main thread.
+     *
+     * <p>A verdict that a newer check already replaced never reaches this method, so the editor
+     * only ever shows the verdict of the newest request. A create-mode save that arrived while
+     * the verdict was still on its way starts here, so the new folder is always written with the
+     * folder type this verdict selected.</p>
+     *
+     * <p>Only a verdict that proved read-only access may change the folder type. An undetermined
+     * verdict keeps the configured type because it is not evidence about the folder.</p>
+     */
+    private void applyFolderWriteability(FolderWriteability writeability) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        mPathWriteabilityPending = false;
+        mPathWriteability = writeability;
 
         /**
          * Check if the permissions we have on that folder is readonly or readwrite.
          * Access level readonly: folder can only be configured "sendonly".
          * Access level readwrite: folder can be configured "sendonly" or "sendreceive".
          */
-        mCanWriteToPath = mRuntime.validateCandidateFolder(mFolder.path)
-                == FolderWriteability.WRITABLE;
+        mCanWriteToPath = writeability == FolderWriteability.WRITABLE;
         if (mCanWriteToPath) {
             mAccessExplanationView.setText(R.string.folder_path_readwrite);
             mFolderTypeView.setEnabled(true);
@@ -780,17 +1323,34 @@ public class FolderActivity extends SyncthingActivity {
                  */
                 updateFolderTypeDescription();
             } else {
-                mEditIgnoreListTitle.setEnabled(true);
-                mEditIgnoreListContent.setEnabled(true);
+                applyIgnoreListEditorAvailability();
             }
         } else {
-            // Force "sendonly" folder.
-            mAccessExplanationView.setText(R.string.folder_path_readonly);
+            /*
+             * The path was not proven writable. Only a probe that proved read-only access may
+             * force "sendonly" and explain itself as read-only access; an undetermined verdict, for
+             * example when privileged access timed out, is not proof and must not persist a folder
+             * type downgrade the user did not ask for, nor claim an access fact the probe never
+             * established. No message describes an undetermined access result yet, so the editor
+             * states the undetermined result the rest of the application already uses, and the
+             * dedicated wording stays with the folder editor work that owns its strings.
+             */
+            mAccessExplanationView.setText(
+                    FolderTypePolicy.provesReadOnlyAccess(writeability)
+                            ? R.string.folder_path_readonly
+                            : R.string.state_unknown
+            );
             mFolderTypeView.setEnabled(false);
-            mEditIgnoreListTitle.setEnabled(false);
-            mEditIgnoreListContent.setEnabled(false);
-            mFolder.type = Constants.FOLDER_TYPE_SEND_ONLY;
+            applyIgnoreListEditorAvailability();
+            mFolder.type = FolderTypePolicy.typeFor(writeability, mFolder.type);
             updateFolderTypeDescription();
+        }
+        if (mSaveAwaitsWriteability) {
+            // The verdict the held save was waiting for is applied, so the save runs with the
+            // folder type this verdict selected instead of the default the editor started with.
+            mSaveAwaitsWriteability = false;
+            setSavingState(false);
+            onSave();
         }
     }
 
@@ -898,6 +1458,16 @@ public class FolderActivity extends SyncthingActivity {
             return;
         }
 
+        if (mPathWriteabilityPending) {
+            // A folder is written with the folder type the writeability verdict selects, so a
+            // save that arrives before that verdict is held instead of writing the folder type
+            // the verdict may replace. The verdict resumes it, and the overlay shows that the
+            // save is under way.
+            mSaveAwaitsWriteability = true;
+            setSavingState(true);
+            return;
+        }
+
         setSavingState(true);
 
         SharedPreferences.Editor editor = mPreferences.edit();
@@ -909,25 +1479,40 @@ public class FolderActivity extends SyncthingActivity {
 
         if (mIsCreateMode) {
             Log.v(TAG, "onSave: Adding folder with ID = '" + mFolder.id + "'");
-            Handler mainHandler = new Handler(Looper.getMainLooper());
-            final ExecutorService executor = Executors.newSingleThreadExecutor();
-            executor.execute(() -> {
-                preCreateFolderStruct(mFolderUri, mFolder.path);
-                mConfig.addFolder(getApi(), mFolder);
-
-                mainHandler.post(() -> {
-                    // Start sync after adding a folder.
-                    LocalBroadcastManager localBroadcastManager = LocalBroadcastManager.getInstance(getApplication().getApplicationContext());
-                    Intent intent = new Intent(ACTION_SYNC_TRIGGER_FIRED);
-                    intent.putExtra(EXTRA_BEGIN_ACTIVE_TIME_WINDOW, true);
-                    localBroadcastManager.sendBroadcast(intent);
-
-                    setSavingState(false);
-                    setResult(AppCompatActivity.RESULT_OK);
-                    finish();
+            // Adding a folder prepares the folder structure and writes the configuration, which can
+            // fail when the selected backend cannot reach the folder. The completion reports that
+            // failure and clears the saving state instead of leaving the editor stuck in it.
+            // The write runs off the main thread, so it reads the confirmed folder
+            // through values captured here: the editor fields change while the write
+            // is under way, and the write must use the folder the user saved.
+            final Folder createdFolder = mFolder;
+            final Uri createdFolderUri = mFolderUri;
+            final ConfigRouter config = mConfig;
+            final RestApi restApi = getApi();
+            runConfirmedFolderWrite(
+                    () -> {
+                        try {
+                            preCreateFolderStruct(createdFolderUri, createdFolder.path);
+                            config.addFolder(restApi, createdFolder);
+                        } catch (RuntimeException failure) {
+                            Log.w(TAG, "Could not add folder=[" + createdFolder.id + "]", failure);
+                            return FolderSaveOutcome.FAILED;
+                        }
+                        return FolderSaveOutcome.STORED;
+                    },
+                    outcome -> {
+                        if (outcome == FolderSaveOutcome.STORED) {
+                            // Start sync after adding a folder.
+                            LocalBroadcastManager localBroadcastManager =
+                                    LocalBroadcastManager.getInstance(
+                                            getApplication().getApplicationContext()
+                                    );
+                            Intent intent = new Intent(ACTION_SYNC_TRIGGER_FIRED);
+                            intent.putExtra(EXTRA_BEGIN_ACTIVE_TIME_WINDOW, true);
+                        localBroadcastManager.sendBroadcast(intent);
+                    }
+                    completeFolderSave(outcome, createdFolder.path);
                 });
-            });
-            executor.shutdown();
             return;
         }
 
@@ -949,17 +1534,103 @@ public class FolderActivity extends SyncthingActivity {
         editor.apply();
 
         // Update folder via restApi and send the config to REST endpoint.
-        RestApi restApi = getApi();
-        if (mIgnoreListNeedsToUpdate) {
-            // Update ignore list.
-            String[] ignore = mEditIgnoreListContent.getText().toString().split("\n");
-            mConfig.postFolderIgnoreList(restApi, mFolder, ignore);
-        }
+        final RestApi restApi = getApi();
+        final Folder savedFolder = mFolder;
+        final String savedFolderPath = mFolder.path;
+        // The editor only holds ignore patterns it read for the path the form shows. Patterns typed
+        // before that path was replaced stay in the editor and are reported as the part of the save
+        // that was not written, because writing them would replace another folder's rules.
+        final boolean ignoreListPending = mIgnoreListNeedsToUpdate;
+        final boolean ignoreListWritten = IgnoreListEditorGate.saveWritesIgnoreList(
+                mIgnoreListDelivered,
+                ignoreListPending
+        );
+        final String[] ignore = ignoreListWritten
+                ? mEditIgnoreListContent.getText().toString().split("\n")
+                : null;
+        final boolean ignoreListLeftUnwritten = ignoreListPending && !ignoreListWritten;
+        // The folder is written through the selected backend, which resolves the authoritative
+        // folder path and can acquire a bounded helper session, so the write runs away from the
+        // main thread. It is a save the user confirmed, so it does not depend on the editor staying
+        // open, and only its completion returns to the main thread.
+        runConfirmedFolderWrite(() -> {
+            try {
+                // The folder configuration is written first: the ignore list is written through
+                // the selected backend, which resolves the folder path that configuration holds,
+                // so a save that changes the path applies the path before the list is written.
+                mConfig.updateFolder(restApi, savedFolder);
+            } catch (RuntimeException failure) {
+                // Nothing of this save happened, so it is reported as failed. The completion still
+                // travels back, because an unanswered save would leave the editor in its saving
+                // state without a way to try again.
+                Log.w(TAG, "Could not write folder=[" + savedFolder.id + "]", failure);
+                return FolderSaveOutcome.FAILED;
+            }
+            if (ignore == null) {
+                // The folder itself is stored. Patterns the editor holds but could not be written
+                // are reported as a partial save instead of being dropped silently.
+                return ignoreListLeftUnwritten
+                        ? FolderSaveOutcome.IGNORE_LIST_FAILED
+                        : FolderSaveOutcome.STORED;
+            }
+            try {
+                mConfig.postFolderIgnoreList(restApi, savedFolder, ignore);
+            } catch (FolderOperationException | RuntimeException e) {
+                // The folder itself is already written, so this failure is reported as a partial
+                // save: the editor stays open with the user patterns in it, and the pending flag
+                // makes a retry write them again.
+                Log.w(TAG, "Could not write the ignore list of folder=[" + savedFolder.id
+                        + "]: " + e.getMessage());
+                return FolderSaveOutcome.IGNORE_LIST_FAILED;
+            }
+            return FolderSaveOutcome.STORED;
+        }, outcome -> completeFolderSave(outcome, savedFolderPath));
+    }
 
-        // Update folder using RestApi or ConfigXml.
-        mConfig.updateFolder(restApi, mFolder);
-        setResult(AppCompatActivity.RESULT_OK);
-        finish();
+    /** How one folder save ended. */
+    private enum FolderSaveOutcome {
+        /** The folder and its ignore list are stored. */
+        STORED,
+        /** The folder is stored, but its ignore list is not. */
+        IGNORE_LIST_FAILED,
+        /** The folder itself could not be stored. */
+        FAILED
+    }
+
+    /**
+     * Finishes the editor after the folder was written, on the main thread.
+     *
+     * <p>The write itself runs away from the main thread, so its completion is what closes the
+     * editor. A completion that arrives after the editor was already left is dropped.</p>
+     *
+     * <p>Only a fully stored save closes the editor with a positive result. When the ignore list
+     * could not be stored, or when the folder itself could not be written, the editor stays open
+     * with the user's patterns in it and the toast names what failed. Closing the editor would
+     * claim a save that did not happen, and clearing the editor would discard the patterns the user
+     * still wants to write.</p>
+     *
+     * @param outcome how the save ended, or {@code null} when the write failed unexpectedly
+     * @param storedPath path the folder write stores, which the configuration holds once the folder
+     *     itself was written
+     */
+    private void completeFolderSave(FolderSaveOutcome outcome, String storedPath) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        setSavingState(false);
+        if (outcome == FolderSaveOutcome.STORED) {
+            setResult(AppCompatActivity.RESULT_OK);
+            finish();
+            return;
+        }
+        String message = getString(R.string.generic_error);
+        if (outcome == FolderSaveOutcome.IGNORE_LIST_FAILED) {
+            // The folder itself was written, so the configuration now holds the stored path; only
+            // its ignore list was not written.
+            mConfiguredFolderPath = storedPath;
+            message += ": " + getString(R.string.ignore_patterns);
+        }
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private void preCreateFolderStruct(Uri uriFolderRoot, String absolutePath) {
