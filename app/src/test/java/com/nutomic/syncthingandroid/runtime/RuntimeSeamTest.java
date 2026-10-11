@@ -149,6 +149,41 @@ public class RuntimeSeamTest {
     }
 
     @Test
+    public void selectedRootBackendFailureNeverStartsTheApplicationUidBackend() {
+        RecordingBackend normal = new RecordingBackend();
+        RecordingBackend root = new RecordingBackend() {
+            @Override
+            public Execution start(SyncthingCommand command, SyncthingEnvironment environment)
+                    throws IOException {
+                startCount++;
+                throw new IOException("root launch failed");
+            }
+        };
+        RootAuthorizationCapability authorization = new RootAuthorizationCapability() {
+            @Override public void verifyAuthorization() {}
+            @Override public boolean isAuthorizationAvailableWithoutPrompt() { return true; }
+            @Override public TuningOutcome applyInotifyWatchLimitIfAuthorized() { return null; }
+        };
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(
+                normal, root, authorization, true
+        );
+        SyncthingEnvironment environment = SyncthingEnvironment.builder()
+                .home("/home")
+                .syncthingHome("/state")
+                .trace("")
+                .monitored()
+                .noUpgrade()
+                .versionExtra("app")
+                .sqliteTemporaryDirectory("/tmp")
+                .gogc(100)
+                .build();
+
+        assertThrows(IOException.class, () -> runtime.start(SyncthingCommand.SERVE, environment));
+        assertEquals(1, root.startCount);
+        assertEquals(0, normal.startCount);
+    }
+
+    @Test
     public void recoveryShutdownLeaseBlocksReplacementUntilRequestIsTerminal() throws Exception {
         RecordingBackend backend = new RecordingBackend();
         GatedExecution oldProcess = new GatedExecution();
