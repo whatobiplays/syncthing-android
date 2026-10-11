@@ -1,0 +1,19 @@
+app/build.gradle.kts
+  s_525263b66e1e64::t_96f6ae69615a76 196-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5bb3173d434cb489cd05381a6151c14faebc8886",
+  "prompts": {},
+  "sessions": {
+    "s_525263b66e1e64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12304-455e-7913-a6ba-214820ce6185",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
