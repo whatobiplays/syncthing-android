@@ -18,6 +18,16 @@ package com.nutomic.syncthingandroid.runtime;
 public interface ManagedStateTransfer {
 
     /**
+     * Reports whether the application can access every existing Managed State member.
+     *
+     * <p>The check is read-only and never acquires root. A missing required configuration or an
+     * inaccessible, unsafe, or wrongly typed existing member reports {@code false}.</p>
+     */
+    default boolean isAppAccessAvailable() {
+        return false;
+    }
+
+    /**
      * Copies the current Managed State into one fresh operation-owned staging directory.
      *
      * <p>Only members that currently exist are staged; a member that is absent from Managed State
@@ -66,4 +76,15 @@ public interface ManagedStateTransfer {
      *     repaired member still cannot be verified
      */
     void repairAppAccess() throws ManagedStateException;
+
+    /**
+     * Repairs Managed State only through root authorization already confirmed in this process.
+     * Implementations without a non-prompting privileged path must fail closed.
+     */
+    default void repairAppAccessIfAuthorized() throws ManagedStateException {
+        throw new ManagedStateException(
+                ManagedStateFailure.STATE_REPAIR_FAILED,
+                "This backend cannot repair Managed State without requesting new authorization"
+        );
+    }
 }

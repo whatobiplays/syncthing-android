@@ -221,6 +221,11 @@ final class AppUidManagedStateTransfer implements ManagedStateTransfer {
     }
 
     @Override
+    public boolean isAppAccessAvailable() {
+        return ManagedStateAccessProbe.isAccessible(locations);
+    }
+
+    @Override
     public void repairAppAccess() throws ManagedStateException {
         locations.requireSafeStateRoot(ManagedStateFailure.STATE_REPAIR_FAILED);
         for (ManagedStateMember member : ManagedStateMember.values()) {

@@ -71,6 +71,31 @@ final class LibsuRootShellFactory implements RootShellFactory {
     }
 
     /**
+     * libsu-core starts a new {@code su} process for this factory and exposes no prompt-free mode.
+     * A cached grant bit cannot make that later process launch safe, so production refuses to
+     * claim an already-authorized capability.
+     */
+    @Override
+    public boolean isAuthorizationAvailableWithoutPrompt() {
+        return false;
+    }
+
+    /**
+     * Refuses passive helper work because libsu-core cannot prevent a new {@code su} request from
+     * prompting after authorization state changes.
+     */
+    @Override
+    public RootShell acquireIfAuthorized(long timeoutMillis) throws RootTransportException {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("The activation deadline must be positive");
+        }
+        throw new RootTransportException(
+                RootFailure.ROOT_NONINTERACTIVE_UNAVAILABLE,
+                "libsu-core does not provide a guaranteed prompt-free root-shell acquisition"
+        );
+    }
+
+    /**
      * Acquires a root shell over an already-started root transport process.
      *
      * <p>The libsu build step is a parameter so tests can drive the acceptance-failure teardown

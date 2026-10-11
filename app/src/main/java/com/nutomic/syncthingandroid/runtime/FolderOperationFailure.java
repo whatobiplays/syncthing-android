@@ -21,5 +21,15 @@ public enum FolderOperationFailure {
     /** A folder member needed by the operation has an unsafe kind, such as a symbolic link. */
     FOLDER_MEMBER_UNSAFE,
     /** The approved sync-completion script set could not be dispatched. */
-    SCRIPT_DISPATCH_FAILED
+    SCRIPT_DISPATCH_FAILED,
+    /** Explicit root-script authorization was denied by the root manager. */
+    ROOT_SCRIPT_AUTH_DENIED,
+    /** A previously available root-script authorization was lost or was not UID 0. */
+    ROOT_SCRIPT_AUTH_LOST,
+    /** The bounded root-script authorization attempt timed out. */
+    ROOT_SCRIPT_AUTH_TIMEOUT,
+    /** Root-script authorization or transport was unavailable. */
+    ROOT_SCRIPT_AUTH_UNAVAILABLE,
+    /** The service closed backend operations while changing execution mode. */
+    EXECUTION_MODE_TRANSITION_BUSY
 }

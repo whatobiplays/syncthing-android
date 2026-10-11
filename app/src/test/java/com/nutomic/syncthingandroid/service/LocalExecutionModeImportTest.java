@@ -23,7 +23,25 @@ public class LocalExecutionModeImportTest {
     @Test
     public void archiveExecutionModePreferenceIsClassifiedAsDeviceLocal() {
         assertTrue(SyncthingService.isDeviceLocalPreference(Constants.PREF_USE_ROOT));
+        assertTrue(SyncthingService.isDeviceLocalPreference(Constants.PREF_INSTALLATION_MARKER));
+        assertTrue(SyncthingService.isDeviceLocalPreference(Constants.PREF_INOTIFY_WATCH_LIMIT));
+        assertTrue(SyncthingService.isDeviceLocalPreference(
+                Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY));
         assertFalse(SyncthingService.isDeviceLocalPreference("backup_password"));
+    }
+
+    @Test
+    public void successfulImportKeepsLocalModeAndTuningAndRecordsInstallationLineage() {
+        Map<String, Object> restored = new HashMap<>();
+        SharedPreferences.Editor editor = recordingEditor(restored);
+
+        assertTrue(SyncthingService.restoreLocalDevicePreferences(
+                editor, true, Boolean.TRUE, true
+        ));
+
+        assertEquals(Boolean.TRUE, restored.get(Constants.PREF_USE_ROOT));
+        assertEquals(Boolean.TRUE, restored.get(Constants.PREF_INSTALLATION_MARKER));
+        assertEquals(Boolean.TRUE, restored.get(Constants.PREF_INOTIFY_WATCH_LIMIT));
     }
 
     @Test
@@ -76,6 +94,35 @@ public class LocalExecutionModeImportTest {
         ));
 
         assertFalse(restored.containsKey(Constants.PREF_USE_ROOT));
+    }
+
+    @Test
+    public void importedRootScriptConsentCannotEnableAutomaticPrompts() {
+        Map<String, Object> archived = new HashMap<>();
+        archived.put(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY, "ARMED");
+        archived.put("ordinary_preference", true);
+        Map<String, Object> restored = new HashMap<>();
+        for (Map.Entry<String, Object> entry : archived.entrySet()) {
+            if (!SyncthingService.isDeviceLocalPreference(entry.getKey())) {
+                restored.put(entry.getKey(), entry.getValue());
+            }
+        }
+        assertFalse(restored.containsKey(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY));
+        assertEquals(true, restored.get("ordinary_preference"));
+    }
+
+    @Test
+    public void backupDoesNotSerializeDeviceLocalRootScriptConsent() {
+        Map<String, Object> live = new HashMap<>();
+        live.put(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY, "SUSPENDED:DENIED");
+        live.put("ordinary_preference", true);
+
+        Map<String, ?> exported = SyncthingService.preferencesForBackup(live);
+
+        assertFalse(exported.containsKey(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY));
+        assertEquals(true, exported.get("ordinary_preference"));
+        assertEquals("SUSPENDED:DENIED",
+                live.get(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY));
     }
 
     @Test

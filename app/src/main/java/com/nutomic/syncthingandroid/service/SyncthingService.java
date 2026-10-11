@@ -12,24 +12,35 @@ import androidx.annotation.Nullable;
 
 import com.nutomic.syncthingandroid.R;
 import com.nutomic.syncthingandroid.SyncthingApp;
+import com.nutomic.syncthingandroid.onboarding.InstallationRecognition;
 import com.nutomic.syncthingandroid.http.PollWebGuiAvailableTask;
 import com.nutomic.syncthingandroid.model.Device;
 import com.nutomic.syncthingandroid.model.Folder;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
 import com.nutomic.syncthingandroid.runtime.ExecutionAdmissionException;
 import com.nutomic.syncthingandroid.runtime.ExecutionIdentity;
+import com.nutomic.syncthingandroid.runtime.ConfiguredFolderReference;
+import com.nutomic.syncthingandroid.runtime.FolderEvent;
+import com.nutomic.syncthingandroid.runtime.FolderOperationException;
+import com.nutomic.syncthingandroid.runtime.FolderOperationFailure;
+import com.nutomic.syncthingandroid.runtime.FolderScriptOutcome;
+import com.nutomic.syncthingandroid.runtime.RunScriptRootAuthorization;
 import com.nutomic.syncthingandroid.runtime.ExecutionOwnershipManager;
 import com.nutomic.syncthingandroid.runtime.ExecutionRecoveryException;
 import com.nutomic.syncthingandroid.runtime.HttpsCertificateState;
 import com.nutomic.syncthingandroid.runtime.HttpsCertificateStorage;
 import com.nutomic.syncthingandroid.runtime.LifecycleLaunchPermit;
 import com.nutomic.syncthingandroid.runtime.ManagedStateException;
+import com.nutomic.syncthingandroid.runtime.ManagedStateFailure;
 import com.nutomic.syncthingandroid.runtime.ManagedStateLocations;
 import com.nutomic.syncthingandroid.runtime.ManagedStateStaging;
 import com.nutomic.syncthingandroid.runtime.OwnedExecutionShutdown;
+import com.nutomic.syncthingandroid.runtime.RootFailure;
+import com.nutomic.syncthingandroid.runtime.RootTransportException;
 import com.nutomic.syncthingandroid.runtime.SyncthingCommand;
 import com.nutomic.syncthingandroid.runtime.TuningOutcome;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
+import com.nutomic.syncthingandroid.util.ConfigurationProjection;
 import com.nutomic.syncthingandroid.util.ConfigXml;
 import com.nutomic.syncthingandroid.util.PermissionUtil;
 import com.nutomic.syncthingandroid.util.Util;
@@ -38,14 +49,18 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
+import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.inject.Inject;
 
@@ -57,6 +72,7 @@ import net.lingala.zip4j.ZipFile;
 public class SyncthingService extends Service {
 
     private static final String TAG = "SyncthingService";
+    private static final long STARTUP_CONFIGURATION_TIMEOUT_MILLIS = 90_000;
 
     private Boolean ENABLE_VERBOSE_LOG = false;
 
@@ -158,6 +174,21 @@ public class SyncthingService extends Service {
         void onServiceStateChange(State currentState);
     }
 
+    /** Receives progress updates for an Execution Mode request. */
+    public interface OnExecutionModeTransitionStatusChangedListener {
+        void onExecutionModeTransitionStatusChanged(ExecutionModeTransitionStatus status);
+    }
+
+    /** Receives changes to automatic root-script authorization consent and suspension. */
+    public interface OnRootRunScriptPromptStatusChangedListener {
+        void onRootRunScriptPromptStatusChanged(RootRunScriptAuthorizationPolicy.Status status);
+    }
+
+    /** Receives the result of an explicit inotify tuning request. */
+    public interface OnInotifyWatchLimitResultListener {
+        void onComplete(boolean enabled, boolean succeeded, String detail);
+    }
+
     /**
      * Outcome of {@link #replaceHttpsCertificate} / {@link #resetHttpsCertificate}.
      */
@@ -209,7 +240,7 @@ public class SyncthingService extends Service {
      */
     private State mCurrentState = State.DISABLED;
     private ConfigRouter mConfigRouter;
-    private ConfigXml mConfig;
+    @Nullable private StartupConfiguration mStartupConfiguration;
     private Thread mSyncthingRunnableThread = null;
     private Handler mHandler;
 
@@ -278,14 +309,74 @@ public class SyncthingService extends Service {
     private final ThreadPoolExecutor mCertificateStorageExecutor =
             CertificateStorageMutation.newWorkerExecutor();
 
-    private boolean mShutdownInProgress;
+    private volatile boolean mShutdownInProgress;
     private boolean mShutdownExitProven;
     private boolean mShutdownSafetyEstablished;
     private boolean mShutdownWorkerStarted;
     private boolean mShutdownRecoveryCheckStarted;
     private boolean mLastExecutionExitProven;
-    private boolean mDestroying;
+    private volatile boolean mDestroying;
+    private boolean mDestructionShutdownCompletionPending;
+    private ModeTransitionRequest mDestructionAbandonedTransition;
+    private volatile long mLifecycleGeneration;
+    @Nullable private volatile RootRunScriptAuthorizationPolicy mRootRunScriptPromptPolicy;
+    private final AtomicBoolean mRootRunScriptWorkerActive = new AtomicBoolean();
+    /** Counts accepted preference workers, including an OFF write that supersedes an opt-in. */
+    private final AtomicInteger mRootScriptConsentMutationsInFlight = new AtomicInteger();
+    private volatile boolean mRootScriptOptOutPending;
+    private volatile long mRootScriptConsentGeneration;
+    @Nullable private volatile Thread mRootRunScriptWorker;
+    /** Serializes automatic script acceptance with transition, shutdown, and helper admission. */
+    private final Object mRootScriptLifecycleLock = new Object();
+    private long mRootScriptLifecycleEpoch;
+    private boolean mRootScriptShutdownClosed;
+    private boolean mRootRunScriptExecuting;
+    /** Narrow test seam for pausing one automatic script or consent worker before it starts. */
+    @FunctionalInterface
+    interface RootScriptWorkerStarter {
+        void start(Thread worker);
+    }
+    private RootScriptWorkerStarter mRootScriptWorkerStarter = Thread::start;
+
+    void setRootScriptWorkerStarterForTest(RootScriptWorkerStarter starter) {
+        mRootScriptWorkerStarter = starter;
+    }
+    private final HashSet<OnRootRunScriptPromptStatusChangedListener>
+            mRootRunScriptPromptStatusListeners = new HashSet<>();
     private boolean mCertificateMutationPending;
+    @Nullable private volatile FileMutationBarrier.ExecutionModeTransitionReservation
+            mExecutionModeTransitionReservation;
+    @Nullable private volatile ModeTransitionRequest mModeTransitionRequest;
+    private ExecutionModeTransitionStatus mModeTransitionStatus =
+            ExecutionModeTransitionStatus.idle(false);
+    private boolean mStateAccessRepairRequired;
+    private boolean mRootStartupAuthorizationAttempted;
+    private volatile boolean mRootStartupAuthorizationPending;
+    private boolean mRootStartupAuthorizationComplete;
+    private boolean mRootStartupStatusPending;
+    private long mRootStartupRequestId;
+    private boolean mStartupConfigLoadPending;
+    private long mStartupConfigLoadRequestId;
+    private long mStartupRequestId;
+    private boolean mStartupConfigLoadTimedOut;
+    @Nullable private Runnable mStartupConfigLoadTimeout;
+    private boolean mStoppedCustomRunConditionsPending;
+    private boolean mStoppedCustomRunConditionsReapplyRequested;
+    private long mStoppedCustomRunConditionsRequestId;
+    private boolean mExecutionModeReconciliationPending;
+    private boolean mExecutionModeReconciliationRetryRequired;
+    private boolean mExecutionModeReconciliationWaitRegistered;
+    private volatile boolean mRuntimeReconciliationInFlight;
+    private volatile boolean mRuntimeReconciliationShutdownSafe;
+    private final Object mExecutionModeReconciliationLock = new Object();
+    @Nullable private SharedPreferences.OnSharedPreferenceChangeListener
+            mExecutionModePreferenceListener;
+    private boolean mStartupStateAccessProbePending;
+    private boolean mStartupStateAccessProbeComplete;
+    private long mStartupStateAccessProbeGeneration;
+    private final HashSet<OnExecutionModeTransitionStatusChangedListener>
+            mModeTransitionStatusListeners = new HashSet<>();
+    @Nullable private ExecutionModeTransitionTestSeam mExecutionModeTransitionTestSeam;
     @Nullable private AtomicBoolean mCertificateMutationCancellation;
     @Nullable private FileMutationBarrier.CertificateRestoreReservation
             mCertificateStorageReservation;
@@ -313,6 +404,121 @@ public class SyncthingService extends Service {
      */
     private boolean mStoragePermissionGranted = false;
 
+    /** Installs deterministic side effects for JVM tests of the real transition coordinator. */
+    void setExecutionModeTransitionTestSeam(ExecutionModeTransitionTestSeam seam) {
+        mExecutionModeTransitionTestSeam = seam;
+    }
+
+    /** Seeds only lifecycle facts that Android supplies before a service transition begins. */
+    void setExecutionModeTransitionTestState(
+            boolean shouldRun,
+            boolean stateAccessRepairRequired,
+            State currentState
+    ) {
+        mLastDeterminedShouldRun = shouldRun;
+        mStateAccessRepairRequired = stateAccessRepairRequired;
+        mCurrentState = currentState;
+    }
+
+    /** Runs the production durable-mode reconciliation path in a JVM test. */
+    void reconcileRuntimeExecutionModeForTest() {
+        reconcileRuntimeExecutionModeFromPreferences();
+    }
+
+    /** Starts one root startup configuration attempt through the normal service load path. */
+    void startRootStartupConfigurationLoadForTest() {
+        mLastDeterminedShouldRun = true;
+        mRootStartupStatusPending = true;
+        loadStartupConfiguration(SyncthingCommand.SERVE, ++mStartupRequestId);
+    }
+
+    /** Starts the normal root-selected authorization path from a deterministic JVM test. */
+    void startRootSelectedStartupForTest() {
+        beginRootSelectedStartup(SyncthingCommand.SERVE, false);
+    }
+
+    /** Applies the same lifecycle invalidation and shutdown result handling used by onDestroy. */
+    void destroyExecutionModeLifecycleForTest() {
+        ModeTransitionRequest abandoned = markServiceDestroying();
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam == null) throw new IllegalStateException("Transition test seam is not installed");
+        seam.shutdown(safe -> onServiceDestructionShutdownComplete(abandoned, safe));
+    }
+
+    ExecutionModeTransitionStatus executionModeTransitionStatusForTest() {
+        return mModeTransitionStatus;
+    }
+
+    /** Delivers a terminal state callback through the production readiness/status handler. */
+    void onServiceStateChangeForTest(State newState) {
+        onServiceStateChange(newState);
+    }
+
+    private boolean postTransitionCallback(Runnable callback) {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) return seam.post(callback);
+        Handler handler = mHandler;
+        return handler != null && handler.post(callback);
+    }
+
+    private boolean executeTransitionWorker(String name, Runnable work) {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) return seam.executeWorker(name, work);
+        Thread worker = new Thread(work, name);
+        worker.setDaemon(true);
+        try {
+            worker.start();
+            return true;
+        } catch (RuntimeException error) {
+            Log.e(TAG, "Could not start " + name, error);
+            return false;
+        }
+    }
+
+    private boolean durableExecutionMode() {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        return seam != null
+                ? seam.durableMode()
+                : mPreferences.getBoolean(Constants.PREF_USE_ROOT, false);
+    }
+
+    private boolean runtimeExecutionMode() {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        return seam != null ? seam.runtimeMode() : mRuntime.isSuperuserModeSelected();
+    }
+
+    private boolean closeBackendOperationAdmission(long timeoutMillis)
+            throws InterruptedException {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        return seam != null
+                ? seam.closeBackendAdmission(timeoutMillis)
+                : mRuntime.closeBackendOperationAdmission(timeoutMillis);
+    }
+
+    private void reopenBackendOperationAdmissionWhenDrained() {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) seam.reopenBackendAdmissionWhenDrained();
+        else mRuntime.reopenBackendOperationAdmissionWhenDrained();
+    }
+
+    private void openBackendOperationAdmission() {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) seam.openBackendAdmission();
+        else mRuntime.openBackendOperationAdmission();
+    }
+
+    private void selectRuntimeExecutionMode(boolean useRoot) {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) seam.selectMode(useRoot);
+        else mRuntime.selectExecutionMode(useRoot);
+    }
+
+    private void launchModeTransitionStartup(SyncthingCommand command) {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) seam.launchStartup(command);
+        else launchStartupTask(command);
+    }
+
     /**
      * Starts the native binary.
      */
@@ -320,10 +526,24 @@ public class SyncthingService extends Service {
     public void onCreate() {
         super.onCreate();
         ((SyncthingApp) getApplication()).component().inject(this);
+        mRootRunScriptPromptPolicy = new RootRunScriptAuthorizationPolicy(
+                new RootRunScriptAuthorizationPolicy.Store() {
+                    @Override public String read() {
+                        return mPreferences.getString(
+                                Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY, "OFF");
+                    }
+                    @Override public Object identity() { return mPreferences; }
+                    @Override public boolean commit(String value) {
+                        return mPreferences.edit().putString(
+                                Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY, value).commit();
+                    }
+                }
+        );
         ENABLE_VERBOSE_LOG = AppPrefs.getPrefVerboseLog(mPreferences);
         LogV("onCreate");
         mConfigRouter = new ConfigRouter(SyncthingService.this);
         mHandler = new Handler();
+        registerExecutionModePreferenceListener();
 
         /**
          * If runtime permissions are revoked, android kills and restarts the service.
@@ -333,6 +553,238 @@ public class SyncthingService extends Service {
 
         if (mNotificationHandler != null) {
             mNotificationHandler.setAppShutdownInProgress(false);
+        }
+        reconcileRuntimeExecutionModeFromPreferences();
+        reapplyInotifyLimitIfAuthorized();
+    }
+
+    private void registerExecutionModePreferenceListener() {
+        mExecutionModePreferenceListener = (preferences, key) -> {
+            if (!Constants.PREF_USE_ROOT.equals(key)) return;
+            postTransitionCallback(this::reconcileRuntimeExecutionModeFromPreferences);
+        };
+        mPreferences.registerOnSharedPreferenceChangeListener(
+                mExecutionModePreferenceListener
+        );
+    }
+
+    /** Registers the production preference callback against deterministic JVM test preferences. */
+    void registerExecutionModePreferenceListenerForTest(SharedPreferences preferences) {
+        mPreferences = Objects.requireNonNull(preferences);
+        registerExecutionModePreferenceListener();
+    }
+
+    /** Reconciles the app-singleton backend with the sole durable mode preference. */
+    private void reconcileRuntimeExecutionModeFromPreferences() {
+        if (mDestroying || (mExecutionModeTransitionTestSeam == null
+                && (mRuntime == null || mPreferences == null))) return;
+        boolean committedMode = durableExecutionMode();
+        if (FileMutationBarrier.executionModeTransitionPending()) {
+            mExecutionModeReconciliationPending = true;
+            if (!mExecutionModeReconciliationWaitRegistered) {
+                mExecutionModeReconciliationWaitRegistered = true;
+                long lifecycleGeneration = mLifecycleGeneration;
+                onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                        ExecutionModeTransitionStatus.Phase.COMMITTING,
+                        ExecutionModeTransitionStatus.FailureKind.NONE,
+                        null,
+                        null,
+                        "Waiting for the previous service's transition work to finish before runtime reconciliation.",
+                        committedMode,
+                        false,
+                        false,
+                        mStateAccessRepairRequired
+                ));
+                FileMutationBarrier.whenExecutionModeTransitionReleased(() -> {
+                    postTransitionCallback(() -> {
+                        if (mDestroying || lifecycleGeneration != mLifecycleGeneration) return;
+                        mExecutionModeReconciliationWaitRegistered = false;
+                        mExecutionModeReconciliationPending = false;
+                        reconcileRuntimeExecutionModeFromPreferences();
+                    });
+                });
+            }
+            return;
+        }
+        if (mExecutionModeReconciliationRetryRequired
+                || mRuntimeReconciliationInFlight
+                || mExecutionModeReconciliationPending) return;
+
+        if (runtimeExecutionMode() == committedMode) {
+            if (!committedMode && mExecutionModeTransitionTestSeam == null
+                    && !mStartupStateAccessProbeComplete) {
+                ensureStartupStateAccessProbe();
+                if (mStartupStateAccessProbePending || !mStartupStateAccessProbeComplete) {
+                    return;
+                }
+            }
+            if (!committedMode && mStateAccessRepairRequired) {
+                onModeTransitionStatusChanged(
+                        ExecutionModeTransitionStatus.idle(true)
+                );
+                return;
+            }
+            try {
+                if (committedMode || !mStateAccessRepairRequired) {
+                    openBackendOperationAdmission();
+                }
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Could not reopen the durably selected runtime", error);
+                mExecutionModeReconciliationPending = true;
+                mExecutionModeReconciliationRetryRequired = true;
+                onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                        ExecutionModeTransitionStatus.Phase.QUIESCING,
+                        ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                        null,
+                        null,
+                        "The selected backend could not reopen safely. Retry reconciliation.",
+                        committedMode,
+                        true,
+                        false,
+                        mStateAccessRepairRequired
+                ));
+                return;
+            }
+            mExecutionModeReconciliationPending = false;
+            if (mLastDeterminedShouldRun && mCurrentState == State.DISABLED
+                    && (committedMode || !mStateAccessRepairRequired)) {
+                launchModeTransitionStartup(SyncthingCommand.SERVE);
+            }
+            return;
+        }
+
+        FileMutationBarrier.ExecutionModeTransitionReservation reservation =
+                FileMutationBarrier.tryReserveExecutionModeTransition();
+        if (reservation == null) {
+            try {
+                closeBackendOperationAdmission(0);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            mExecutionModeReconciliationPending = true;
+            mExecutionModeReconciliationRetryRequired = true;
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Another lifecycle or Managed State owner prevents safe runtime reconciliation.",
+                    committedMode,
+                    true,
+                    false,
+                    mStateAccessRepairRequired
+            ));
+            return;
+        }
+        mExecutionModeTransitionReservation = reservation;
+
+        mExecutionModeReconciliationPending = true;
+        mRuntimeReconciliationInFlight = true;
+        long lifecycleGeneration = mLifecycleGeneration;
+        onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                ExecutionModeTransitionStatus.Phase.COMMITTING,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Reconciling the runtime with the durably committed Execution Mode.",
+                committedMode,
+                false,
+                false,
+                mStateAccessRepairRequired
+        ));
+        boolean workerStarted = executeTransitionWorker("Execution Mode runtime reconciliation", () -> {
+            boolean reconciled = false;
+            try {
+                if (!closeBackendOperationAdmission(5_000)) {
+                    throw new IllegalStateException(
+                            "Backend operations did not drain before runtime reconciliation"
+                    );
+                }
+                boolean latestCommittedMode = durableExecutionMode();
+                synchronized (mExecutionModeReconciliationLock) {
+                    if (mDestroying || lifecycleGeneration != mLifecycleGeneration) {
+                        throw new IllegalStateException(
+                                "Runtime reconciliation was cancelled by service destruction"
+                        );
+                    }
+                    selectRuntimeExecutionMode(latestCommittedMode);
+                    if (runtimeExecutionMode() != latestCommittedMode) {
+                        throw new IllegalStateException(
+                                "The selected runtime does not match the durable mode preference"
+                        );
+                    }
+                    if (latestCommittedMode) openBackendOperationAdmission();
+                }
+                reconciled = true;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "Runtime mode reconciliation was interrupted", interrupted);
+            } catch (RuntimeException failure) {
+                Log.e(TAG, "Runtime could not be reconciled with the durable execution mode", failure);
+            }
+            boolean result = reconciled;
+            mRuntimeReconciliationInFlight = false;
+            if (mDestroying && mRuntimeReconciliationShutdownSafe) {
+                releaseModeTransitionReservation();
+            }
+            if (!postTransitionCallback(() -> {
+                if (mDestroying || lifecycleGeneration != mLifecycleGeneration) return;
+                boolean currentCommittedMode = durableExecutionMode();
+                if (result && runtimeExecutionMode() == currentCommittedMode) {
+                    mExecutionModeReconciliationPending = false;
+                    mExecutionModeReconciliationRetryRequired = false;
+                    releaseModeTransitionReservation();
+                    invalidateStartupStateAccessProbe();
+                    if (currentCommittedMode) {
+                        mRootStartupAuthorizationComplete = false;
+                        mRootStartupAuthorizationAttempted = false;
+                    } else {
+                        ensureStartupStateAccessProbe();
+                    }
+                    onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                            mStateAccessRepairRequired
+                    ));
+                    if (mLastDeterminedShouldRun && mCurrentState == State.DISABLED
+                            && (currentCommittedMode || !mStateAccessRepairRequired)
+                            && !mStartupStateAccessProbePending) {
+                        launchModeTransitionStartup(SyncthingCommand.SERVE);
+                    }
+                } else {
+                    mExecutionModeReconciliationPending = true;
+                    mExecutionModeReconciliationRetryRequired = true;
+                    releaseModeTransitionReservation();
+                    onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                            ExecutionModeTransitionStatus.Phase.FAILED,
+                            ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                            null,
+                            null,
+                            "The committed execution backend could not be selected safely. Retry reconciliation.",
+                            currentCommittedMode,
+                            true,
+                            false,
+                            mStateAccessRepairRequired
+                    ));
+                }
+            })) {
+                Log.e(TAG, "Runtime reconciliation result could not return to the service thread");
+            }
+        });
+        if (!workerStarted) {
+            mRuntimeReconciliationInFlight = false;
+            mExecutionModeReconciliationPending = true;
+            mExecutionModeReconciliationRetryRequired = true;
+            releaseModeTransitionReservation();
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                    null,
+                    null,
+                    "The runtime reconciliation worker could not be started. Retry reconciliation.",
+                    committedMode,
+                    true,
+                    false,
+                    mStateAccessRepairRequired
+            ));
         }
     }
 
@@ -365,6 +817,7 @@ public class SyncthingService extends Service {
             );
         }
         mNotificationHandler.updatePersistentNotification(this);
+        ensureStartupStateAccessProbe();
 
         if (intent == null) {
             return START_STICKY;
@@ -512,20 +965,8 @@ public class SyncthingService extends Service {
      */
     private void afterFreshServiceInstanceStart() {
         LogV("afterFreshServiceInstanceStart: Service started from scratch, SyncthingNative is going to STATE_" + mCurrentState + " meanwhilst ...");
-        if (mCurrentState == State.DISABLED) {
-            // Read and parse the config from disk.
-            ConfigXml configXml = new ConfigXml(this);
-            try {
-                configXml.loadConfig();
-            } catch (ConfigXml.OpenConfigException e) {
-                mNotificationHandler.showCrashedNotification(R.string.config_read_failed, "afterFreshServiceInstanceStart:OpenConfigException");
-                synchronized (mStateLock) {
-                    onServiceStateChange(State.ERROR);
-                }
-                stopSelf();
-                return;
-            }
-        }
+        // A stopped service has no reason to read or migrate authoritative configuration. An
+        // eligible launch performs that work on StartupConfigurationLoad's bounded worker.
     }
 
     /**
@@ -543,6 +984,10 @@ public class SyncthingService extends Service {
             if (newShouldRunDecision) {
                 boolean lifecycleBlocksStartup = mStartingShutdownDeferral
                         .blocksStartup(mShutdownInProgress)
+                        || mModeTransitionRequest != null
+                        || mExecutionModeTransitionReservation != null
+                        || mStartupStateAccessProbePending
+                        || (mStateAccessRepairRequired && !runtimeExecutionMode())
                         || mFileMutationBarrier != null
                         || FileMutationBarrier.certificateRestorePending()
                         || mCertificateRestoreDeferredStart.isPending()
@@ -553,6 +998,11 @@ public class SyncthingService extends Service {
                         || mSyncthingRunnable != null
                         || mSyncthingRunnableThread != null));
                 mShutdownStartIntent.onRunConditionChanged(true, lifecycleBlocksStartup);
+                if (mModeTransitionRequest != null
+                        || mExecutionModeTransitionReservation != null
+                        || FileMutationBarrier.executionModeTransitionPending()) {
+                    return;
+                }
                 if (lifecycleBlocksStartup) {
                     if (FileMutationBarrier.certificateRestorePending()) {
                         deferStartupUntilCertificateRestore(SyncthingCommand.SERVE);
@@ -584,6 +1034,13 @@ public class SyncthingService extends Service {
             } else {
                 mShutdownStartIntent.onRunConditionChanged(false, false);
                 mCertificateRestoreDeferredStart.onRunConditionChanged(false);
+                if (mModeTransitionRequest == null) {
+                    invalidateRootStartupForStoppedRunConditions();
+                }
+                if (mExecutionModeTransitionReservation != null
+                        || FileMutationBarrier.executionModeTransitionPending()) {
+                    return;
+                }
                 revokeStartupLaunchPermit();
                 // Stop syncthing.
                 if (mCurrentState == State.DISABLED) {
@@ -591,6 +1048,22 @@ public class SyncthingService extends Service {
                 }
                 shutdown(State.DISABLED);
             }
+        }
+    }
+
+    /** Invalidates a stopped launch without turning a prior denial into automatic consent. */
+    private void invalidateRootStartupForStoppedRunConditions() {
+        ++mStartupRequestId;
+        mRootStartupAuthorizationPending = false;
+        // A previously authorized launch may be restarted by a new eligible Run Condition
+        // cycle. A denied authorization still requires the explicit Retry action.
+        if (mRootStartupAuthorizationComplete) mRootStartupAuthorizationAttempted = false;
+        mRootStartupAuthorizationComplete = false;
+        if (mRootStartupStatusPending) {
+            mRootStartupStatusPending = false;
+            onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                    mStateAccessRepairRequired
+            ));
         }
     }
 
@@ -636,6 +1109,8 @@ public class SyncthingService extends Service {
 
         boolean serviceCanStart = (mCurrentState == State.DISABLED || mCurrentState == State.INIT)
                 && !mShutdownInProgress
+                && mExecutionModeTransitionReservation == null
+                && !FileMutationBarrier.executionModeTransitionPending()
                 && !mCertificateMutationPending
                 && mFileMutationBarrier == null
                 && !mPostMutationStartupGate.ownsStartup()
@@ -683,77 +1158,175 @@ public class SyncthingService extends Service {
             }
         }
 
-        Boolean configChanged = false;
-        ConfigXml configXml;
+        if (mRuntime.isSuperuserModeSelected()
+                || mPreferences.getBoolean(Constants.PREF_USE_ROOT, false)
+                || mModeTransitionRequest != null
+                || mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()
+                || mStateAccessRepairRequired) {
+            // The saved per-object preferences remain the pending intent. A passive callback must
+            // not read or write privileged config.xml; an active REST session reapplies them.
+            Log.d(TAG, "Deferring custom Run Condition updates until authoritative REST config is active");
+            return;
+        }
 
-        // Read and parse the config from disk.
-        configXml = new ConfigXml(this);
+        applyStoppedCustomRunConditions(runConditionMonitor);
+    }
+
+    /** Applies pending Run Condition changes to stopped Normal Mode config off the service thread. */
+    private void applyStoppedCustomRunConditions(RunConditionMonitor runConditionMonitor) {
+        if (mHandler == null || mDestroying) return;
+        if (mStoppedCustomRunConditionsPending) {
+            mStoppedCustomRunConditionsReapplyRequested = true;
+            return;
+        }
+        FileMutationBarrier.StoppedStateMutationReservation mutation =
+                FileMutationBarrier.tryReserveStoppedStateMutation();
+        if (mutation == null) return;
+
+        mStoppedCustomRunConditionsPending = true;
+        long requestId = ++mStoppedCustomRunConditionsRequestId;
+        long lifecycleGeneration = mLifecycleGeneration;
+        Thread worker = new Thread(() -> {
+            Throwable failure = null;
+            try {
+                ConfigXml configXml = new ConfigXml(this);
+                configXml.loadConfig();
+                Map<String, Boolean> requestedFolderPauses = new LinkedHashMap<>();
+                Map<String, Boolean> requestedDevicePauses = new LinkedHashMap<>();
+                boolean changed = false;
+
+                List<Folder> folders = configXml.getFolders();
+                if (folders == null) throw new IllegalStateException("Folder configuration is unavailable");
+                for (Folder folder : folders) {
+                    String key = Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id;
+                    if (!mPreferences.getBoolean(
+                            Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(key), false
+                    )) continue;
+                    boolean paused = !runConditionMonitor.checkObjectSyncConditions(key);
+                    requestedFolderPauses.put(folder.id, paused);
+                    if (folder.paused != paused) {
+                        configXml.setFolderPause(folder.id, paused);
+                        changed = true;
+                    }
+                }
+
+                List<Device> devices = configXml.getDevices(false);
+                if (devices == null) throw new IllegalStateException("Device configuration is unavailable");
+                for (Device device : devices) {
+                    String key = Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID;
+                    if (!mPreferences.getBoolean(
+                            Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(key), false
+                    )) continue;
+                    boolean paused = !runConditionMonitor.checkObjectSyncConditions(key);
+                    requestedDevicePauses.put(device.deviceID, paused);
+                    if (device.paused != paused) {
+                        configXml.setDevicePause(device.deviceID, paused);
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    if (mDestroying || lifecycleGeneration != mLifecycleGeneration
+                            || requestId != mStoppedCustomRunConditionsRequestId) return;
+                    if (!configXml.saveChanges()) {
+                        throw new IllegalStateException("Stopped Run Condition config write failed");
+                    }
+                    ConfigXml authoritative = new ConfigXml(this);
+                    authoritative.loadConfig();
+                    Set<String> verifiedFolders = new HashSet<>();
+                    for (Folder folder : authoritative.getFolders()) {
+                        Boolean expected = requestedFolderPauses.get(folder.id);
+                        if (expected != null) {
+                            if (expected != folder.paused) {
+                                throw new IllegalStateException(
+                                        "Folder Run Condition read-back mismatch"
+                                );
+                            }
+                            verifiedFolders.add(folder.id);
+                        }
+                    }
+                    if (!verifiedFolders.equals(requestedFolderPauses.keySet())) {
+                        throw new IllegalStateException(
+                                "Folder Run Condition read-back omitted requested objects"
+                        );
+                    }
+                    Set<String> verifiedDevices = new HashSet<>();
+                    for (Device device : authoritative.getDevices(false)) {
+                        Boolean expected = requestedDevicePauses.get(device.deviceID);
+                        if (expected != null) {
+                            if (expected != device.paused) {
+                                throw new IllegalStateException(
+                                        "Device Run Condition read-back mismatch"
+                                );
+                            }
+                            verifiedDevices.add(device.deviceID);
+                        }
+                    }
+                    if (!verifiedDevices.equals(requestedDevicePauses.keySet())) {
+                        throw new IllegalStateException(
+                                "Device Run Condition read-back omitted requested objects"
+                        );
+                    }
+                }
+            } catch (Exception error) {
+                failure = error;
+            } finally {
+                mutation.release();
+            }
+
+            Throwable result = failure;
+            if (mHandler == null || !mHandler.post(() -> {
+                if (requestId != mStoppedCustomRunConditionsRequestId) return;
+                mStoppedCustomRunConditionsPending = false;
+                if (mDestroying || lifecycleGeneration != mLifecycleGeneration) return;
+                if (result != null) {
+                    Log.w(TAG, "Stopped custom Run Condition changes remain pending", result);
+                } else {
+                    Log.d(TAG, "Stopped custom Run Condition changes match authoritative config");
+                }
+                if (mStoppedCustomRunConditionsReapplyRequested) {
+                    mStoppedCustomRunConditionsReapplyRequested = false;
+                    applyCustomRunConditions(runConditionMonitor);
+                }
+            })) {
+                Log.e(TAG, "Stopped Run Condition result could not return to the service thread");
+            }
+        }, "Stopped Run Condition config update");
+        worker.setDaemon(true);
         try {
-            configXml.loadConfig();
-        } catch (ConfigXml.OpenConfigException e) {
-            mNotificationHandler.showCrashedNotification(R.string.config_read_failed, "applyCustomRunConditions:OpenConfigException");
-            synchronized (mStateLock) {
-                onServiceStateChange(State.ERROR);
-            }
-            stopSelf();
-            return;
+            worker.start();
+        } catch (RuntimeException error) {
+            mutation.release();
+            mStoppedCustomRunConditionsPending = false;
+            Log.e(TAG, "Could not start stopped Run Condition config worker", error);
         }
+    }
 
-        // Check if the folders are available from config.
-        List<Folder> folders = configXml.getFolders();
-        if (folders != null) {
-            for (Folder folder : folders) {
-                // LogV("applyCustomRunConditions: Processing config of folder(" + folder.label + ")");
-                Boolean folderCustomSyncConditionsEnabled = mPreferences.getBoolean(
-                    Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id), false
-                );
-                if (folderCustomSyncConditionsEnabled) {
-                    Boolean syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                        Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id
-                    );
-                    LogV("applyCustomRunConditions: f(" + folder.label + ")=" + (syncConditionsMet ? "1" : "0"));
-                    if (folder.paused != !syncConditionsMet) {
-                        configXml.setFolderPause(folder.id, !syncConditionsMet);
-                        Log.d(TAG, "applyCustomRunConditions: f(" + folder.label + ")=" + (syncConditionsMet ? ">1" : ">0"));
-                        configChanged = true;
-                    }
-                }
-            }
-        } else {
-            Log.d(TAG, "applyCustomRunConditions: folders == null");
-            return;
-        }
+    private enum ModeTransitionPurpose {
+        CHANGE_MODE,
+        REPAIR_STATE
+    }
 
-        // Check if the devices are available from config.
-        List<Device> devices = configXml.getDevices(false);
-        if (devices != null) {
-            for (Device device : devices) {
-                // LogV("applyCustomRunConditions: Processing config of device(" + device.name + ")");
-                Boolean deviceCustomSyncConditionsEnabled = mPreferences.getBoolean(
-                    Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID), false
-                );
-                if (deviceCustomSyncConditionsEnabled) {
-                    Boolean syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                        Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID
-                    );
-                    LogV("applyCustomRunConditions: d(" + device.name + ")=" + (syncConditionsMet ? "1" : "0"));
-                    if (device.paused != !syncConditionsMet) {
-                        configXml.setDevicePause(device.deviceID, !syncConditionsMet);
-                        Log.d(TAG, "applyCustomRunConditions: d(" + device.name + ")=" + (syncConditionsMet ? ">1" : ">0"));
-                        configChanged = true;
-                    }
-                }
-            }
-        } else {
-            Log.d(TAG, "applyCustomRunConditions: devices == null");
-            return;
-        }
+    /** Request data retained only while the service owns one mode-transition admission lease. */
+    private static final class ModeTransitionRequest {
+        private final boolean targetUseRoot;
+        private final ModeTransitionPurpose purpose;
+        private boolean disableAnywayConfirmed;
+        private boolean gatesClosed;
+        private boolean shutdownProven;
+        private boolean stateRepairSucceeded;
+        private boolean rootAuthorizationSucceeded;
+        private boolean commitStarted;
+        private boolean cancelled;
+        @Nullable private RestApi transitionRestApi;
+        private boolean shutdownStarted;
+        private int backgroundOperationsInFlight;
+        private boolean destructionShutdownSafe;
 
-        if (configChanged) {
-            LogV("applyCustomRunConditions: Saving changed config ...");
-            configXml.saveChanges();
-        } else {
-            LogV("applyCustomRunConditions: No action was necessary.");
+        private ModeTransitionRequest(boolean targetUseRoot, ModeTransitionPurpose purpose) {
+            this.targetUseRoot = targetUseRoot;
+            this.purpose = purpose;
         }
     }
 
@@ -777,6 +1350,26 @@ public class SyncthingService extends Service {
 
     /** Prepares a bounded startup whose deadline includes REST configuration initialization. */
     private void launchStartupTask(SyncthingCommand command) {
+        if (mDestroying || mExecutionModeReconciliationPending) return;
+        if (durableExecutionMode() != runtimeExecutionMode()) {
+            reconcileRuntimeExecutionModeFromPreferences();
+            return;
+        }
+        if (mModeTransitionRequest != null || mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()) {
+            Log.d(TAG, "launchStartupTask deferred while Execution Mode transition owns admission");
+            return;
+        }
+        ensureStartupStateAccessProbe();
+        if (!runtimeExecutionMode()
+                && (mStartupStateAccessProbePending || mStateAccessRepairRequired)) {
+            Log.d(TAG, "launchStartupTask deferred until Managed State access is available");
+            return;
+        }
+        if (runtimeExecutionMode() && !mRootStartupAuthorizationComplete) {
+            beginRootSelectedStartup(command, false);
+            return;
+        }
         synchronized (mStateLock) {
             if (mCurrentState != State.DISABLED && mCurrentState != State.INIT) {
                 Log.e(TAG, "launchStartupTask: Wrong state " + mCurrentState + " detected. Cancelling.");
@@ -793,33 +1386,284 @@ public class SyncthingService extends Service {
             deferStartupUntilCertificateRestore(command);
             return;
         }
-
-        if (mSyncthingRunnable != null || mSyncthingRunnableThread != null) {
-            Log.e(TAG, "launchStartupTask: Syncthing binary lifecycle violated");
-            return;
-        }
         if (mFileMutationBarrier != null || mPostMutationStartupGate.ownsStartup()
                 || !mDatabaseResetOwnership.canStartLifecycle()) {
             Log.d(TAG, "launchStartupTask deferred until stopped-state ownership is released");
             return;
         }
-
-        mConfig = new ConfigXml(this);
-        try {
-            mConfig.loadConfig();
-        } catch (ConfigXml.OpenConfigException e) {
-            mNotificationHandler.showCrashedNotification(
-                    R.string.config_read_failed,
-                    "launchStartupTask:OpenConfigException"
-            );
-            synchronized (mStateLock) {
-                onServiceStateChange(State.ERROR);
-            }
-            stopSelf();
+        if (FileMutationBarrier.certificateRestorePending()) {
+            Log.d(TAG, "launchStartupTask deferred until certificate restoration completes");
+            deferStartupUntilCertificateRestore(command);
             return;
         }
 
-        Integer webGuiTcpPort = mConfig.getWebGuiBindPort();
+        if (mSyncthingRunnable != null || mSyncthingRunnableThread != null) {
+            Log.e(TAG, "launchStartupTask: Syncthing binary lifecycle violated");
+            return;
+        }
+        if (mStartupConfigLoadPending) return;
+        loadStartupConfiguration(command, ++mStartupRequestId);
+    }
+
+    private void beginRootSelectedStartup(SyncthingCommand command, boolean explicitRetry) {
+        if (mRootStartupAuthorizationPending || mStartupConfigLoadPending
+                || !ExecutionModeTransitionPolicy.mayAttemptRootStartup(
+                runtimeExecutionMode(),
+                mLastDeterminedShouldRun,
+                mRootStartupAuthorizationAttempted,
+                explicitRetry
+        )) {
+            return;
+        }
+        mRootStartupAuthorizationAttempted = true;
+        mRootStartupAuthorizationPending = true;
+        mRootStartupStatusPending = true;
+        long requestId = ++mStartupRequestId;
+        long lifecycleGeneration = mLifecycleGeneration;
+        onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                ExecutionModeTransitionStatus.Phase.PREPARING_ROOT,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Checking root authorization before the eligible startup.",
+                true,
+                false,
+                false,
+                mStateAccessRepairRequired
+        ));
+        runRootAuthorizationPreflight(
+                () -> {
+                    if (!isCurrentStartupRequest(requestId, lifecycleGeneration)) return;
+                    mRootStartupAuthorizationPending = false;
+                    if (!mLastDeterminedShouldRun) {
+                        mRootStartupStatusPending = false;
+                        onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                                mStateAccessRepairRequired
+                        ));
+                        return;
+                    }
+                    mRootStartupAuthorizationComplete = true;
+                    loadStartupConfiguration(command, requestId);
+                },
+                failure -> {
+                    if (!isCurrentStartupRequest(requestId, lifecycleGeneration)) return;
+                    mRootStartupAuthorizationPending = false;
+                    mRootStartupAuthorizationComplete = false;
+                    failRootStartup(
+                            ExecutionModeTransitionStatus.FailureKind.ROOT,
+                            failure,
+                            null,
+                            "Root startup authorization failed. Retry after resolving the cause."
+                    );
+                }
+        );
+    }
+
+    private void loadStartupConfiguration(SyncthingCommand command, long requestId) {
+        if (!isCurrentStartupRequest(requestId, mLifecycleGeneration)
+                || mStartupConfigLoadPending || mDestroying) return;
+        if (mModeTransitionRequest != null || mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()) return;
+        if (FileMutationBarrier.certificateRestorePending()) {
+            deferStartupUntilCertificateRestore(command);
+            return;
+        }
+        FileMutationBarrier.StoppedStateMutationReservation mutation =
+                FileMutationBarrier.tryReserveStoppedStateMutation();
+        if (mutation == null) {
+            FileMutationBarrier.whenStoppedStateMutationReleased(() -> {
+                if (mHandler != null) {
+                    mHandler.post(() -> loadStartupConfiguration(command, requestId));
+                }
+            });
+            return;
+        }
+        mStartupConfigLoadPending = true;
+        mStartupConfigLoadTimedOut = false;
+        long loadRequestId = ++mStartupConfigLoadRequestId;
+        long lifecycleGeneration = mLifecycleGeneration;
+        Runnable timeout = () -> {
+            if (!isCurrentStartupRequest(requestId, lifecycleGeneration)
+                    || loadRequestId != mStartupConfigLoadRequestId
+                    || !mStartupConfigLoadPending) return;
+            mStartupConfigLoadTimedOut = true;
+            if (mRootStartupStatusPending) {
+                onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                        ExecutionModeTransitionStatus.Phase.QUIESCING,
+                        ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                        null,
+                        null,
+                        "The startup deadline elapsed; the configuration worker still owns storage admission. Retry becomes available after it settles.",
+                        true,
+                        false,
+                        false,
+                        mStateAccessRepairRequired
+                ));
+            }
+        };
+        mStartupConfigLoadTimeout = timeout;
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam == null) {
+            mHandler.postDelayed(timeout, STARTUP_CONFIGURATION_TIMEOUT_MILLIS);
+        } else {
+            seam.scheduleStartupConfigurationTimeout(timeout,
+                    STARTUP_CONFIGURATION_TIMEOUT_MILLIS);
+        }
+        try {
+            StartupConfigurationLoad.Source source = () -> {
+                ConfigXml config = new ConfigXml(this);
+                config.loadConfig();
+                return StartupConfiguration.from(config);
+            };
+            StartupConfigurationLoad.Callback callback = result -> {
+                mutation.release();
+                if (!postTransitionCallback(() -> onStartupConfigurationLoaded(
+                        command,
+                        requestId,
+                        loadRequestId,
+                        lifecycleGeneration,
+                        result
+                ))) {
+                    Log.e(TAG, "Startup configuration result could not return to the service thread");
+                }
+            };
+            if (seam == null) StartupConfigurationLoad.start(source, callback);
+            else seam.startStartupConfigurationLoad(source, callback);
+        } catch (RuntimeException workerStartFailure) {
+            mutation.release();
+            if (mHandler != null) mHandler.removeCallbacks(timeout);
+            mStartupConfigLoadPending = false;
+            if (mRootStartupStatusPending) {
+                failRootStartup(
+                        ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                        null,
+                        null,
+                        "The startup configuration worker could not be started."
+                );
+            } else {
+                showConfigurationStartupFailure(workerStartFailure);
+            }
+        }
+    }
+
+    private void onStartupConfigurationLoaded(
+            SyncthingCommand command,
+            long requestId,
+            long loadRequestId,
+            long lifecycleGeneration,
+            StartupConfigurationLoad.Result result
+    ) {
+        if (lifecycleGeneration != mLifecycleGeneration || mDestroying
+                || loadRequestId != mStartupConfigLoadRequestId) return;
+        mStartupConfigLoadPending = false;
+        if (mStartupConfigLoadTimeout != null) {
+            if (mHandler != null) mHandler.removeCallbacks(mStartupConfigLoadTimeout);
+            mStartupConfigLoadTimeout = null;
+        }
+        if (!isCurrentStartupRequest(requestId, lifecycleGeneration)) {
+            // A Run Condition cycle can obsolete this request while its worker still owns
+            // storage. Once it settles, the latest eligible request may claim admission.
+            if (mLastDeterminedShouldRun && !mShutdownInProgress
+                    && mModeTransitionRequest == null && !mDestroying
+                    && (mCurrentState == State.DISABLED || mCurrentState == State.INIT)) {
+                launchStartupTask(command);
+            }
+            return;
+        }
+        if (mStartupConfigLoadTimedOut) {
+            if (mRootStartupStatusPending) {
+                failRootStartup(
+                        ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                        null,
+                        null,
+                        "Configuration access timed out. Retry the root-selected startup."
+                );
+            }
+            return;
+        }
+        if (!result.succeeded()) {
+            if (mRootStartupStatusPending) {
+                failRootStartup(
+                        result.rootFailure() == null
+                                ? ExecutionModeTransitionStatus.FailureKind.STARTUP
+                                : ExecutionModeTransitionStatus.FailureKind.ROOT,
+                        result.rootFailure(),
+                        null,
+                        "Startup configuration could not be read: " + result.detail()
+                );
+            } else {
+                showConfigurationStartupFailure(new ConfigXml.OpenConfigException());
+            }
+            return;
+        }
+        if (mModeTransitionRequest != null || mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()
+                || !mLastDeterminedShouldRun && command == SyncthingCommand.SERVE) {
+            if (mRootStartupStatusPending && !mLastDeterminedShouldRun) {
+                mRootStartupStatusPending = false;
+                mRootStartupAuthorizationComplete = false;
+                onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                        mStateAccessRepairRequired
+                ));
+            }
+            return;
+        }
+        startPreparedStartup(command, requestId, result.configuration());
+    }
+
+    private boolean isCurrentStartupRequest(long requestId, long lifecycleGeneration) {
+        return !mDestroying && lifecycleGeneration == mLifecycleGeneration
+                && requestId == mStartupRequestId;
+    }
+
+    private void failRootStartup(
+            ExecutionModeTransitionStatus.FailureKind failureKind,
+            @Nullable RootFailure rootFailure,
+            @Nullable ManagedStateFailure managedStateFailure,
+            String detail
+    ) {
+        mRootStartupStatusPending = false;
+        // A failed launch must wait for explicit Retry even if Run Conditions cycle later.
+        mRootStartupAuthorizationComplete = false;
+        onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                ExecutionModeTransitionStatus.Phase.FAILED,
+                failureKind,
+                rootFailure,
+                managedStateFailure,
+                detail,
+                true,
+                true,
+                false,
+                mStateAccessRepairRequired
+        ));
+    }
+
+    private void showConfigurationStartupFailure(Throwable error) {
+        Log.e(TAG, "Startup configuration could not be read", error);
+        mNotificationHandler.showCrashedNotification(
+                R.string.config_read_failed,
+                "launchStartupTask:OpenConfigException"
+        );
+        synchronized (mStateLock) {
+            if (mCurrentState != State.ERROR) onServiceStateChange(State.ERROR);
+        }
+        stopSelf();
+    }
+
+    /** Starts Syncthing after the authoritative configuration has been loaded off-thread. */
+    private void startPreparedStartup(
+            SyncthingCommand command,
+            long requestId,
+            StartupConfiguration configuration
+    ) {
+        if (!isCurrentStartupRequest(requestId, mLifecycleGeneration)
+                || mExecutionModeReconciliationPending
+                || mPreferences.getBoolean(Constants.PREF_USE_ROOT, false)
+                != mRuntime.isSuperuserModeSelected()) return;
+        if (mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()) return;
+        mStartupConfiguration = configuration;
+        Integer webGuiTcpPort = configuration.webGuiBindPort();
 
         onServiceStateChange(State.STARTING);
         mStartupCommand = command;
@@ -827,7 +1671,7 @@ public class SyncthingService extends Service {
         mShutdownExitProven = false;
         mShutdownWorkerStarted = false;
         mShutdownRecoveryCheckStarted = false;
-        mRecoveryRestApi = createRecoveryRestApi(mConfig);
+        mRecoveryRestApi = createRecoveryRestApi(configuration);
         mStartupReadiness = new StartupReadiness((delayMillis, task) -> {
             mHandler.postDelayed(task, delayMillis);
             return () -> mHandler.removeCallbacks(task);
@@ -880,16 +1724,18 @@ public class SyncthingService extends Service {
         mSyncthingRunnableThread.start();
     }
 
-    private RestApi createRecoveryRestApi(ConfigXml config) {
-        return new RestApi(this, config.getWebGuiUrl(), config.getApiKey(), () -> { }, () -> { });
+    private RestApi createRecoveryRestApi(StartupConfiguration configuration) {
+        return new RestApi(
+                this, configuration.webGuiUrl(), configuration.apiKey(), () -> { }, () -> { }
+        );
     }
 
     private RestApi createCurrentRestApi() {
         RestApi[] reference = new RestApi[1];
         reference[0] = new RestApi(
                 this,
-                mConfig.getWebGuiUrl(),
-                mConfig.getApiKey(),
+                mStartupConfiguration.webGuiUrl(),
+                mStartupConfiguration.apiKey(),
                 () -> mHandler.post(() -> onApiAvailable(reference[0])),
                 () -> mHandler.post(() -> {
                     if (mRestApi == reference[0]) {
@@ -1058,7 +1904,7 @@ public class SyncthingService extends Service {
                 mRecoveryRestApi = null;
                 mNotificationHandler.showCrashedNotification(
                         R.string.webui_tcp_port_unavailable,
-                        Integer.toString(mConfig.getWebGuiBindPort())
+                        Integer.toString(mStartupConfiguration.webGuiBindPort())
                 );
                 synchronized (mStateLock) {
                     if (mCurrentState == State.STARTING) onServiceStateChange(State.DISABLED);
@@ -1132,12 +1978,16 @@ public class SyncthingService extends Service {
 
         mRecoveryRestApi = null;
         mRestApi = createCurrentRestApi();
+        synchronized (mRootScriptLifecycleLock) {
+            // The replacement REST owner may accept future events after the prior shutdown.
+            mRootScriptShutdownClosed = false;
+        }
         RestApi expectedApi = mRestApi;
-        Log.i(TAG, "Web GUI will be available at " + mConfig.getWebGuiUrl());
+        Log.i(TAG, "Web GUI will be available at " + mStartupConfiguration.webGuiUrl());
         mPollWebGuiAvailableTask = new PollWebGuiAvailableTask(
                 this,
-                mConfig.getWebGuiUrl(),
-                mConfig.getApiKey(),
+                mStartupConfiguration.webGuiUrl(),
+                mStartupConfiguration.apiKey(),
                 result -> mHandler.post(() -> onWebGuiAvailable(expectedApi))
         );
     }
@@ -1182,6 +2032,14 @@ public class SyncthingService extends Service {
             mStartupReadiness = null;
             synchronized (mStateLock) {
                 onServiceStateChange(State.ACTIVE);
+            }
+            ConfigurationProjection.update(
+                    expectedApi.getFolders(),
+                    expectedApi.getDevices(false),
+                    expectedApi.getDevices(true)
+            );
+            if (mRunConditionMonitor != null) {
+                applyCustomRunConditions(mRunConditionMonitor);
             }
             if (mEventProcessor == null) {
                 mEventProcessor = new EventProcessor(SyncthingService.this, expectedApi);
@@ -1468,6 +2326,12 @@ public class SyncthingService extends Service {
             return;
         }
         if (mDestroying) return;
+        if (mExecutionModeTransitionReservation != null
+                || FileMutationBarrier.executionModeTransitionPending()) {
+            Log.w(TAG, "Database reset rejected while an execution-mode transition owns admission");
+            dispatchResetFailure(onFailure);
+            return;
+        }
         if (FileMutationBarrier.certificateRestorePending()) {
             Log.w(TAG, "Database reset rejected while certificate storage is reserved");
             dispatchResetFailure(onFailure);
@@ -1610,17 +2474,9 @@ public class SyncthingService extends Service {
 
     @Nullable
     private RestApi createRecoveryRestApiFromDisk() {
-        ConfigXml config = mConfig;
-        if (config == null) {
-            config = new ConfigXml(this);
-            try {
-                config.loadConfig();
-            } catch (ConfigXml.OpenConfigException e) {
-                Log.w(TAG, "Cannot load REST settings for execution recovery", e);
-                return null;
-            }
-        }
-        return createRecoveryRestApi(config);
+        StartupConfiguration configuration = mStartupConfiguration;
+        if (configuration == null) return null;
+        return createRecoveryRestApi(configuration);
     }
 
     @Override
@@ -1635,7 +2491,15 @@ public class SyncthingService extends Service {
     @Override
     public void onDestroy() {
         Log.d(TAG, "onDestroy");
-        mDestroying = true;
+        ModeTransitionRequest abandonedTransition = markServiceDestroying();
+        mDestructionAbandonedTransition = abandonedTransition;
+        mDestructionShutdownCompletionPending = true;
+        if (mExecutionModePreferenceListener != null && mPreferences != null) {
+            mPreferences.unregisterOnSharedPreferenceChangeListener(
+                    mExecutionModePreferenceListener
+            );
+            mExecutionModePreferenceListener = null;
+        }
         DatabaseResetOwnership.Operation resetOperation =
                 mDatabaseResetOwnership.currentOperation();
         if (resetOperation != null) {
@@ -1678,6 +2542,55 @@ public class SyncthingService extends Service {
                 this::failCertificateDestructionRestoreAfterShutdown
         );
         super.onDestroy();
+    }
+
+    private ModeTransitionRequest markServiceDestroying() {
+        synchronized (mRootScriptLifecycleLock) {
+            synchronized (mExecutionModeReconciliationLock) {
+                mDestroying = true;
+            }
+            ++mRootScriptLifecycleEpoch;
+            RootRunScriptAuthorizationPolicy scriptPolicy = mRootRunScriptPromptPolicy;
+            if (scriptPolicy != null) scriptPolicy.invalidate();
+            Thread scriptWorker = mRootRunScriptWorker;
+            if (scriptWorker != null && !mRootRunScriptExecuting) scriptWorker.interrupt();
+        }
+        ++mLifecycleGeneration;
+        ++mStartupRequestId;
+        mRootStartupAuthorizationPending = false;
+        mRootStartupAuthorizationComplete = false;
+        mRootStartupStatusPending = false;
+        ModeTransitionRequest abandonedTransition = mModeTransitionRequest;
+        if (abandonedTransition != null) {
+            synchronized (abandonedTransition) {
+                if (!abandonedTransition.commitStarted) abandonedTransition.cancelled = true;
+            }
+        }
+        mModeTransitionRequest = null;
+        return abandonedTransition;
+    }
+
+    private void onServiceDestructionShutdownComplete(
+            @Nullable ModeTransitionRequest abandonedTransition,
+            boolean safe
+    ) {
+        if (!safe) return;
+        if (mExecutionModeTransitionReservation == null) {
+            reopenBackendOperationAdmissionWhenDrained();
+            RestApi api = abandonedTransition == null
+                    ? null : abandonedTransition.transitionRestApi;
+            if (api != null) api.reopenFolderScriptAdmissionAfterModeTransitionFailure();
+            return;
+        }
+        if (abandonedTransition != null) {
+            synchronized (abandonedTransition) {
+                abandonedTransition.destructionShutdownSafe = true;
+            }
+            maybeReleaseDestroyedTransitionReservation(abandonedTransition);
+        } else {
+            mRuntimeReconciliationShutdownSafe = true;
+            maybeReleaseDestroyedTransitionReservation(null);
+        }
     }
 
     /** Refuses certificate writes when destruction cannot prove the old execution has exited. */
@@ -1760,6 +2673,11 @@ public class SyncthingService extends Service {
             ))) {
                 onShutdownFailure.run();
             }
+            return;
+        }
+
+        if (FileMutationBarrier.executionModeTransitionPending()) {
+            onLifecycleConflict.run();
             return;
         }
 
@@ -2108,6 +3026,12 @@ public class SyncthingService extends Service {
             failFileMutationBarrier();
             CertificateDestructionRestore destructionRestore = mCertificateDestructionRestore;
             if (destructionRestore != null) destructionRestore.onExecutionExitProven();
+            if (mDestructionShutdownCompletionPending) {
+                mDestructionShutdownCompletionPending = false;
+                onServiceDestructionShutdownComplete(mDestructionAbandonedTransition,
+                        mShutdownExitProven && mShutdownSafetyEstablished);
+                mDestructionAbandonedTransition = null;
+            }
             return;
         }
         Log.d(TAG, "Finished the owned Syncthing lifecycle execution.");
@@ -2208,6 +3132,8 @@ public class SyncthingService extends Service {
         FileMutationBarrier barrier = new FileMutationBarrier();
         boolean posted = mHandler.post(() -> {
             if (mDestroying || mFileMutationBarrier != null || mCertificateMutationPending
+                    || mExecutionModeTransitionReservation != null
+                    || FileMutationBarrier.executionModeTransitionPending()
                     || FileMutationBarrier.certificateRestorePending()) {
                 barrier.stopFailed();
                 return;
@@ -2350,6 +3276,1484 @@ public class SyncthingService extends Service {
         mPostMutationStartupGate.cancel(mShutdownStartIntent);
     }
 
+    /** Returns the committed backend selection currently used by the runtime. */
+    public boolean isSuperuserModeSelected() {
+        return mRuntime.isSuperuserModeSelected();
+    }
+
+    /** Returns the durable mode selection shown in settings, including a post-commit retry case. */
+    public boolean isSuperuserModeCommitted() {
+        return mPreferences.getBoolean(Constants.PREF_USE_ROOT, false);
+    }
+
+    /** Returns the latest transition state for settings and other service clients. */
+    public ExecutionModeTransitionStatus getExecutionModeTransitionStatus() {
+        return mModeTransitionStatus;
+    }
+
+    /** Returns consent and suspension without attempting root authorization. */
+    @Nullable
+    public RootRunScriptAuthorizationPolicy.Status getRootRunScriptPromptStatus() {
+        RootRunScriptAuthorizationPolicy policy = mRootRunScriptPromptPolicy;
+        return policy == null ? null : policy.status();
+    }
+
+    public void registerRootRunScriptPromptStatusListener(
+            OnRootRunScriptPromptStatusChangedListener listener
+    ) {
+        mRootRunScriptPromptStatusListeners.add(listener);
+        RootRunScriptAuthorizationPolicy.Status status = getRootRunScriptPromptStatus();
+        if (status != null) listener.onRootRunScriptPromptStatusChanged(status);
+    }
+
+    public void unregisterRootRunScriptPromptStatusListener(
+            OnRootRunScriptPromptStatusChangedListener listener
+    ) {
+        mRootRunScriptPromptStatusListeners.remove(listener);
+    }
+
+    private void notifyRootRunScriptPromptStatusChanged() {
+        if (mHandler == null) return;
+        mHandler.post(() -> {
+            RootRunScriptAuthorizationPolicy.Status status = getRootRunScriptPromptStatus();
+            if (status == null || mDestroying) return;
+            for (OnRootRunScriptPromptStatusChangedListener listener
+                    : new HashSet<>(mRootRunScriptPromptStatusListeners)) {
+                listener.onRootRunScriptPromptStatusChanged(status);
+            }
+        });
+    }
+
+    /** Changes consent on a worker. Resume only arms events received after this call succeeds. */
+    public void requestRootRunScriptPromptConsent(boolean enabled) {
+        RootRunScriptAuthorizationPolicy policy = mRootRunScriptPromptPolicy;
+        if (policy == null) return;
+        final long consentGeneration;
+        Thread scriptWorker = null;
+        synchronized (mRootScriptLifecycleLock) {
+            if (mDestroying) return;
+            if (enabled) {
+                if (mRootScriptOptOutPending
+                        || mRootScriptConsentMutationsInFlight.get() != 0
+                        || !isSuperuserModeCommitted()
+                        || isExecutionModeTransitionBusy()) return;
+            } else {
+                // OFF supersedes a queued or blocked opt-in. The old worker's generation and
+                // policy epoch then prevent its eventual write from restoring authorization.
+                if (mRootScriptOptOutPending) return;
+                mRootScriptOptOutPending = true;
+                ++mRootScriptConsentGeneration;
+                ++mRootScriptLifecycleEpoch;
+                policy.markOptOutPending();
+                scriptWorker = mRootRunScriptWorker;
+            }
+            consentGeneration = mRootScriptConsentGeneration;
+            mRootScriptConsentMutationsInFlight.incrementAndGet();
+        }
+        if (scriptWorker != null) scriptWorker.interrupt();
+        long generation = mLifecycleGeneration;
+        Thread worker = new Thread(() -> {
+            try {
+                // An accepted opt-out must commit even if this service is destroyed before the
+                // worker starts. Opt-in and Resume remain bound to the requesting lifecycle.
+                if (enabled && (mDestroying || generation != mLifecycleGeneration
+                        || consentGeneration != mRootScriptConsentGeneration)) return;
+                boolean persisted = enabled
+                        ? policy.armIf(() -> !mDestroying
+                                && generation == mLifecycleGeneration
+                                && consentGeneration == mRootScriptConsentGeneration
+                                && isSuperuserModeCommitted()
+                                && !isExecutionModeTransitionBusy())
+                        : policy.disable();
+                if (!persisted) logRootRunScriptFailure(
+                        "Root Run Script prompt consent could not be saved", null);
+            } finally {
+                mRootScriptConsentMutationsInFlight.decrementAndGet();
+                if (!enabled) mRootScriptOptOutPending = false;
+                notifyRootRunScriptPromptStatusChanged();
+            }
+        }, "root-script-consent");
+        worker.setDaemon(true);
+        try {
+            mRootScriptWorkerStarter.start(worker);
+        } catch (RuntimeException failure) {
+            mRootScriptConsentMutationsInFlight.decrementAndGet();
+            if (!enabled) {
+                policy.markOptOutSchedulingFailed();
+                mRootScriptOptOutPending = false;
+            }
+            logRootRunScriptFailure("Root Run Script consent worker could not start", failure);
+        }
+    }
+
+    public boolean isRootRunScriptPromptConsentMutationPending() {
+        return mRootScriptConsentMutationsInFlight.get() != 0;
+    }
+
+    /** Reports whether an accepted script still owns its worker and lifecycle admissions. */
+    public boolean isRootRunScriptOperationActive() {
+        return mRootRunScriptWorkerActive.get();
+    }
+
+    /** A typed immediate decision; accepted work retains both admission gates on its worker. */
+    public enum RootRunScriptDispatchDecision {
+        ACCEPTED, BUSY, OBSOLETE, UNAVAILABLE
+    }
+
+    /** Cancels only the admitted automatic root script when its owning core is stopping. */
+    public void cancelAdmittedRootRunScript() {
+        synchronized (mRootScriptLifecycleLock) {
+            mRootScriptShutdownClosed = true;
+            ++mRootScriptLifecycleEpoch;
+            RootRunScriptAuthorizationPolicy policy = mRootRunScriptPromptPolicy;
+            if (policy != null) policy.invalidate();
+            Thread worker = mRootRunScriptWorker;
+            if (worker != null && !mRootRunScriptExecuting) worker.interrupt();
+        }
+    }
+
+    private boolean rootScriptWorkerCurrent(long lifecycleGeneration, long scriptEpoch) {
+        synchronized (mRootScriptLifecycleLock) {
+            return !mDestroying && !mRootScriptShutdownClosed
+                    && mModeTransitionRequest == null
+                    && mExecutionModeTransitionReservation == null
+                    && !mShutdownInProgress
+                    && lifecycleGeneration == mLifecycleGeneration
+                    && scriptEpoch == mRootScriptLifecycleEpoch
+                    && isSuperuserModeCommitted() && mRuntime.isSuperuserModeSelected();
+        }
+    }
+
+    /**
+     * Accepts at most one root-script event without queueing. REST already reserved both gates;
+     * this service owns the authorization policy, worker lifetime, and cancellation generation.
+     */
+    public RootRunScriptDispatchDecision tryDispatchRootRunScript(
+            DefaultSyncthingRuntime.FolderScriptReservation reservation,
+            ConfiguredFolderReference folder,
+            FolderEvent event,
+            Runnable releaseAdmission
+    ) {
+        RootRunScriptAuthorizationPolicy policy = mRootRunScriptPromptPolicy;
+        if (policy == null) return RootRunScriptDispatchDecision.UNAVAILABLE;
+        final long lifecycleGeneration;
+        final long scriptEpoch;
+        synchronized (mRootScriptLifecycleLock) {
+            if (mDestroying || mRootScriptShutdownClosed || mModeTransitionRequest != null
+                    || mExecutionModeTransitionReservation != null || mShutdownInProgress
+                    || !isSuperuserModeCommitted() || !reservation.isSuperuserMode()
+                    || !mRuntime.isSuperuserModeSelected()) {
+                return RootRunScriptDispatchDecision.OBSOLETE;
+            }
+            if (!mRootRunScriptWorkerActive.compareAndSet(false, true)) {
+                return RootRunScriptDispatchDecision.BUSY;
+            }
+            if (policy.status().state() != RootRunScriptAuthorizationPolicy.State.ARMED) {
+                mRootRunScriptWorkerActive.set(false);
+                return RootRunScriptDispatchDecision.UNAVAILABLE;
+            }
+            lifecycleGeneration = mLifecycleGeneration;
+            scriptEpoch = mRootScriptLifecycleEpoch;
+        }
+        Thread worker = new Thread(() -> {
+            RootRunScriptAuthorizationPolicy.Attempt attempt = null;
+            RootRunScriptAuthorizationPolicy.Result result =
+                    RootRunScriptAuthorizationPolicy.Result.CANCELLED;
+            try {
+                if (!rootScriptWorkerCurrent(lifecycleGeneration, scriptEpoch)) return;
+                // A failed pre-commit transition may have cancelled a queued event without
+                // recording an attempt. Only that settled ARMED state can serve a future event.
+                policy.restoreUnattemptedConsent();
+                if (!rootScriptWorkerCurrent(lifecycleGeneration, scriptEpoch)) return;
+                attempt = policy.begin(reservation.generation());
+                notifyRootRunScriptPromptStatusChanged();
+                if (attempt == null) {
+                    return;
+                }
+                RootRunScriptAuthorizationPolicy.Attempt ownedAttempt = attempt;
+                RunScriptRootAuthorization authorization = new RunScriptRootAuthorization() {
+                    private boolean acquisitionStarted;
+
+                    @Override public boolean isCurrent() {
+                        return rootScriptWorkerCurrent(lifecycleGeneration, scriptEpoch)
+                                && policy.isCurrent(ownedAttempt, reservation.generation());
+                    }
+
+                    @Override public boolean tryBeginAuthorization() {
+                        synchronized (mRootScriptLifecycleLock) {
+                            if (acquisitionStarted || mDestroying || mRootScriptShutdownClosed
+                                    || mModeTransitionRequest != null
+                                    || mExecutionModeTransitionReservation != null
+                                    || mShutdownInProgress
+                                    || lifecycleGeneration != mLifecycleGeneration
+                                    || scriptEpoch != mRootScriptLifecycleEpoch
+                                    || !isSuperuserModeCommitted()
+                                    || !mRuntime.isSuperuserModeSelected()
+                                    || !policy.isCurrent(ownedAttempt,
+                                            reservation.generation())) return false;
+                            acquisitionStarted = true;
+                            return true;
+                        }
+                    }
+
+                    @Override public boolean tryBeginScriptExecution() {
+                        synchronized (mRootScriptLifecycleLock) {
+                            if (mRootRunScriptExecuting || !isCurrent()) return false;
+                            mRootRunScriptExecuting = true;
+                            return true;
+                        }
+                    }
+
+                    @Override public void onAuthorizationTimeout() {
+                        policy.suspendPending(ownedAttempt,
+                                RootRunScriptAuthorizationPolicy.Reason.TIMEOUT);
+                        notifyRootRunScriptPromptStatusChanged();
+                    }
+                };
+                if (!authorization.isCurrent()) return;
+                List<FolderScriptOutcome> outcomes = reservation.run(folder, event, authorization);
+                result = RootRunScriptAuthorizationPolicy.Result.SUCCESS;
+                for (FolderScriptOutcome outcome : outcomes) {
+                    if (!outcome.succeeded()) {
+                        result = RootRunScriptAuthorizationPolicy.Result.SCRIPT_FAILED;
+                        logRootRunScriptFailure("Root Run Script '" + outcome.scriptName()
+                                + "' exited with status " + outcome.exitStatus(), null);
+                    }
+                }
+            } catch (FolderOperationException failure) {
+                switch (failure.failure()) {
+                    case ROOT_SCRIPT_AUTH_DENIED:
+                        result = RootRunScriptAuthorizationPolicy.Result.DENIED; break;
+                    case ROOT_SCRIPT_AUTH_LOST:
+                        result = RootRunScriptAuthorizationPolicy.Result.LOST; break;
+                    case ROOT_SCRIPT_AUTH_TIMEOUT:
+                        result = RootRunScriptAuthorizationPolicy.Result.TIMEOUT; break;
+                    case ROOT_SCRIPT_AUTH_UNAVAILABLE:
+                        result = RootRunScriptAuthorizationPolicy.Result.UNAVAILABLE; break;
+                    case FOLDER_OPERATION_CANCELLED:
+                        result = RootRunScriptAuthorizationPolicy.Result.CANCELLED; break;
+                    default:
+                        result = RootRunScriptAuthorizationPolicy.Result.SCRIPT_FAILED;
+                }
+                logRootRunScriptFailure("Root Run Script failed: " + failure.failure(), failure);
+            } catch (RuntimeException failure) {
+                result = RootRunScriptAuthorizationPolicy.Result.UNAVAILABLE;
+                logRootRunScriptFailure("Root Run Script worker failed", failure);
+            } finally {
+                // A timeout observed elsewhere never releases these gates. The worker releases
+                // them only after the semantic backend call has actually returned.
+                if (attempt != null) policy.complete(attempt, result);
+                reservation.close();
+                releaseAdmission.run();
+                synchronized (mRootScriptLifecycleLock) {
+                    mRootRunScriptWorker = null;
+                    mRootRunScriptExecuting = false;
+                    mRootRunScriptWorkerActive.set(false);
+                }
+                notifyRootRunScriptPromptStatusChanged();
+            }
+        }, "root-run-script");
+        worker.setDaemon(true);
+        synchronized (mRootScriptLifecycleLock) {
+            if (!rootScriptWorkerCurrent(lifecycleGeneration, scriptEpoch)) {
+                mRootRunScriptWorkerActive.set(false);
+                return RootRunScriptDispatchDecision.OBSOLETE;
+            }
+            mRootRunScriptWorker = worker;
+            try {
+                mRootScriptWorkerStarter.start(worker);
+                return RootRunScriptDispatchDecision.ACCEPTED;
+            } catch (RuntimeException failure) {
+                mRootRunScriptWorker = null;
+                mRootRunScriptWorkerActive.set(false);
+                Log.w(TAG, "Root Run Script worker could not start", failure);
+                return RootRunScriptDispatchDecision.UNAVAILABLE;
+            }
+        }
+    }
+
+    /** Diagnostic logging must not replace the typed terminal result or skip gate release. */
+    private static void logRootRunScriptFailure(String message, @Nullable Throwable failure) {
+        try {
+            if (failure == null) Log.w(TAG, message);
+            else Log.w(TAG, message, failure);
+        } catch (RuntimeException loggingFailure) {
+            // Android's JVM test stubs can reject Log calls; lifecycle cleanup still must run.
+        }
+    }
+
+    /** Reports whether a mode request still owns admission or is preparing authorization. */
+    public boolean isExecutionModeTransitionBusy() {
+        return mModeTransitionRequest != null
+                || mExecutionModeTransitionReservation != null
+                || mRootStartupAuthorizationPending;
+    }
+
+    /** Returns whether Normal Mode startup is suppressed pending explicit Managed State repair. */
+    public boolean isStateAccessRepairRequired() {
+        return mStateAccessRepairRequired;
+    }
+
+    public boolean isInotifyWatchLimitEnabled() {
+        return mPreferences.getBoolean(Constants.PREF_INOTIFY_WATCH_LIMIT, false);
+    }
+
+    /** Applies or disables optional inotify reapplication; enabling explicitly may request root. */
+    public void requestInotifyWatchLimit(
+            boolean enabled,
+            OnInotifyWatchLimitResultListener listener
+    ) {
+        if (mHandler == null) {
+            listener.onComplete(isInotifyWatchLimitEnabled(), false,
+                    "The service is not ready to apply inotify tuning.");
+            return;
+        }
+        mHandler.post(() -> {
+            if (mModeTransitionRequest != null || mExecutionModeTransitionReservation != null
+                    || FileMutationBarrier.executionModeTransitionPending()) {
+                listener.onComplete(isInotifyWatchLimitEnabled(), false,
+                        "Inotify tuning is unavailable during an execution-mode transition.");
+                return;
+            }
+            Thread worker = new Thread(() -> {
+                String failure = null;
+                boolean succeeded = false;
+                try {
+                    if (enabled) {
+                        mRuntime.verifyRootAuthorization();
+                        TuningOutcome outcome = mRuntime.applyInotifyWatchLimit();
+                        succeeded = outcome.status() == TuningOutcome.Status.APPLIED;
+                        if (!succeeded) failure = outcome.detail();
+                    } else {
+                        succeeded = true;
+                    }
+                    if (succeeded && !mPreferences.edit()
+                            .putBoolean(Constants.PREF_INOTIFY_WATCH_LIMIT, enabled)
+                            .commit()) {
+                        succeeded = false;
+                        failure = "The inotify preference could not be saved.";
+                    }
+                } catch (RootTransportException error) {
+                    failure = error.failure().name();
+                } catch (IOException | RuntimeException error) {
+                    Log.e(TAG, "Inotify tuning request failed", error);
+                    failure = error.getMessage();
+                }
+                boolean result = succeeded;
+                String detail = failure == null
+                        ? (enabled ? "Inotify watch limit applied." : "Automatic reapplication disabled.")
+                        : failure;
+                if (!mHandler.post(() -> listener.onComplete(enabled, result, detail))) {
+                    Log.e(TAG, "Inotify tuning result could not return to the service thread");
+                }
+            }, "Explicit inotify watch-limit request");
+            worker.setDaemon(true);
+            try {
+                worker.start();
+            } catch (RuntimeException startFailure) {
+                Log.e(TAG, "Could not start inotify tuning worker", startFailure);
+                listener.onComplete(isInotifyWatchLimitEnabled(), false,
+                        "The inotify tuning worker could not start.");
+            }
+        });
+    }
+
+    /** Reapplies a saved tuning choice in the background without requesting new root access. */
+    private void reapplyInotifyLimitIfAuthorized() {
+        if (!mPreferences.getBoolean(Constants.PREF_INOTIFY_WATCH_LIMIT, false)) return;
+        Thread worker = new Thread(() -> {
+            TuningOutcome outcome = mRuntime.applyInotifyWatchLimitIfAuthorized();
+            Log.i(TAG, "Optional inotify reapplication: " + outcome.status() + " — "
+                    + outcome.detail());
+        }, "Optional inotify watch-limit reapplication");
+        worker.setDaemon(true);
+        try {
+            worker.start();
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Optional inotify reapplication could not be scheduled", error);
+        }
+    }
+
+    public void registerExecutionModeTransitionStatusListener(
+            OnExecutionModeTransitionStatusChangedListener listener
+    ) {
+        mModeTransitionStatusListeners.add(listener);
+        listener.onExecutionModeTransitionStatusChanged(mModeTransitionStatus);
+    }
+
+    public void unregisterExecutionModeTransitionStatusListener(
+            OnExecutionModeTransitionStatusChangedListener listener
+    ) {
+        mModeTransitionStatusListeners.remove(listener);
+    }
+
+    /** Requests a user-confirmed change of the device-local execution mode. */
+    public void requestExecutionModeTransition(boolean useRoot) {
+        postTransitionCallback(() -> beginModeTransition(
+                new ModeTransitionRequest(useRoot, ModeTransitionPurpose.CHANGE_MODE)
+        ));
+    }
+
+    /** Retries the transition, committed-mode reconciliation, state repair, or startup in status. */
+    public void retryExecutionModeTransition() {
+        postTransitionCallback(() -> {
+            if (mExecutionModeReconciliationRetryRequired
+                    && mModeTransitionRequest == null) {
+                mExecutionModeReconciliationRetryRequired = false;
+                mExecutionModeReconciliationPending = false;
+                reconcileRuntimeExecutionModeFromPreferences();
+                return;
+            }
+            ModeTransitionRequest current = mModeTransitionRequest;
+            if (current == null && durableExecutionMode() && runtimeExecutionMode()) {
+                retryRootSelectedStartupOnServiceThread();
+                return;
+            }
+            if (current != null && current.purpose == ModeTransitionPurpose.REPAIR_STATE
+                    && current.shutdownProven && current.gatesClosed) {
+                onModeTransitionStatusChanged(modeStatus(
+                        ExecutionModeTransitionStatus.Phase.PREPARING_ROOT,
+                        ExecutionModeTransitionStatus.FailureKind.NONE,
+                        null,
+                        null,
+                        "Retrying explicit Managed State repair.",
+                        current,
+                        false,
+                        false
+                ));
+                runRootAuthorizationPreflight(
+                        () -> repairManagedStateForTransition(current),
+                        failure -> onModeTransitionStatusChanged(modeStatus(
+                                ExecutionModeTransitionStatus.Phase.FAILED,
+                                ExecutionModeTransitionStatus.FailureKind.ROOT,
+                                failure,
+                                ManagedStateFailure.STATE_REPAIR_FAILED,
+                                "Root authorization failed. Retry repair explicitly.",
+                                current,
+                                true,
+                                false
+                        ))
+                );
+                return;
+            }
+            if (current != null && current.shutdownProven
+                    && current.purpose == ModeTransitionPurpose.CHANGE_MODE
+                    && !current.targetUseRoot
+                    && (mModeTransitionStatus.phase()
+                    == ExecutionModeTransitionStatus.Phase.WAITING_FOR_DISABLE_CONFIRMATION
+                    || mModeTransitionStatus.phase()
+                    == ExecutionModeTransitionStatus.Phase.FAILED)) {
+                retryManagedStateRepair(current);
+                return;
+            }
+            if (current != null && current.shutdownProven
+                    && durableExecutionMode()
+                    == current.targetUseRoot) {
+                finishCommittedModeTransition(current);
+                return;
+            }
+            boolean target = mModeTransitionStatus.requestedUseRoot();
+            if (mStateAccessRepairRequired && !target) {
+                beginModeTransition(new ModeTransitionRequest(
+                        false, ModeTransitionPurpose.REPAIR_STATE
+                ));
+            } else {
+                beginModeTransition(new ModeTransitionRequest(
+                        target, ModeTransitionPurpose.CHANGE_MODE
+                ));
+            }
+        });
+    }
+
+    /** Confirms the exceptional path that disables root mode without restoring app access. */
+    public void confirmDisableAnyway() {
+        postTransitionCallback(() -> {
+            ModeTransitionRequest request = mModeTransitionRequest;
+            if (request == null || request.purpose != ModeTransitionPurpose.CHANGE_MODE
+                    || !ExecutionModeTransitionPolicy.mayConfirmDisableAnyway(
+                    mModeTransitionStatus,
+                    true,
+                    request.targetUseRoot,
+                    request.shutdownProven,
+                    request.gatesClosed
+            )) {
+                return;
+            }
+            request.disableAnywayConfirmed = true;
+            persistTransitionMode(request, true);
+        });
+    }
+
+    /** Explicitly retries root repair while Normal Mode remains the committed selection. */
+    public void requestStateAccessRepair() {
+        postTransitionCallback(() -> {
+            if (!mStateAccessRepairRequired) {
+                ensureStartupStateAccessProbe();
+                return;
+            }
+            beginModeTransition(new ModeTransitionRequest(
+                    false, ModeTransitionPurpose.REPAIR_STATE
+            ));
+        });
+    }
+
+    /** Explicitly retries a root-selected startup after the old execution is safely stopped. */
+    public void retryRootSelectedStartup() {
+        postTransitionCallback(this::retryRootSelectedStartupOnServiceThread);
+    }
+
+    private void retryRootSelectedStartupOnServiceThread() {
+        if (!runtimeExecutionMode() || mModeTransitionRequest != null
+                || mExecutionModeTransitionReservation != null
+                || mRootStartupAuthorizationPending || mStartupConfigLoadPending
+                || mDestroying) {
+            return;
+        }
+        if (!mLastDeterminedShouldRun) {
+            if (mModeTransitionStatus.retryAvailable()
+                    && mModeTransitionStatus.requestedUseRoot()) {
+                onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                        mStateAccessRepairRequired
+                ));
+            }
+            return;
+        }
+        if (mCurrentState == State.STARTING || mCurrentState == State.ACTIVE) return;
+        mRootStartupAuthorizationAttempted = false;
+        mRootStartupAuthorizationComplete = false;
+        if (mCurrentState == State.ERROR) {
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.STOPPING,
+                    ExecutionModeTransitionStatus.FailureKind.NONE,
+                    null,
+                    null,
+                    "Proving the previous startup has stopped before retrying.",
+                    true,
+                    false,
+                    false,
+                    mStateAccessRepairRequired
+            ));
+            Runnable retryStartup = () -> beginRootSelectedStartup(
+                    SyncthingCommand.SERVE, true
+            );
+            ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+            if (seam == null) {
+                shutdown(State.DISABLED, retryStartup, true);
+            } else {
+                long lifecycleGeneration = mLifecycleGeneration;
+                seam.shutdown(safe -> postTransitionCallback(() -> {
+                    if (mDestroying || lifecycleGeneration != mLifecycleGeneration) return;
+                    mShutdownExitProven = safe;
+                    mShutdownSafetyEstablished = safe;
+                    if (!safe) {
+                        failRootStartup(
+                                ExecutionModeTransitionStatus.FailureKind.EXECUTION_UNRESOLVED,
+                                null,
+                                null,
+                                "The previous root startup could not be proven stopped. Retry after resolving the execution state."
+                        );
+                        return;
+                    }
+                    mLastExecutionExitProven = true;
+                    onServiceStateChange(State.DISABLED);
+                    retryStartup.run();
+                }));
+            }
+            return;
+        }
+        beginRootSelectedStartup(SyncthingCommand.SERVE, true);
+    }
+
+    private void beginModeTransition(ModeTransitionRequest request) {
+        if (mExecutionModeReconciliationPending) {
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Runtime reconciliation must finish before another mode transition.",
+                    request.targetUseRoot,
+                    true,
+                    false,
+                    mStateAccessRepairRequired
+            ));
+            return;
+        }
+        if (mModeTransitionRequest != null || mExecutionModeTransitionReservation != null
+                || mModeTransitionStatus.busy()) {
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Another lifecycle or execution-mode operation is still active.",
+                    request.targetUseRoot,
+                    true,
+                    false,
+                    mStateAccessRepairRequired
+            ));
+            return;
+        }
+        if (request.purpose == ModeTransitionPurpose.REPAIR_STATE
+                && (!mStateAccessRepairRequired || runtimeExecutionMode())) {
+            onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(false));
+            return;
+        }
+        if (request.purpose == ModeTransitionPurpose.CHANGE_MODE
+                && request.targetUseRoot == runtimeExecutionMode()
+                && !mStateAccessRepairRequired) {
+            onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(false));
+            return;
+        }
+
+        synchronized (mRootScriptLifecycleLock) {
+            // This is the transition's root-script cancellation point. A worker that has not
+            // claimed its helper boundary cannot initiate a new authorization afterward.
+            mModeTransitionRequest = request;
+            ++mRootScriptLifecycleEpoch;
+            RootRunScriptAuthorizationPolicy scriptPolicy = mRootRunScriptPromptPolicy;
+            if (scriptPolicy != null) scriptPolicy.invalidate();
+            Thread admittedScriptWorker = mRootRunScriptWorker;
+            if (admittedScriptWorker != null && !mRootRunScriptExecuting) {
+                admittedScriptWorker.interrupt();
+            }
+        }
+        if (request.targetUseRoot || request.purpose == ModeTransitionPurpose.REPAIR_STATE) {
+            onModeTransitionStatusChanged(modeStatus(
+                    ExecutionModeTransitionStatus.Phase.PREPARING_ROOT,
+                    ExecutionModeTransitionStatus.FailureKind.NONE,
+                    null,
+                    null,
+                    "Checking root authorization.",
+                    request,
+                    false,
+                    false
+            ));
+            runRootAuthorizationPreflight(
+                    () -> {
+                        if (mModeTransitionRequest != request || mDestroying) return;
+                        request.rootAuthorizationSucceeded = true;
+                        admitModeTransition(request);
+                    },
+                    failure -> failBeforeCommit(
+                            request,
+                            ExecutionModeTransitionStatus.FailureKind.ROOT,
+                            failure,
+                            null,
+                            "Root authorization was not confirmed. Normal Mode remains active."
+                    )
+            );
+        } else {
+            admitModeTransition(request);
+        }
+    }
+
+    private interface RootAuthorizationFailure {
+        void onFailure(RootFailure failure);
+    }
+
+    private void runRootAuthorizationPreflight(
+            Runnable onSuccess,
+            RootAuthorizationFailure onFailure
+    ) {
+        long lifecycleGeneration = mLifecycleGeneration;
+        boolean workerStarted = executeTransitionWorker("Execution Mode root authorization", () -> {
+            RootFailure failure = null;
+            try {
+                ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+                if (seam != null) failure = seam.authorizeRoot();
+                else mRuntime.verifyRootAuthorization();
+            } catch (RootTransportException rootFailure) {
+                failure = rootFailure.failure();
+            } catch (IOException | RuntimeException error) {
+                failure = RootFailure.ROOT_TRANSPORT_FAILED;
+                Log.e(TAG, "Root authorization preflight failed", error);
+            }
+            RootFailure result = failure;
+            if (!postTransitionCallback(() -> {
+                if (mDestroying || lifecycleGeneration != mLifecycleGeneration) return;
+                if (result == null) onSuccess.run();
+                else onFailure.onFailure(result);
+            })) {
+                Log.e(TAG, "Root authorization result could not return to the service thread");
+            }
+        });
+        if (!workerStarted) {
+            Log.e(TAG, "Could not start root authorization worker");
+            if (!mDestroying && lifecycleGeneration == mLifecycleGeneration) {
+                onFailure.onFailure(RootFailure.ROOT_TRANSPORT_FAILED);
+            }
+        }
+    }
+
+    private void admitModeTransition(ModeTransitionRequest request) {
+        if (mModeTransitionRequest != request) return;
+        if (mDestroying || mFileMutationBarrier != null || mCertificateMutationPending
+                || mCertificateStorageReservation != null
+                || FileMutationBarrier.certificateRestorePending()
+                || mCertificateRestoreDeferredStart.isPending()
+                || mPostMutationStartupGate.ownsStartup()
+                || mDatabaseResetOwnership.isReserved() || mShutdownInProgress
+                || mStartingShutdownDeferral.isPending()) {
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Another lifecycle owner prevents an atomic mode transition."
+            );
+            return;
+        }
+        FileMutationBarrier.ExecutionModeTransitionReservation reservation =
+                FileMutationBarrier.tryReserveExecutionModeTransition();
+        if (reservation == null) {
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Certificate recovery or another mode transition owns admission."
+            );
+            return;
+        }
+        mExecutionModeTransitionReservation = reservation;
+        request.transitionRestApi = mRestApi;
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.QUIESCING,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Waiting for admitted backend work and Run Scripts to finish.",
+                request,
+                false,
+                false
+        ));
+        beginTransitionBackgroundOperation(request);
+        boolean workerStarted = executeTransitionWorker("Execution Mode admission drain", () -> {
+            boolean scriptsDrained = false;
+            boolean backendDrained = false;
+            try {
+                RestApi api = request.transitionRestApi;
+                ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+                scriptsDrained = seam != null
+                        ? seam.closeScriptAdmission(2_000)
+                        : api == null || api.closeFolderScriptAdmissionForModeTransition(2_000);
+                backendDrained = closeBackendOperationAdmission(5_000);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "Execution Mode admission drain was interrupted", interrupted);
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Execution Mode admission drain failed", error);
+            }
+            boolean scriptsReady = scriptsDrained;
+            boolean backendReady = backendDrained;
+            finishTransitionBackgroundOperation(request);
+            if (!postTransitionCallback(() -> onModeTransitionAdmissionsDrained(
+                    request, scriptsReady, backendReady
+            ))) {
+                if (!mDestroying) {
+                    reopenBackendOperationAdmissionWhenDrained();
+                    RestApi api = request.transitionRestApi;
+                    if (api != null) api.reopenFolderScriptAdmissionAfterModeTransitionFailure();
+                    reservation.release();
+                    mExecutionModeTransitionReservation = null;
+                }
+            }
+        });
+        if (!workerStarted) {
+            finishTransitionBackgroundOperation(request);
+            Log.e(TAG, "Could not start Execution Mode admission drain");
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "The transition could not safely wait for admitted work."
+            );
+        }
+    }
+
+    private void onModeTransitionAdmissionsDrained(
+            ModeTransitionRequest request,
+            boolean scriptsDrained,
+            boolean backendDrained
+    ) {
+        if (mModeTransitionRequest != request) return;
+        if (!scriptsDrained || !backendDrained) {
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.BUSY,
+                    null,
+                    null,
+                    "Admitted work did not reach a safe terminal result before the transition deadline."
+            );
+            return;
+        }
+        request.gatesClosed = true;
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.STOPPING,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Stopping and verifying the currently owned Syncthing execution.",
+                request,
+                false,
+                false
+        ));
+        request.shutdownStarted = true;
+        shutdownForModeTransition(request);
+    }
+
+    private void shutdownForModeTransition(ModeTransitionRequest request) {
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam == null) {
+            shutdown(
+                    State.DISABLED,
+                    () -> onModeTransitionShutdownProven(request),
+                    true,
+                    false,
+                    () -> onModeTransitionShutdownFailed(request)
+            );
+            return;
+        }
+        seam.shutdown(safe -> {
+            mShutdownExitProven = safe;
+            mShutdownSafetyEstablished = safe;
+            if (safe) {
+                onServiceStateChange(State.DISABLED);
+                onModeTransitionShutdownProven(request);
+            }
+            else onModeTransitionShutdownFailed(request);
+        });
+    }
+
+    private void onModeTransitionShutdownProven(ModeTransitionRequest request) {
+        if (mModeTransitionRequest != request) return;
+        request.shutdownProven = mShutdownExitProven && mShutdownSafetyEstablished;
+        if (!request.shutdownProven) {
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.EXECUTION_UNRESOLVED,
+                    null,
+                    null,
+                    "Shutdown did not prove a safe terminal execution result."
+            );
+            return;
+        }
+        if (request.purpose == ModeTransitionPurpose.REPAIR_STATE
+                || !request.targetUseRoot && !request.disableAnywayConfirmed) {
+            // Disabling Superuser Mode is an explicit user request. The bounded repair worker
+            // acquires its own operation-scoped shell, so a separate root preflight cannot race
+            // authorization revocation or trigger a second prompt.
+            repairManagedStateForTransition(request, true);
+        } else {
+            persistTransitionMode(request, request.disableAnywayConfirmed);
+        }
+    }
+
+    private void repairManagedStateForTransition(ModeTransitionRequest request) {
+        repairManagedStateForTransition(
+                request,
+                request.purpose == ModeTransitionPurpose.REPAIR_STATE
+        );
+    }
+
+    private void repairManagedStateForTransition(
+            ModeTransitionRequest request,
+            boolean allowExplicitAuthorization
+    ) {
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.REPAIRING_STATE,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Restoring application access to the Managed State files.",
+                request,
+                false,
+                false
+        ));
+        beginTransitionBackgroundOperation(request);
+        boolean workerStarted = executeTransitionWorker("Managed State mode repair", () -> {
+            ManagedStateException failure = null;
+            ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+            if (seam != null) {
+                failure = seam.repairState(allowExplicitAuthorization);
+                if (failure == null && !seam.applicationStateAccessible()) {
+                    failure = new ManagedStateException(
+                            ManagedStateFailure.STATE_REPAIR_FAILED,
+                            "Managed State access verification failed after repair"
+                    );
+                }
+            } else {
+                try {
+                    if (allowExplicitAuthorization) {
+                        mRuntime.repairManagedStateAccessDuringModeTransition();
+                    } else {
+                        if (!mRuntime.isRootAuthorizationAvailableWithoutPrompt()) {
+                            throw new ManagedStateException(
+                                    ManagedStateFailure.STATE_REPAIR_FAILED,
+                                    "Previously authorized root access is unavailable for automatic mode-disable repair",
+                                    new RootTransportException(
+                                            RootFailure.ROOT_UNAVAILABLE,
+                                            "Disable repair does not trigger a new root authorization prompt"
+                                    )
+                            );
+                        }
+                        mRuntime.repairManagedStateAccessDuringModeTransitionIfAuthorized();
+                    }
+                    if (!mRuntime.isAppUidManagedStateAccessible()) {
+                        throw new ManagedStateException(
+                                ManagedStateFailure.STATE_REPAIR_FAILED,
+                                "Managed State access verification failed after repair"
+                        );
+                    }
+                } catch (ManagedStateException error) {
+                    failure = error;
+                } catch (RuntimeException error) {
+                    failure = new ManagedStateException(
+                            ManagedStateFailure.STATE_REPAIR_FAILED,
+                            "Managed State repair failed",
+                            error
+                    );
+                }
+            }
+            ManagedStateException result = failure;
+            finishTransitionBackgroundOperation(request);
+            if (!postTransitionCallback(() -> onManagedStateRepairFinished(request, result))) {
+                Log.e(TAG, "Managed State repair result could not return to the service thread");
+            }
+        });
+        if (!workerStarted) {
+            finishTransitionBackgroundOperation(request);
+            Log.e(TAG, "Could not start Managed State repair worker");
+            onManagedStateRepairFinished(request, new ManagedStateException(
+                    ManagedStateFailure.STATE_REPAIR_FAILED,
+                    "Managed State repair worker could not start"
+            ));
+        }
+    }
+
+    private void onManagedStateRepairFinished(
+            ModeTransitionRequest request,
+            @Nullable ManagedStateException failure
+    ) {
+        if (mModeTransitionRequest != request) return;
+        if (failure != null) {
+            boolean disableRequest = request.purpose == ModeTransitionPurpose.CHANGE_MODE
+                    && !request.targetUseRoot;
+            RootFailure rootFailure = rootFailureFrom(failure);
+            boolean disableAnywayAvailable = disableRequest
+                    && ExecutionModeTransitionPolicy.mayOfferDisableAnyway(
+                            failure.failure(), rootFailure
+                    );
+            if (disableAnywayAvailable) {
+                onModeTransitionStatusChanged(modeStatus(
+                        ExecutionModeTransitionStatus.Phase.WAITING_FOR_DISABLE_CONFIRMATION,
+                        ExecutionModeTransitionStatus.FailureKind.STATE_REPAIR_UNAVAILABLE,
+                        rootFailure,
+                        failure.failure(),
+                        "Root authorization is unavailable for Managed State repair. Retry or confirm Disable anyway.",
+                        request,
+                        true,
+                        true
+                ));
+            } else {
+                if (!disableRequest) mStateAccessRepairRequired = true;
+                onModeTransitionStatusChanged(modeStatus(
+                        ExecutionModeTransitionStatus.Phase.FAILED,
+                        rootFailure == null
+                                ? ExecutionModeTransitionStatus.FailureKind.STATE_REPAIR_UNAVAILABLE
+                                : ExecutionModeTransitionStatus.FailureKind.ROOT,
+                        rootFailure,
+                        failure.failure(),
+                        disableRequest
+                                ? "Managed State repair failed. Retry repair; Disable anyway is unavailable for this failure."
+                                : "Managed State repair failed. Normal Mode remains suppressed.",
+                        request,
+                        true,
+                        false
+                ));
+                if (!disableRequest) releaseTransitionAdmissionAfterFailure(request, true);
+            }
+            return;
+        }
+        request.stateRepairSucceeded = true;
+        if (request.purpose == ModeTransitionPurpose.REPAIR_STATE) {
+            mStateAccessRepairRequired = false;
+            mStartupStateAccessProbeComplete = true;
+            finishSuccessfulModeTransition(request, true);
+        } else {
+            persistTransitionMode(request, false);
+        }
+    }
+
+    private void retryManagedStateRepair(ModeTransitionRequest request) {
+        if (mModeTransitionRequest != request || !request.shutdownProven
+                || !request.gatesClosed) return;
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.PREPARING_ROOT,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Retrying root authorization for Managed State repair.",
+                request,
+                false,
+                false
+        ));
+        // The explicit Retry owns the authorization prompt and the repair in one bounded
+        // operation. A separate preflight followed by a second `su` launch could lose the
+        // just-authorized capability between those requests.
+        repairManagedStateForTransition(request, true);
+    }
+
+    private void persistTransitionMode(ModeTransitionRequest request, boolean disableAnyway) {
+        if (mDestroying || mModeTransitionRequest != request) return;
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.COMMITTING,
+                ExecutionModeTransitionStatus.FailureKind.NONE,
+                null,
+                null,
+                "Persisting the selected execution mode.",
+                request,
+                false,
+                false
+        ));
+        long lifecycleGeneration = mLifecycleGeneration;
+        beginTransitionBackgroundOperation(request);
+        boolean workerStarted = executeTransitionWorker("Execution Mode preference commit", () -> {
+            boolean commitAdmitted;
+            synchronized (request) {
+                commitAdmitted = !request.cancelled && !mDestroying
+                        && lifecycleGeneration == mLifecycleGeneration
+                        && mModeTransitionRequest == request;
+                if (commitAdmitted) request.commitStarted = true;
+            }
+            boolean committed = false;
+            if (commitAdmitted) {
+                try {
+                    // Device-local consent must be durably off before Normal Mode is committed.
+                    // A mode commit failure can leave root selected with prompts off, which is safe.
+                    RootRunScriptAuthorizationPolicy scriptPolicy = mRootRunScriptPromptPolicy;
+                    boolean scriptConsentCleared = request.targetUseRoot
+                            || (scriptPolicy != null
+                                    ? scriptPolicy.disable()
+                                    : mExecutionModeTransitionTestSeam != null);
+                    ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+                    committed = scriptConsentCleared && (seam != null
+                            ? seam.commitMode(request.targetUseRoot)
+                            : ExecutionModePreferenceCommit.commit(
+                                    mPreferences, request.targetUseRoot
+                            ));
+                    if (scriptConsentCleared && !request.targetUseRoot) {
+                        notifyRootRunScriptPromptStatusChanged();
+                    }
+                } catch (RuntimeException error) {
+                    Log.e(TAG, "Execution Mode preference commit failed", error);
+                }
+            }
+            boolean result = committed;
+            finishTransitionBackgroundOperation(request);
+            if (!postTransitionCallback(() -> {
+                if (mDestroying || lifecycleGeneration != mLifecycleGeneration
+                        || mModeTransitionRequest != request) return;
+                if (!result) {
+                    failBeforeCommit(
+                            request,
+                            ExecutionModeTransitionStatus.FailureKind.PREFERENCE_PERSISTENCE,
+                            null,
+                            null,
+                            "Execution Mode could not be durably saved; the backend was not switched."
+                    );
+                    return;
+                }
+                if (disableAnyway) {
+                    mStateAccessRepairRequired = true;
+                } else if (request.stateRepairSucceeded) {
+                    mStateAccessRepairRequired = false;
+                }
+                finishCommittedModeTransition(request);
+            })) {
+                Log.e(TAG, "Execution Mode preference result could not return to the service thread");
+            }
+        });
+        if (!workerStarted) {
+            finishTransitionBackgroundOperation(request);
+            Log.e(TAG, "Could not start Execution Mode preference worker");
+            failBeforeCommit(
+                    request,
+                    ExecutionModeTransitionStatus.FailureKind.PREFERENCE_PERSISTENCE,
+                    null,
+                    null,
+                    "Execution Mode could not be durably saved; the backend was not switched."
+            );
+        }
+    }
+
+    private void finishCommittedModeTransition(ModeTransitionRequest request) {
+        if (mModeTransitionRequest != request || !request.shutdownProven || !request.gatesClosed) {
+            return;
+        }
+        boolean useRoot = durableExecutionMode();
+        if (useRoot != request.targetUseRoot) {
+            onModeTransitionStatusChanged(modeStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.PREFERENCE_PERSISTENCE,
+                    null,
+                    null,
+                    "The durable execution mode does not match the completed request.",
+                    request,
+                    true,
+                    false
+            ));
+            return;
+        }
+        try {
+            selectRuntimeExecutionMode(useRoot);
+        } catch (RuntimeException error) {
+            if (mExecutionModeTransitionTestSeam == null) {
+                Log.e(TAG, "Committed mode could not be selected in the runtime", error);
+            }
+            onModeTransitionStatusChanged(modeStatus(
+                    ExecutionModeTransitionStatus.Phase.FAILED,
+                    ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                    null,
+                    null,
+                    "The committed backend could not be selected. Retry the transition.",
+                    request,
+                    true,
+                    false
+            ));
+            return;
+        }
+        invalidateStartupStateAccessProbe();
+        if (!useRoot && request.stateRepairSucceeded) {
+            mStartupStateAccessProbeComplete = true;
+            mStateAccessRepairRequired = false;
+        }
+        mRootStartupAuthorizationComplete = useRoot && request.rootAuthorizationSucceeded;
+        if (useRoot) {
+            mRootStartupAuthorizationAttempted = true;
+            mRootStartupStatusPending = mLastDeterminedShouldRun;
+        }
+        finishSuccessfulModeTransition(request, true);
+    }
+
+    private void finishSuccessfulModeTransition(
+            ModeTransitionRequest request,
+            boolean launchIfRequired
+    ) {
+        if (mModeTransitionRequest != request) return;
+        boolean rootMode = runtimeExecutionMode();
+        if (rootMode || (request.stateRepairSucceeded && !mStateAccessRepairRequired)) {
+            openBackendOperationAdmission();
+        }
+        releaseModeTransitionReservation();
+        mModeTransitionRequest = null;
+        if (mRootStartupStatusPending) {
+            onModeTransitionStatusChanged(new ExecutionModeTransitionStatus(
+                    ExecutionModeTransitionStatus.Phase.PREPARING_ROOT,
+                    ExecutionModeTransitionStatus.FailureKind.NONE,
+                    null,
+                    null,
+                    "Root authorization succeeded; waiting for the selected backend to become ready.",
+                    true,
+                    false,
+                    false,
+                    mStateAccessRepairRequired
+            ));
+        } else {
+            onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                    mStateAccessRepairRequired
+            ));
+        }
+        if (!rootMode && !request.stateRepairSucceeded) {
+            ensureStartupStateAccessProbe();
+        }
+        if (launchIfRequired && (rootMode || !mStateAccessRepairRequired)
+                && !mStartupStateAccessProbePending && mLastDeterminedShouldRun
+                && mCurrentState == State.DISABLED) {
+            launchModeTransitionStartup(SyncthingCommand.SERVE);
+        }
+    }
+
+    private void onModeTransitionShutdownFailed(ModeTransitionRequest request) {
+        if (mModeTransitionRequest != request) return;
+        failBeforeCommit(
+                request,
+                ExecutionModeTransitionStatus.FailureKind.EXECUTION_UNRESOLVED,
+                null,
+                null,
+                "The existing Syncthing execution could not be proven stopped; the mode was not changed."
+        );
+    }
+
+    private void failBeforeCommit(
+            ModeTransitionRequest request,
+            ExecutionModeTransitionStatus.FailureKind failureKind,
+            @Nullable RootFailure rootFailure,
+            @Nullable ManagedStateFailure managedStateFailure,
+            String detail
+    ) {
+        if (mModeTransitionRequest != request) return;
+        onModeTransitionStatusChanged(modeStatus(
+                ExecutionModeTransitionStatus.Phase.FAILED,
+                failureKind,
+                rootFailure,
+                managedStateFailure,
+                detail,
+                request,
+                true,
+                false
+        ));
+        releaseTransitionAdmissionAfterFailure(request, true);
+    }
+
+    private void releaseTransitionAdmissionAfterFailure(
+            ModeTransitionRequest request,
+        boolean clearRequest
+    ) {
+        if (mExecutionModeTransitionReservation != null) {
+            if (!mStateAccessRepairRequired || runtimeExecutionMode()) {
+                reopenBackendOperationAdmissionWhenDrained();
+            }
+            RestApi api = request.transitionRestApi;
+            if (api != null) api.reopenFolderScriptAdmissionAfterModeTransitionFailure();
+            releaseModeTransitionReservation();
+        }
+        if (clearRequest && mModeTransitionRequest == request) {
+            mModeTransitionRequest = null;
+        }
+        if (clearRequest && !mStateAccessRepairRequired && mLastDeterminedShouldRun
+                && mCurrentState == State.DISABLED && !mShutdownInProgress) {
+            Runnable retryStartup = () -> {
+                if (mModeTransitionRequest == null
+                        && mExecutionModeTransitionReservation == null) {
+                    launchModeTransitionStartup(SyncthingCommand.SERVE);
+                }
+            };
+            ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+            if (seam != null) seam.post(retryStartup);
+            else if (mHandler != null) mHandler.postDelayed(retryStartup, 0);
+        }
+    }
+
+    private void releaseModeTransitionReservation() {
+        FileMutationBarrier.ExecutionModeTransitionReservation reservation =
+                mExecutionModeTransitionReservation;
+        mExecutionModeTransitionReservation = null;
+        if (reservation != null) reservation.release();
+    }
+
+    private static void beginTransitionBackgroundOperation(ModeTransitionRequest request) {
+        synchronized (request) {
+            request.backgroundOperationsInFlight++;
+        }
+    }
+
+    private void finishTransitionBackgroundOperation(ModeTransitionRequest request) {
+        synchronized (request) {
+            if (request.backgroundOperationsInFlight > 0) {
+                request.backgroundOperationsInFlight--;
+            }
+        }
+        if (mDestroying) maybeReleaseDestroyedTransitionReservation(request);
+    }
+
+    /** Retains process-wide launch admission until destroyed transition work and shutdown settle. */
+    private void maybeReleaseDestroyedTransitionReservation(
+            @Nullable ModeTransitionRequest request
+    ) {
+        if (!mDestroying) return;
+        boolean workSettled;
+        if (request == null) {
+            workSettled = mRuntimeReconciliationShutdownSafe
+                    && !mRuntimeReconciliationInFlight;
+        } else {
+            synchronized (request) {
+                workSettled = request.destructionShutdownSafe
+                        && request.backgroundOperationsInFlight == 0;
+            }
+        }
+        if (!workSettled) return;
+        synchronized (mExecutionModeReconciliationLock) {
+            if (!mDestroying) return;
+            releaseModeTransitionReservation();
+        }
+    }
+
+    private ExecutionModeTransitionStatus modeStatus(
+            ExecutionModeTransitionStatus.Phase phase,
+            ExecutionModeTransitionStatus.FailureKind failureKind,
+            @Nullable RootFailure rootFailure,
+            @Nullable ManagedStateFailure managedStateFailure,
+            @Nullable String detail,
+            ModeTransitionRequest request,
+            boolean retryAvailable,
+            boolean disableAnywayAvailable
+    ) {
+        return new ExecutionModeTransitionStatus(
+                phase,
+                failureKind,
+                rootFailure,
+                managedStateFailure,
+                detail,
+                request.targetUseRoot,
+                retryAvailable,
+                disableAnywayAvailable,
+                mStateAccessRepairRequired
+        );
+    }
+
+    private void onModeTransitionStatusChanged(ExecutionModeTransitionStatus status) {
+        mModeTransitionStatus = status;
+        for (OnExecutionModeTransitionStatusChangedListener listener
+                : new HashSet<>(mModeTransitionStatusListeners)) {
+            listener.onExecutionModeTransitionStatusChanged(status);
+        }
+    }
+
+    @Nullable
+    private static RootFailure rootFailureFrom(ManagedStateException exception) {
+        Throwable cause = exception.getCause();
+        while (cause != null) {
+            if (cause instanceof RootTransportException) {
+                return ((RootTransportException) cause).failure();
+            }
+            cause = cause.getCause();
+        }
+        return null;
+    }
+
+    private void ensureStartupStateAccessProbe() {
+        if (durableExecutionMode()) {
+            mStartupStateAccessProbePending = false;
+            return;
+        }
+        if (mStartupStateAccessProbeComplete || mStartupStateAccessProbePending) return;
+        ExecutionModeTransitionTestSeam seam = mExecutionModeTransitionTestSeam;
+        if (seam != null) {
+            // The test seam supplies the same app-access verdict consumed by the production
+            // worker, so integrated transition tests still exercise this launch gate.
+            mStartupStateAccessProbeComplete = true;
+            mStateAccessRepairRequired = !seam.applicationStateAccessible();
+            return;
+        }
+        if (mHandler == null) return;
+        mStartupStateAccessProbePending = true;
+        long probeGeneration = ++mStartupStateAccessProbeGeneration;
+        long lifecycleGeneration = mLifecycleGeneration;
+        try {
+            if (!mRuntime.closeBackendOperationAdmission(0)) {
+                mRuntime.whenBackendOperationAdmissionDrained(() -> postTransitionCallback(() -> {
+                    if (isCurrentStartupStateAccessProbe(
+                            probeGeneration, lifecycleGeneration
+                    )) {
+                        startStartupStateAccessProbe(probeGeneration, lifecycleGeneration);
+                    }
+                }));
+                return;
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            mStartupStateAccessProbePending = false;
+            return;
+        }
+        startStartupStateAccessProbe(probeGeneration, lifecycleGeneration);
+    }
+
+    /** Invalidates an asynchronous probe whose result belongs to an earlier backend selection. */
+    private void invalidateStartupStateAccessProbe() {
+        mStartupStateAccessProbeGeneration++;
+        mStartupStateAccessProbePending = false;
+        mStartupStateAccessProbeComplete = false;
+    }
+
+    private boolean isCurrentStartupStateAccessProbe(
+            long probeGeneration,
+            long lifecycleGeneration
+    ) {
+        return !mDestroying
+                && lifecycleGeneration == mLifecycleGeneration
+                && probeGeneration == mStartupStateAccessProbeGeneration
+                && mStartupStateAccessProbePending
+                && !durableExecutionMode()
+                && !runtimeExecutionMode();
+    }
+
+    private void startStartupStateAccessProbe(
+            long probeGeneration,
+            long lifecycleGeneration
+    ) {
+        Thread worker = new Thread(() -> {
+            boolean accessible;
+            try {
+                accessible = mRuntime.isAppUidManagedStateAccessible();
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Could not inspect application access to Managed State", error);
+                accessible = false;
+            }
+            boolean installationMarkerPresent = mPreferences.getBoolean(
+                    Constants.PREF_INSTALLATION_MARKER, false
+            );
+            boolean configurationExists = Constants.getConfigFile(this).exists();
+            boolean stateRepairRequired = InstallationRecognition.shouldRequireStateRepair(
+                    accessible,
+                    installationMarkerPresent,
+                    false,
+                    configurationExists
+            );
+            if (!postTransitionCallback(() -> {
+                if (!isCurrentStartupStateAccessProbe(
+                        probeGeneration, lifecycleGeneration
+                )) return;
+                mStartupStateAccessProbePending = false;
+                mStartupStateAccessProbeComplete = true;
+                mStateAccessRepairRequired = stateRepairRequired;
+                if (!mStateAccessRepairRequired) {
+                    try {
+                        openBackendOperationAdmission();
+                    } catch (RuntimeException failure) {
+                        Log.e(TAG, "Verified Managed State access could not reopen admission",
+                                failure);
+                        mStateAccessRepairRequired = true;
+                    }
+                }
+                onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                        mStateAccessRepairRequired
+                ));
+                if (mStateAccessRepairRequired) {
+                    Log.e(TAG, "Normal Mode startup is suppressed until Managed State is repaired");
+                } else if (mLastDeterminedShouldRun
+                        && mCurrentState == State.DISABLED
+                        && mExecutionModeTransitionReservation == null) {
+                    launchStartupTask(SyncthingCommand.SERVE);
+                }
+            })) {
+                Log.e(TAG, "Managed State accessibility result could not return to the service thread");
+            }
+        }, "Managed State app access probe");
+        worker.setDaemon(true);
+        try {
+            worker.start();
+        } catch (RuntimeException error) {
+            if (!isCurrentStartupStateAccessProbe(probeGeneration, lifecycleGeneration)) return;
+            boolean stateRepairRequired = InstallationRecognition.shouldRequireStateRepair(
+                    false,
+                    mPreferences.getBoolean(Constants.PREF_INSTALLATION_MARKER, false),
+                    false,
+                    Constants.getConfigFile(this).exists()
+            );
+            mStartupStateAccessProbePending = false;
+            mStartupStateAccessProbeComplete = true;
+            mStateAccessRepairRequired = stateRepairRequired;
+            if (!stateRepairRequired) openBackendOperationAdmission();
+            Log.e(TAG, "Could not start Managed State accessibility probe", error);
+            onModeTransitionStatusChanged(
+                    ExecutionModeTransitionStatus.idle(mStateAccessRepairRequired)
+            );
+        }
+    }
+
     public @Nullable
     RestApi getApi() {
         return mRestApi;
@@ -2397,13 +4801,42 @@ public class SyncthingService extends Service {
      */
     private void onServiceStateChange(State newState) {
         if (newState == mCurrentState) {
-            Log.d(TAG, "onServiceStateChange: Called with unchanged state " + newState);
+            if (mExecutionModeTransitionTestSeam == null) {
+                Log.d(TAG, "onServiceStateChange: Called with unchanged state " + newState);
+            }
             return;
         }
-        Log.i(TAG, "onServiceStateChange: from " + mCurrentState + " to " + newState);
+        if (mExecutionModeTransitionTestSeam == null) {
+            Log.i(TAG, "onServiceStateChange: from " + mCurrentState + " to " + newState);
+        }
+        State previousState = mCurrentState;
         mCurrentState = newState;
-        mHandler.post(() -> {
-            mNotificationHandler.updatePersistentNotification(this);
+        if (mRootStartupStatusPending && newState == State.ACTIVE) {
+            mRootStartupStatusPending = false;
+            onModeTransitionStatusChanged(ExecutionModeTransitionStatus.idle(
+                    mStateAccessRepairRequired
+            ));
+        } else if (mRootStartupStatusPending && newState == State.ERROR) {
+            failRootStartup(
+                    ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                    null,
+                    null,
+                    "The root-selected Syncthing startup failed. Retry is available."
+            );
+        } else if (mRootStartupStatusPending && previousState == State.STARTING
+                && newState == State.DISABLED) {
+            failRootStartup(
+                    ExecutionModeTransitionStatus.FailureKind.STARTUP,
+                    null,
+                    null,
+                    "The root-selected Syncthing startup stopped before it became ready. Retry is available."
+            );
+        }
+        if (mExecutionModeTransitionTestSeam != null) return;
+        postTransitionCallback(() -> {
+            if (mNotificationHandler != null) {
+                mNotificationHandler.updatePersistentNotification(this);
+            }
             Iterator<OnServiceStateChangeListener> it = mOnServiceStateChangeListeners.iterator();
             while (it.hasNext()) {
                 OnServiceStateChangeListener listener = it.next();
@@ -2467,7 +4900,7 @@ public class SyncthingService extends Service {
                 try (ObjectOutputStream preferences = new ObjectOutputStream(
                         new FileOutputStream(sharedPreferencesFile)
                 )) {
-                    preferences.writeObject(mPreferences.getAll());
+                    preferences.writeObject(preferencesForBackup(mPreferences.getAll()));
                 }
                 String password = mPreferences.getString(
                         Constants.PREF_BACKUP_PASSWORD, ""
@@ -2482,6 +4915,13 @@ public class SyncthingService extends Service {
         } finally {
             finishFileMutation(null, true);
         }
+    }
+
+    /** Builds a backup preference snapshot without this device's automatic root-prompt consent. */
+    static Map<String, ?> preferencesForBackup(Map<String, ?> current) {
+        Map<String, ?> exported = new LinkedHashMap<>(current);
+        exported.remove(Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY);
+        return exported;
     }
 
     /**
@@ -2534,8 +4974,15 @@ public class SyncthingService extends Service {
         boolean useRootPresent = mPreferences.contains(Constants.PREF_USE_ROOT);
         Object localUseRootValue = mPreferences.getAll().get(Constants.PREF_USE_ROOT);
         try {
+            RootRunScriptAuthorizationPolicy scriptPolicy = mRootRunScriptPromptPolicy;
+            if (scriptPolicy != null && !scriptPolicy.disable()) {
+                Log.e(TAG, "importConfig: Could not clear automatic root-script consent");
+                failSuccess = false;
+                return false;
+            }
             try {
                 mRuntime.managedStateTransfer().installImportedState(staging);
+                ConfigurationProjection.clear();
             } catch (Exception e) {
                 Log.e(TAG, "importConfig: Failed to install staged Managed State", e);
                 failSuccess = false;
@@ -2547,6 +4994,11 @@ public class SyncthingService extends Service {
                 failSuccess = importConfigSharedPrefs(
                         importedSharedPreferences, useRootPresent, localUseRootValue
                 );
+            } else if (!mPreferences.edit()
+                    .putBoolean(Constants.PREF_INSTALLATION_MARKER, true)
+                    .commit()) {
+                Log.e(TAG, "importConfig: Could not record installation lineage");
+                failSuccess = false;
             }
 
             try {
@@ -3328,9 +5780,14 @@ public class SyncthingService extends Service {
     ) {
         boolean failSuccess = true;
         try {
+            RootRunScriptAuthorizationPolicy scriptPolicy = mRootRunScriptPromptPolicy;
+            if (scriptPolicy != null) scriptPolicy.invalidate();
             // Store backup folder to restore it back later in the process.
             String relPathToZip = mPreferences.getString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, "");
             String backupPassword = mPreferences.getString(Constants.PREF_BACKUP_PASSWORD, "");
+            boolean localInotifyWatchLimit = mPreferences.getBoolean(
+                    Constants.PREF_INOTIFY_WATCH_LIMIT, false
+            );
 
             // Prepare a SharedPreferences commit only after the complete archive value is valid.
             SharedPreferences.Editor editor = mPreferences.edit();
@@ -3389,14 +5846,20 @@ public class SyncthingService extends Service {
             editor.putString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, relPathToZip);
             editor.putString(Constants.PREF_BACKUP_PASSWORD, backupPassword);
 
-            if (!restoreLocalExecutionModePreference(
-                    editor, useRootPresent, localUseRootValue
+            if (!restoreLocalDevicePreferences(
+                    editor, useRootPresent, localUseRootValue, localInotifyWatchLimit
             )) {
-                Log.e(TAG, "importConfig: Could not preserve the local execution mode preference");
+                Log.e(TAG, "importConfig: Could not preserve device-local preferences");
                 failSuccess = false;
             }
 
-            if (failSuccess) failSuccess = editor.commit();
+            if (failSuccess) {
+                failSuccess = editor.commit();
+                if (failSuccess && scriptPolicy != null) {
+                    scriptPolicy.observeImportedReset();
+                    notifyRootRunScriptPromptStatusChanged();
+                }
+            }
         } catch (RuntimeException e) {
             Log.e(TAG, "importConfig: Failed to import SharedPreferences #1", e);
             failSuccess = false;
@@ -3426,7 +5889,26 @@ public class SyncthingService extends Service {
     }
 
     static boolean isDeviceLocalPreference(String key) {
-        return Constants.PREF_USE_ROOT.equals(key);
+        return Constants.PREF_USE_ROOT.equals(key)
+                || Constants.PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY.equals(key)
+                || Constants.PREF_INSTALLATION_MARKER.equals(key)
+                || Constants.PREF_INOTIFY_WATCH_LIMIT.equals(key);
+    }
+
+    static boolean restoreLocalDevicePreferences(
+            SharedPreferences.Editor editor,
+            boolean useRootWasPresent,
+            Object localUseRootValue,
+            boolean localInotifyWatchLimit
+    ) {
+        if (!restoreLocalExecutionModePreference(
+                editor, useRootWasPresent, localUseRootValue
+        )) {
+            return false;
+        }
+        editor.putBoolean(Constants.PREF_INSTALLATION_MARKER, true);
+        editor.putBoolean(Constants.PREF_INOTIFY_WATCH_LIMIT, localInotifyWatchLimit);
+        return true;
     }
 
     static boolean restoreLocalExecutionModePreference(

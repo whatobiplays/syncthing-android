@@ -5,6 +5,8 @@ import androidx.preference.PreferenceManager;
 
 import com.nutomic.syncthingandroid.runtime.AppUidBackend;
 import com.nutomic.syncthingandroid.runtime.DefaultSyncthingRuntime;
+import com.nutomic.syncthingandroid.runtime.RootBackend;
+import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.NotificationHandler;
 
 import javax.inject.Singleton;
@@ -35,7 +37,14 @@ public class SyncthingModule {
 
     @Provides
     @Singleton
-    public DefaultSyncthingRuntime getSyncthingRuntime() {
-        return new DefaultSyncthingRuntime(new AppUidBackend(mApp));
+    public DefaultSyncthingRuntime getSyncthingRuntime(SharedPreferences preferences) {
+        AppUidBackend appUidBackend = new AppUidBackend(mApp);
+        RootBackend rootBackend = new RootBackend(mApp);
+        return new DefaultSyncthingRuntime(
+                appUidBackend,
+                rootBackend,
+                rootBackend,
+                preferences.getBoolean(Constants.PREF_USE_ROOT, false)
+        );
     }
 }

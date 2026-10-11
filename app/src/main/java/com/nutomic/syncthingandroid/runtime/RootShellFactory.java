@@ -13,4 +13,19 @@ interface RootShellFactory {
      * @throws RootTransportException with a typed {@link RootFailure} describing the cause
      */
     RootShell acquire(long timeoutMillis) throws RootTransportException;
+
+    /** Reports authorization already confirmed in this process without requesting a shell. */
+    default boolean isAuthorizationAvailableWithoutPrompt() {
+        return false;
+    }
+
+    /**
+     * Acquires a shell only when root authorization was already confirmed in this process.
+     *
+     * <p>The default refuses the request. Implementations must never initiate a new authorization
+     * prompt from this entry point.</p>
+     */
+    default RootShell acquireIfAuthorized(long timeoutMillis) throws RootTransportException {
+        return null;
+    }
 }

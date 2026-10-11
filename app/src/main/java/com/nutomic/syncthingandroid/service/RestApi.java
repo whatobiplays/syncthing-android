@@ -82,6 +82,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
 
@@ -129,6 +130,13 @@ public class RestApi {
     private final Context mContext;
     private URL mUrl;
     private final String mApiKey;
+
+    /** Isolates completion preferences and request creation for deterministic JVM REST tests. */
+    interface CompletionTestSeam {
+        boolean runScriptEnabled(String folderId);
+        OwnedExecutionShutdown.RestShutdownRequest shutdownRequest();
+    }
+    private final CompletionTestSeam mCompletionTestSeam;
 
     private String mVersion;
     private Config mConfig;
@@ -209,6 +217,15 @@ public class RestApi {
      * dispatch and teardown cannot interleave.</p>
      */
     private final FolderScriptAdmission mFolderScriptAdmission = new FolderScriptAdmission();
+    /** Keeps deferred Run Condition updates pending until a server read confirms application. */
+    private boolean mCustomRunConditionsApplyInFlight;
+    private boolean mCustomRunConditionsReapplyRequested;
+    /** True when a config POST may have reached Syncthing but authoritative read-back failed. */
+    private boolean mCustomRunConditionsOutcomeUncertain;
+    private long mCustomRunConditionsRequestId;
+    private boolean mModeTransitionConfigAdmissionClosed;
+    private boolean mReopenConfigAdmissionWhenDrained;
+    private static final long CUSTOM_RUN_CONDITION_REQUEST_TIMEOUT_MILLIS = 360_000;
 
     /**
      * Runs the sync-completion scripts of one folder.
@@ -225,6 +242,7 @@ public class RestApi {
     public RestApi(Context context, URL url, String apiKey, OnApiAvailableListener apiListener,
                    OnConfigChangedListener configListener) {
         ((SyncthingApp) context.getApplicationContext()).component().inject(this);
+        mCompletionTestSeam = null;
         ENABLE_VERBOSE_LOG = AppPrefs.getPrefVerboseLog(context);
         mContext = context;
         mUrl = url;
@@ -233,6 +251,21 @@ public class RestApi {
         mOnConfigChangedListener = configListener;
         mLocalCompletion = new LocalCompletion(ENABLE_VERBOSE_LOG);
         mRemoteCompletion = new RemoteCompletion(ENABLE_VERBOSE_LOG);
+        mGson = getGson();
+    }
+
+    /** Constructs the same completion/admission path without Android preferences or HTTP. */
+    RestApi(SyncthingService service, DefaultSyncthingRuntime runtime,
+            CompletionTestSeam completionTestSeam) throws MalformedURLException {
+        mContext = service;
+        mRuntime = runtime;
+        mCompletionTestSeam = completionTestSeam;
+        mUrl = new URL("http://127.0.0.1:8384");
+        mApiKey = "";
+        mOnApiAvailableListener = () -> { };
+        mOnConfigChangedListener = () -> { };
+        mLocalCompletion = new LocalCompletion(false);
+        mRemoteCompletion = new RemoteCompletion(false);
         mGson = getGson();
     }
 
@@ -325,10 +358,18 @@ public class RestApi {
     }
 
     private void onReloadConfigComplete(String configResult) {
+        onReloadConfigComplete(configResult, false);
+    }
+
+    private void onReloadConfigComplete(String configResult, boolean keepRunConditionUpdatePending) {
         Boolean configParseSuccess;
         synchronized(mConfigLock) {
             mConfig = mGson.fromJson(configResult, Config.class);
             configParseSuccess = mConfig != null;
+            if (configParseSuccess && !mCustomRunConditionsApplyInFlight
+                    && !keepRunConditionUpdatePending) {
+                mCustomRunConditionsOutcomeUncertain = false;
+            }
         }
         if (!configParseSuccess) {
             throw new RuntimeException("config is null: " + configResult);
@@ -655,8 +696,11 @@ public class RestApi {
     public OwnedExecutionShutdown.RestShutdownRequest prepareShutdown() {
         // Admission closes before the executor stops accepting work, and it is the same state the
         // dispatch checks, so no sync-completion script can start after this point. What was
-        // admitted earlier is waited for inside a bound; a dispatch that outlasts the bound keeps
-        // its own transport deadlines, and the executor interruption above cancels it.
+        // admitted earlier is cancelled and waited for inside a bound. A timed-out wait does not
+        // release its runtime admission or authorize a backend change.
+        if (mContext instanceof SyncthingService) {
+            ((SyncthingService) mContext).cancelAdmittedRootRunScript();
+        }
         try {
             if (!mFolderScriptAdmission.closeAndWait(FOLDER_SCRIPT_TEARDOWN_WAIT_MILLIS)) {
                 Log.w(TAG, "prepareShutdown: A folder script dispatch did not finish within "
@@ -669,7 +713,49 @@ public class RestApi {
             hasShutdown = true;
             executorService.shutdownNow();
         }
-        return PostRequest.singleAttemptShutdown(mContext, mUrl, mApiKey);
+        return mCompletionTestSeam == null
+                ? PostRequest.singleAttemptShutdown(mContext, mUrl, mApiKey)
+                : mCompletionTestSeam.shutdownRequest();
+    }
+
+    /**
+     * Closes sync-completion script admission for an execution-mode transition.
+     *
+     * <p>The caller waits on a worker thread. A timeout means an admitted script still has not
+     * reached a terminal result, so the transition must not commit.</p>
+     */
+    public boolean closeFolderScriptAdmissionForModeTransition(long timeoutMillis)
+            throws InterruptedException {
+        long startedNanos = System.nanoTime();
+        boolean scriptsDrained = mFolderScriptAdmission.closeAndWait(timeoutMillis);
+        if (!scriptsDrained) return false;
+        long remainingMillis = timeoutMillis - TimeUnit.NANOSECONDS.toMillis(
+                System.nanoTime() - startedNanos
+        );
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, remainingMillis));
+        synchronized (mConfigLock) {
+            mModeTransitionConfigAdmissionClosed = true;
+            while (mCustomRunConditionsApplyInFlight) {
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0) return false;
+                TimeUnit.NANOSECONDS.timedWait(mConfigLock, remainingNanos);
+            }
+            return !mCustomRunConditionsOutcomeUncertain;
+        }
+    }
+
+    /** Reopens script admission after a failed pre-commit transition, once active scripts leave. */
+    public void reopenFolderScriptAdmissionAfterModeTransitionFailure() {
+        mFolderScriptAdmission.reopenWhenDrained();
+        synchronized (mConfigLock) {
+            if (mCustomRunConditionsApplyInFlight) {
+                mReopenConfigAdmissionWhenDrained = true;
+            } else {
+                mModeTransitionConfigAdmissionClosed = false;
+            }
+            mConfigLock.notifyAll();
+        }
     }
 
     /**
@@ -1349,27 +1435,71 @@ public class RestApi {
     public void onFolderSyncCompleted(final Folder folder, 
                                             final String folderState, 
                                             final String deviceId) {
-        Log.d(TAG, "onFolderSyncCompleted: Completed folder=[" + folder.id + "]");
+        logCompletion("onFolderSyncCompleted: Completed folder=[" + folder.id + "]");
 
         // Run folder script set if enabled by user pref.
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(mContext);
-        Boolean folderRunScriptEnabled = sharedPreferences.getBoolean(
-            Constants.DYN_PREF_OBJECT_FOLDER_RUN_SCRIPT(folder.id), false
-        );
+        boolean folderRunScriptEnabled;
+        if (mCompletionTestSeam != null) {
+            folderRunScriptEnabled = mCompletionTestSeam.runScriptEnabled(folder.id);
+        } else {
+            SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(mContext);
+            folderRunScriptEnabled = sharedPreferences.getBoolean(
+                    Constants.DYN_PREF_OBJECT_FOLDER_RUN_SCRIPT(folder.id), false);
+        }
         // Admission is taken immediately before the dispatch and shares its state with teardown,
         // so either the dispatch runs and teardown waits for it, or the dispatch never starts.
         if (folderRunScriptEnabled) {
-            // The dispatch reports its own problems and never raises, so the completion
-            // announcement below always reaches its listeners.
-            mFolderScriptDispatch.dispatch(
-                    ConfiguredFolderReference.of(folder.id),
-                    FolderEvent.SYNC_COMPLETE,
-                    message -> Log.w(TAG, "onFolderSyncCompleted: " + message)
-            );
+            if (mRuntime.isSuperuserModeSelected()) {
+                // Reserve both gates before asynchronous acceptance. The service owns the root
+                // prompt policy and the single worker slot; REST never reads consent or `su`.
+                if (!mFolderScriptAdmission.tryAdmit()) {
+                    logCompletionWarning("Root Run Script rejected: script admission closed");
+                } else {
+                    DefaultSyncthingRuntime.FolderScriptReservation reservation =
+                            mRuntime.tryReserveFolderScriptOperation();
+                    if (reservation == null) {
+                        mFolderScriptAdmission.leave();
+                        logCompletionWarning("Root Run Script rejected: runtime admission closed");
+                    } else {
+                        SyncthingService.RootRunScriptDispatchDecision decision =
+                                mContext instanceof SyncthingService
+                                        ? ((SyncthingService) mContext).tryDispatchRootRunScript(
+                                                reservation,
+                                                ConfiguredFolderReference.of(folder.id),
+                                                FolderEvent.SYNC_COMPLETE,
+                                                mFolderScriptAdmission::leave
+                                        )
+                                        : SyncthingService.RootRunScriptDispatchDecision.UNAVAILABLE;
+                        if (decision != SyncthingService.RootRunScriptDispatchDecision.ACCEPTED) {
+                            reservation.close();
+                            mFolderScriptAdmission.leave();
+                            logCompletionWarning("Root Run Script rejected: " + decision);
+                        }
+                    }
+                }
+            } else {
+                // Preserve Normal Mode dispatch and announcement ordering.
+                mFolderScriptDispatch.dispatch(
+                        ConfiguredFolderReference.of(folder.id),
+                        FolderEvent.SYNC_COMPLETE,
+                        message -> Log.w(TAG, "onFolderSyncCompleted: " + message)
+                );
+            }
         }
 
         // Notify listening third-party apps.
         sendBroadcastFolderSyncComplete(deviceId, folder, folderState);
+    }
+
+    /** Logging is best effort; Android JVM stubs must not suppress a completion announcement. */
+    private static void logCompletion(String message) {
+        try { Log.d(TAG, message); }
+        catch (RuntimeException unavailable) { /* No Android logger in plain JVM tests. */ }
+    }
+
+    private static void logCompletionWarning(String message) {
+        try { Log.w(TAG, message); }
+        catch (RuntimeException unavailable) { /* No Android logger in plain JVM tests. */ }
     }
 
     public void setRemoteIndexUpdated(final String deviceId,
@@ -1489,69 +1619,177 @@ public class RestApi {
      */
     public void applyCustomRunConditions(RunConditionMonitor runConditionMonitor) {
         SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(mContext);
+        Config candidate = null;
+        String candidateJson = null;
+        CustomRunConditionConfigUpdate.Result candidateUpdate = null;
+        long requestId;
+        boolean mustReloadAuthoritativeConfig;
         synchronized (mConfigLock) {
-            Boolean configChanged = false;
-
             // Check if the config has been loaded.
             if (mConfig == null) {
                 Log.w(TAG, "applyCustomRunConditions: mConfig is not ready yet.");
                 return;
             }
-
-            // Check if the folders are available from config.
-            if (mConfig.folders != null) {
-                for (Folder folder : mConfig.folders) {
-                    // LogV("applyCustomRunConditions: Processing config of folder(" + folder.label + ")");
-                    Boolean folderCustomSyncConditionsEnabled = sharedPreferences.getBoolean(
-                        Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id), false
-                    );
-                    if (folderCustomSyncConditionsEnabled) {
-                        Boolean syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                            Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id
-                        );
-                        LogV("applyCustomRunConditions: f(" + folder.label + ")=" + (syncConditionsMet ? "1" : "0"));
-                        if (folder.paused != !syncConditionsMet) {
-                            folder.paused = !syncConditionsMet;
-                            Log.d(TAG, "applyCustomRunConditions: f(" + folder.label + ")=" + (syncConditionsMet ? ">1" : ">0"));
-                            configChanged = true;
-                        }
-                    }
-                }
-            } else {
-                Log.d(TAG, "applyCustomRunConditions: mConfig.folders is not ready yet.");
+            if (mModeTransitionConfigAdmissionClosed) return;
+            if (mCustomRunConditionsApplyInFlight) {
+                // The preferences remain pending intent while the current REST write is
+                // unresolved. Recompute from the latest values after that write settles.
+                mCustomRunConditionsReapplyRequested = true;
                 return;
             }
+            mCustomRunConditionsReapplyRequested = false;
 
-            // Check if the devices are available from config.
-            if (mConfig.devices != null) {
-                for (Device device : mConfig.devices) {
-                    // LogV("applyCustomRunConditions: Processing config of device(" + device.name + ")");
-                    Boolean deviceCustomSyncConditionsEnabled = sharedPreferences.getBoolean(
-                        Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID), false
-                    );
-                    if (deviceCustomSyncConditionsEnabled) {
-                        Boolean syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                            Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID
-                        );
-                        LogV("applyCustomRunConditions: d(" + device.name + ")=" + (syncConditionsMet ? "1" : "0"));
-                        if (device.paused != !syncConditionsMet) {
-                            device.paused = !syncConditionsMet;
-                            Log.d(TAG, "applyCustomRunConditions: d(" + device.name + ")=" + (syncConditionsMet ? ">1" : ">0"));
-                            configChanged = true;
-                        }
-                    }
+            mustReloadAuthoritativeConfig = mCustomRunConditionsOutcomeUncertain;
+            mCustomRunConditionsApplyInFlight = true;
+            requestId = ++mCustomRunConditionsRequestId;
+            if (!mustReloadAuthoritativeConfig) {
+                CustomRunConditionConfigUpdate.Result update =
+                        CustomRunConditionConfigUpdate.createCandidate(mConfig,
+                                new CustomRunConditionConfigUpdate.Policy() {
+                                    @Override
+                                    public boolean isEnabled(String objectKey) {
+                                        return sharedPreferences.getBoolean(
+                                                Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(
+                                                        objectKey
+                                                ), false
+                                        );
+                                    }
+
+                                    @Override
+                                    public boolean conditionsAreMet(String objectKey) {
+                                        return runConditionMonitor
+                                                .checkObjectSyncConditions(objectKey);
+                                    }
+                                });
+                if (!update.isReady()) {
+                    mCustomRunConditionsApplyInFlight = false;
+                    mConfigLock.notifyAll();
+                    Log.d(TAG, "applyCustomRunConditions: authoritative configuration is incomplete");
+                    return;
                 }
-            } else {
-                Log.d(TAG, "applyCustomRunConditions: mConfig.devices is not ready yet.");
-                return;
+                if (!update.changed()) {
+                    mCustomRunConditionsApplyInFlight = false;
+                    mConfigLock.notifyAll();
+                    LogV("applyCustomRunConditions: No action was necessary.");
+                    return;
+                }
+                candidate = update.candidate();
+                candidateJson = mGson.toJson(candidate);
+                candidateUpdate = update;
             }
+        }
 
-            if (configChanged) {
-                LogV("applyCustomRunConditions: Sending changed config ...");
-                sendConfig();
-            } else {
-                LogV("applyCustomRunConditions: No action was necessary.");
+        final CustomRunConditionConfigUpdate.Result expectedUpdate = candidateUpdate;
+
+        if (mustReloadAuthoritativeConfig) {
+            Log.w(TAG, "Custom Run Condition write outcome is uncertain; refreshing authoritative configuration before retrying");
+            new GetRequest(mContext, mUrl, GetRequest.URI_CONFIG, mApiKey, null, result -> {
+                synchronized (mConfigLock) {
+                    if (requestId != mCustomRunConditionsRequestId) return;
+                    mCustomRunConditionsApplyInFlight = false;
+                    mCustomRunConditionsOutcomeUncertain = false;
+                    reopenConfigAdmissionIfDrained();
+                    mConfigLock.notifyAll();
+                }
+                onReloadConfigComplete(result);
+                applyCustomRunConditions(runConditionMonitor);
+            }, error -> {
+                synchronized (mConfigLock) {
+                    if (requestId != mCustomRunConditionsRequestId) return;
+                    mCustomRunConditionsApplyInFlight = false;
+                    mCustomRunConditionsOutcomeUncertain = true;
+                    reopenConfigAdmissionIfDrained();
+                    mConfigLock.notifyAll();
+                }
+                Log.w(TAG, "Could not refresh configuration after an uncertain Run Condition update", error);
+            });
+            return;
+        }
+
+        LogV("applyCustomRunConditions: Sending a candidate config to authoritative REST storage");
+        Handler handler = new Handler(Looper.getMainLooper());
+        Runnable timeout = () -> {
+            synchronized (mConfigLock) {
+                if (requestId != mCustomRunConditionsRequestId
+                        || !mCustomRunConditionsApplyInFlight) return;
+                mCustomRunConditionsApplyInFlight = false;
+                mCustomRunConditionsOutcomeUncertain = true;
+                ++mCustomRunConditionsRequestId;
+                reopenConfigAdmissionIfDrained();
+                mConfigLock.notifyAll();
             }
+            Log.w(TAG, "Custom Run Condition config request timed out; refreshing authoritative configuration before retrying");
+            applyCustomRunConditions(runConditionMonitor);
+        };
+        handler.postDelayed(timeout, CUSTOM_RUN_CONDITION_REQUEST_TIMEOUT_MILLIS);
+        new PostRequest(mContext, mUrl, PostRequest.URI_SYSTEM_CONFIG, mApiKey,
+                null, candidateJson, ignored -> {
+                    synchronized (mConfigLock) {
+                        if (requestId != mCustomRunConditionsRequestId) return;
+                    }
+                    GetRequest verification = new GetRequest(
+                            mContext,
+                            mUrl,
+                            GetRequest.URI_CONFIG,
+                            mApiKey,
+                            null,
+                            result -> {
+                                boolean readBackMatches;
+                                try {
+                                    readBackMatches = expectedUpdate != null
+                                            && expectedUpdate.matchesAuthoritativeReadBack(
+                                            mGson.fromJson(result, Config.class)
+                                    );
+                                } catch (RuntimeException invalidReadBack) {
+                                    readBackMatches = false;
+                                }
+                                handler.removeCallbacks(timeout);
+                                synchronized (mConfigLock) {
+                                    if (requestId != mCustomRunConditionsRequestId) return;
+                                    mCustomRunConditionsApplyInFlight = false;
+                                    mCustomRunConditionsOutcomeUncertain = !readBackMatches;
+                                    reopenConfigAdmissionIfDrained();
+                                    mConfigLock.notifyAll();
+                                }
+                                onReloadConfigComplete(result, !readBackMatches);
+                                if (readBackMatches) {
+                                    mOnConfigChangedListener.onConfigChanged();
+                                } else {
+                                    Log.w(TAG, "Authoritative configuration read-back did not contain all requested Run Condition changes; keeping the update pending");
+                                }
+                                reapplyCustomRunConditionsIfRequested(runConditionMonitor);
+                            },
+                            error -> {
+                                handler.removeCallbacks(timeout);
+                                synchronized (mConfigLock) {
+                                    if (requestId == mCustomRunConditionsRequestId) {
+                                        mCustomRunConditionsApplyInFlight = false;
+                                        mCustomRunConditionsOutcomeUncertain = true;
+                                        reopenConfigAdmissionIfDrained();
+                                        mConfigLock.notifyAll();
+                                    }
+                                }
+                                Log.w(TAG, "Could not verify whether custom Run Conditions were applied", error);
+                                reapplyCustomRunConditionsIfRequested(runConditionMonitor);
+                            }
+                    );
+                });
+    }
+
+    /** Recomputes one coalesced change after the previous REST outcome is terminal. */
+    private void reapplyCustomRunConditionsIfRequested(RunConditionMonitor monitor) {
+        boolean reapply;
+        synchronized (mConfigLock) {
+            reapply = mCustomRunConditionsReapplyRequested;
+            mCustomRunConditionsReapplyRequested = false;
+        }
+        if (reapply) applyCustomRunConditions(monitor);
+    }
+
+    private void reopenConfigAdmissionIfDrained() {
+        if (mReopenConfigAdmissionWhenDrained && !mCustomRunConditionsApplyInFlight) {
+            mModeTransitionConfigAdmissionClosed = false;
+            mReopenConfigAdmissionWhenDrained = false;
         }
     }
 

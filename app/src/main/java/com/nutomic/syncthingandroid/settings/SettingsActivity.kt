@@ -43,6 +43,14 @@ class SettingsActivity : SyncthingActivity() {
     val stateChangeListener = SyncthingService.OnServiceStateChangeListener {
         serviceUpdateTick++
     }
+    private val executionModeStatusListener =
+        SyncthingService.OnExecutionModeTransitionStatusChangedListener {
+            serviceUpdateTick++
+        }
+    private val rootScriptPromptStatusListener =
+        SyncthingService.OnRootRunScriptPromptStatusChangedListener {
+            serviceUpdateTick++
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         (application as SyncthingApp).component().inject(this)
@@ -94,13 +102,32 @@ class SettingsActivity : SyncthingActivity() {
 
     override fun onServiceConnected(name: ComponentName, service: IBinder) {
         super.onServiceConnected(name, service)
+        syncthingServiceState?.unregisterOnServiceStateChangeListener(stateChangeListener)
+        syncthingServiceState?.unregisterExecutionModeTransitionStatusListener(
+            executionModeStatusListener
+        )
+        syncthingServiceState?.unregisterRootRunScriptPromptStatusListener(
+            rootScriptPromptStatusListener
+        )
         syncthingServiceState = this.service
         syncthingServiceState?.registerOnServiceStateChangeListener(stateChangeListener)
+        syncthingServiceState?.registerExecutionModeTransitionStatusListener(
+            executionModeStatusListener
+        )
+        syncthingServiceState?.registerRootRunScriptPromptStatusListener(
+            rootScriptPromptStatusListener
+        )
         serviceUpdateTick++
     }
 
     override fun onServiceDisconnected(name: ComponentName) {
         syncthingServiceState?.unregisterOnServiceStateChangeListener(stateChangeListener)
+        syncthingServiceState?.unregisterExecutionModeTransitionStatusListener(
+            executionModeStatusListener
+        )
+        syncthingServiceState?.unregisterRootRunScriptPromptStatusListener(
+            rootScriptPromptStatusListener
+        )
         super.onServiceDisconnected(name)
         syncthingServiceState = null
         serviceUpdateTick++
@@ -115,6 +142,12 @@ class SettingsActivity : SyncthingActivity() {
 
     override fun onDestroy() {
         syncthingServiceState?.unregisterOnServiceStateChangeListener(stateChangeListener)
+        syncthingServiceState?.unregisterExecutionModeTransitionStatusListener(
+            executionModeStatusListener
+        )
+        syncthingServiceState?.unregisterRootRunScriptPromptStatusListener(
+            rootScriptPromptStatusListener
+        )
         super.onDestroy()
     }
 

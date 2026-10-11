@@ -171,6 +171,14 @@ A root prompt is allowed only for an explicit root-capable action:
 - State Access Repair;
 - explicitly enabling/applying the inotify expert feature.
 
+Automatic sync-completion Run Scripts are a narrowly approved exception to the former
+no-background-prompt rule. A prompt may be requested for one configured Superuser Mode Run Script
+event only after the user explicitly enables the separate, device-local root-script prompt setting
+and the event holds both Run Script and runtime-operation admission. This opt-in defaults off.
+When it is off or suspended, the callback reports a typed unavailable result without acquiring
+root or executing a root-selected script as app UID. A prompt may occur while the app is in the
+background; a root manager is not guaranteed to present it successfully.
+
 Passive rendering must never prompt, including:
 
 - onboarding;
@@ -187,6 +195,13 @@ Root helper shells are **operation-scoped**.
 There may be at most one helper shell for a privileged operation, and it may be reused within that operation. Close it when the operation finishes.
 
 Do not keep a general-purpose UID-0 helper process alive merely because root Syncthing is active.
+
+An opted-in Run Script may acquire one bounded, operation-scoped helper on a worker. Verify UID 0
+before resolving the authoritative folder or running scripts. Close the shell at terminal
+settlement. A timeout alone does not establish that the helper or script has exited: admission
+remains owned until that work has actually settled or its exit has been proven. Do not use a
+global cached shell, persistent helper, RootService/AIDL, undocumented manager-specific `su`
+options, or a generic privileged command interface for this exception.
 
 ### 6.4 Root launch primitive
 
@@ -739,15 +754,43 @@ The runtime:
 
 Normal Mode scripts run app UID.
 
-Superuser Mode scripts run UID 0.
+Superuser Mode scripts run UID 0 only when the separate root-script prompt policy is armed. The
+policy is device-local, defaults off, and is never restored from backup/import. Successful
+disabling of Superuser Mode, including Disable anyway, resets it to off. Re-enabling Superuser
+Mode requires new explicit consent.
 
-Settings must warn that scripts execute with unrestricted superuser privileges when Superuser Mode is enabled.
+An armed, configured sync-completion event reserves Run Script and runtime-operation admission
+before asynchronous work is accepted. An operation identity and execution-mode generation bind
+the work to the selected root backend. One such operation may make one bounded authorization
+attempt on a worker, resolve the authoritative configured folder, and execute the approved
+script set in its UID-0-verified helper session. Neither authorization nor script execution
+blocks REST event handling, the sync-completion broadcast, or the Android service thread.
+Concurrent root-script events return a typed busy result; they are not put on an unbounded queue.
+Normal Mode completion and script behavior remains unchanged.
+
+The service serializes policy changes in one durable preference key with states `OFF`, `ARMED`,
+`ATTEMPT_IN_PROGRESS`, and `SUSPENDED(reason)`. Before invoking `su`, it durably commits
+`ATTEMPT_IN_PROGRESS`; a failed commit causes no authorization attempt. Denial, authorization
+loss, authorization timeout, and uncertain authorization suspend future automatic attempts with
+a typed visible reason. A settled durable `ARMED` value survives service recreation; an
+interrupted `ATTEMPT_IN_PROGRESS` or unknown value fails closed. Ordinary nonzero script exits
+are reported without suspending authorization. Each operation identity prevents a late result
+from rearming after opt-out, suspension, destruction, or mode change. Explicit Resume/Retry only
+arms future sync-completion events and never replays an earlier script event.
+
+Settings must warn that scripts execute with unrestricted superuser privileges in Superuser Mode,
+and that an opted-in authorization prompt can occur when synchronization finishes, including
+while the app is in the background. Settings shows suspension and its reason.
 
 Scripts may run while the main Syncthing `serve` process remains active.
 
 Root scripts use an operation-scoped helper shell. Do not add durable orphan recovery for arbitrary user scripts in this stack.
 
 Orderly teardown stops admitting new script operations and performs bounded cleanup/waiting for current script work. Arbitrary child processes deliberately launched by user scripts are outside Syncthing process ownership.
+
+Script failure cannot stop Syncthing, change Run Conditions, or cause an implicit Execution Mode
+fallback. Transitions, teardown, destruction, cancellation, and deadlines reject stale work and
+retain admission while privileged work is unresolved.
 
 ## 23. Optional system tuning
 
@@ -857,6 +900,12 @@ If Disable anyway is selected, commit Normal Mode and surface State Access Repai
 
 Show **Repair Syncthing state access** only when repair is actually required.
 
+Add a separate **Allow root prompts for Run Scripts after sync** setting, default off. Explain:
+configured scripts run with unrestricted superuser privileges; authorization may be requested
+after sync completion even in the background; and a root manager may fail to show that prompt.
+Show a typed suspension reason and **Resume for future sync completions** when suspended. The
+setting is independent of the Execution Mode switch, and disabling Superuser Mode clears consent.
+
 ### Experimental
 
 Add:
@@ -946,11 +995,21 @@ Minimum final qualification matrix:
 9. explicit State Access Repair restores normal operation;
 10. import/export in Superuser Mode preserves archive format and device-local mode;
 11. restricted-folder write/access and conflict discovery;
-12. root Run Script executes as UID 0;
+12. default-off root Run Scripts do not prompt or run as app UID; opt-in Run Scripts execute as UID
+    0 after bounded authorization; denial/loss/timeout suspend attempts; Resume affects only
+    future events; concurrent callbacks and teardown preserve admission and mode identity;
 13. optional inotify tuning does not create surprise normal-start prompts;
 14. startup-readiness timeout terminates only the exact Owned Execution;
 15. ambiguous/missing ownership evidence is never signaled;
 16. normal-mode baseline remains behaviorally equivalent.
+
+Run item 12 separately with Magisk, KernelSU, and APatch while SELinux is enforcing. For each
+manager, record its version and Android version; foreground and background prompt presentation;
+confirmed UID-0 execution and selected-folder resolution; denial, revoked authorization, and
+timeout suspension; explicit Resume without event replay; concurrent completion rejection; and
+teardown while authorization or a script is still active. A JVM fake proves the app's admission
+and policy ordering, but only these device runs can qualify each manager's prompt behavior and
+the platform's process-group cleanup after a script deadline.
 
 Milestone qualification:
 
@@ -1100,14 +1159,17 @@ The stack is complete only when all of the following are true:
 12. Ambiguous executions fail closed.
 13. Startup reaches ACTIVE only after REST/config readiness.
 14. Startup readiness is bounded.
-15. Root prompts occur only from approved explicit triggers.
+15. Root prompts occur only from approved explicit triggers or an admitted sync-completion Run
+    Script event with prior explicit, device-local opt-in.
 16. Passive onboarding/settings/folder/device rendering never prompts.
 17. Managed State repair is closed and never recursively repairs arbitrary app data.
 18. Normal Mode never opportunistically escalates to root except explicit Privileged Maintenance Operations.
 19. Backup/import external format remains the established pre-root contract.
 20. Root preference is not restored from backup.
 21. Configuration Projection is in-memory and non-authoritative.
-22. Run Scripts use selected execution identity and warn when root-enabled.
+22. Run Scripts use the selected execution identity, warn when root-enabled, and require the
+    separate default-off opt-in for automatic root prompts. Denial/loss/timeout suspend future
+    attempts until explicit Resume; stale results cannot rearm; failed events are never replayed.
 23. Inotify tuning is separate from Superuser Mode and non-fatal.
 24. Normal-mode behavior is preserved except for explicitly specified safety corrections.
 25. Every stacked PR is independently green.

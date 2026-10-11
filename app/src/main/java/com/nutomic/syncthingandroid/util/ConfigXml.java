@@ -230,7 +230,7 @@ public class ConfigXml {
 
         // Save changes if we made any.
         if (changed) {
-            saveChanges();
+            if (!saveChanges()) throw new OpenConfigException();
         }
     }
 
@@ -289,7 +289,7 @@ public class ConfigXml {
             // LogV("Successfully parsed config file");
         } catch (SAXException | ParserConfigurationException | IOException e) {
             Log.w(TAG, "Failed to parse config file", e);
-            throw new OpenConfigException();
+            throw new OpenConfigException(e);
         }
     }
 
@@ -425,7 +425,7 @@ public class ConfigXml {
 
         // Save changes if we made any.
         if (changed) {
-            saveChanges();
+            if (!saveChanges()) throw new OpenConfigException();
         }
     }
 
@@ -1272,10 +1272,10 @@ public class ConfigXml {
     /**
      * Writes updated mConfig back to file.
      */
-    public void saveChanges() {
+    public boolean saveChanges() {
         if (!mConfigStorage.canWrite()) {
             Log.w(TAG, "Failed to save updated config. Cannot change the owner of the config file.");
-            return;
+            return false;
         }
 
         Log.i(TAG, "Saving config file");
@@ -1300,11 +1300,13 @@ public class ConfigXml {
             byte[] outputBytes = byteArrayOutputStream.toByteArray();
             configOutput.write(outputBytes);
             mConfigStorage.save(configOutput.toByteArray());
+            return true;
         } catch (TransformerException e) {
             Log.w(TAG, "Failed to transform object to xml and save temporary config file", e);
-            return;
+            return false;
         } catch (IOException e) {
             Log.w(TAG, "Failed to save temporary config file, IOException", e);
+            return false;
         }
     }
 

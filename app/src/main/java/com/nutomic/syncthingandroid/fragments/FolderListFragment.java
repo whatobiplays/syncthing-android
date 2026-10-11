@@ -24,6 +24,7 @@ import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.RestApi;
 import com.nutomic.syncthingandroid.service.SyncthingService;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
+import com.nutomic.syncthingandroid.util.ConfigurationUnavailableException;
 import com.nutomic.syncthingandroid.util.ConfigXml.OpenConfigException;
 import com.nutomic.syncthingandroid.views.FoldersAdapter;
 
@@ -154,6 +155,17 @@ public class FolderListFragment extends ListFragment implements SyncthingService
         RestApi restApi = activity.getApi();
         try {
             folders = mConfigRouter.getFolders(restApi);
+        } catch (ConfigurationUnavailableException e) {
+            Log.i(TAG, "Stopped Superuser Mode has no in-memory configuration projection");
+            if (mAdapter == null) {
+                mAdapter = new FoldersAdapter(activity);
+                setListAdapter(mAdapter);
+            }
+            mAdapter.clear();
+            mAdapter.notifyDataSetChanged();
+            setEmptyText(getString(R.string.configuration_unavailable));
+            setListShown(true);
+            return;
         } catch (OpenConfigException e) {
             Log.e(TAG, "Failed to parse existing config. You will need support from here ...");
             return;
@@ -165,6 +177,7 @@ public class FolderListFragment extends ListFragment implements SyncthingService
             mAdapter = new FoldersAdapter(activity);
             setListAdapter(mAdapter);
         }
+        setEmptyText(getString(R.string.folder_list_empty));
         mAdapter.setRestApi(restApi);
 
         // Prevent scroll position reset due to list update from clear().

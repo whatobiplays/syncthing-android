@@ -65,9 +65,20 @@ public class Constants {
      *
      * <p>The value records whether Superuser Mode was selected on this device. A backup archive
      * never changes it: the import keeps whatever this device had before the import and ignores the
-     * value stored in an archive. No code in this application writes this preference yet.</p>
+     * value stored in an archive. The service commits changes only after an execution-mode
+     * transition has quiesced the prior backend.</p>
      */
     public static final String PREF_USE_ROOT                    = "use_root";
+
+    /** Device-local consent and suspension for automatic Superuser Mode Run Script prompts. */
+    public static final String PREF_ROOT_RUN_SCRIPT_PROMPT_POLICY =
+            "root_run_script_prompt_policy";
+
+    /** App-owned lineage marker used to distinguish an existing installation from first run. */
+    public static final String PREF_INSTALLATION_MARKER          = "installation_marker_v1";
+
+    /** Whether the optional system inotify watch limit was explicitly applied. */
+    public static final String PREF_INOTIFY_WATCH_LIMIT          = "inotify_watch_limit_enabled";
 
     // Preferences - Troubleshooting
     public static final String PREF_VERBOSE_LOG                 = "verbose_log";

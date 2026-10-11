@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.util;
 
 import android.content.Context;
 import android.util.Log;
+import androidx.preference.PreferenceManager;
 
 import com.nutomic.syncthingandroid.model.Device;
 import com.nutomic.syncthingandroid.model.Folder;
@@ -29,23 +30,42 @@ public class ConfigRouter {
     }
 
     private final Context mContext;
+    private final boolean mAllowStoppedRootAccess;
 
     private ConfigXml configXml;
 
     public ConfigRouter(Context context) {
+        this(context, false);
+    }
+
+    /**
+     * @param allowStoppedRootAccess true only for an explicit edit flow that needs authoritative
+     *                               stopped-state config before it can expose editing controls
+     */
+    public ConfigRouter(Context context, boolean allowStoppedRootAccess) {
         mContext = context;
+        mAllowStoppedRootAccess = allowStoppedRootAccess;
         configXml = new ConfigXml(mContext);
     }
 
     public List<Folder> getFolders(RestApi restApi) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            if (isRootModeSelected() && !mAllowStoppedRootAccess) {
+                List<Folder> projection = ConfigurationProjection.folders();
+                if (projection == null) throw unavailable();
+                return projection;
+            }
+            loadStoppedAuthoritativeConfig();
             return configXml.getFolders();
         }
 
         // Syncthing is running and REST API is available.
-        return restApi.getFolders();
+        List<Folder> folders = restApi.getFolders();
+        ConfigurationProjection.update(
+                folders, restApi.getDevices(false), restApi.getDevices(true)
+        );
+        return folders;
     }
 
     public List<Folder> getSharedFolders(String deviceID) {
@@ -65,7 +85,7 @@ public class ConfigRouter {
     public void addFolder(RestApi restApi, Folder folder) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.addFolder(folder);
             configXml.saveChanges();
             return;
@@ -95,7 +115,7 @@ public class ConfigRouter {
     public void updateFolder(RestApi restApi, final Folder folder) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.updateFolder(folder);
             configXml.saveChanges();
             return;
@@ -108,7 +128,7 @@ public class ConfigRouter {
     public void removeFolder(RestApi restApi, final String folderId) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.removeFolder(folderId);
             configXml.saveChanges();
             return;
@@ -131,7 +151,7 @@ public class ConfigRouter {
             throws FolderOperationException {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.getFolderIgnoreList(folder, folderIgnoreList -> listener.onResult(folderIgnoreList));
             return;
         }
@@ -149,7 +169,7 @@ public class ConfigRouter {
             throws FolderOperationException {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.postFolderIgnoreList(folder, ignore);
             return;
         }
@@ -164,11 +184,19 @@ public class ConfigRouter {
 
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
-            devices = configXml.getDevices(includeLocal);
+            if (isRootModeSelected() && !mAllowStoppedRootAccess) {
+                devices = ConfigurationProjection.devices(includeLocal);
+                if (devices == null) throw unavailable();
+            } else {
+                loadStoppedAuthoritativeConfig();
+                devices = configXml.getDevices(includeLocal);
+            }
         } else {
             // Syncthing is running and REST API is available.
             devices = restApi.getDevices(includeLocal);
+            ConfigurationProjection.update(
+                    restApi.getFolders(), restApi.getDevices(false), restApi.getDevices(true)
+            );
         }
 
         return devices;
@@ -177,7 +205,7 @@ public class ConfigRouter {
     public void updateDevice(RestApi restApi, final Device device) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.updateDevice(device);
             configXml.saveChanges();
             return;
@@ -190,7 +218,7 @@ public class ConfigRouter {
     public void removeDevice(RestApi restApi, final String deviceID) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.removeDevice(deviceID);
             configXml.saveChanges();
             return;
@@ -220,7 +248,7 @@ public class ConfigRouter {
     public Gui getGui(RestApi restApi) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             return configXml.getGui();
         }
 
@@ -231,7 +259,7 @@ public class ConfigRouter {
     public void updateGui(RestApi restApi, final Gui gui) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             configXml.updateGui(gui);
             configXml.saveChanges();
             return;
@@ -244,12 +272,30 @@ public class ConfigRouter {
     public Options getOptions(RestApi restApi) {
         if (restApi == null || !restApi.isConfigLoaded()) {
             // Syncthing is not running or REST API is not (yet) available.
-            configXml.loadConfig();
+            loadStoppedAuthoritativeConfig();
             return configXml.getOptions();
         }
 
         // Syncthing is running and REST API is available.
         return restApi.getOptions();
+    }
+
+    private void loadStoppedAuthoritativeConfig() throws ConfigXml.OpenConfigException {
+        if (isRootModeSelected() && !mAllowStoppedRootAccess) throw unavailable();
+        configXml.loadConfig();
+    }
+
+    private boolean isRootModeSelected() {
+        return PreferenceManager.getDefaultSharedPreferences(mContext).getBoolean(
+                com.nutomic.syncthingandroid.service.Constants.PREF_USE_ROOT, false
+        );
+    }
+
+    private static ConfigurationUnavailableException unavailable() {
+        return new ConfigurationUnavailableException(
+                "The authoritative config is unavailable while Superuser Mode is stopped. "
+                        + "Open an explicit edit action to authorize access."
+        );
     }
 
 }

@@ -98,6 +98,10 @@ final class FakeRootTransport {
 
         /** When false, no root transport exists, as on an unrooted device. */
         boolean rootAvailable = true;
+        /** Whether the current process already has root authorization and may reuse it silently. */
+        boolean authorizationAvailableWithoutPrompt = true;
+        /** Revokes the silent capability at the next helper acquisition boundary. */
+        boolean revokeAuthorizationDuringNextAuthorizedAcquisition;
         /** When set, every activation reports this typed failure instead of a shell. */
         RootFailure activationFailure;
         /** When true, writing the launch script spawns the process it describes. */
@@ -1051,6 +1055,24 @@ final class FakeRootTransport {
                 );
             }
             return new Shell(device, acquireCalls);
+        }
+
+        @Override
+        public boolean isAuthorizationAvailableWithoutPrompt() {
+            return device.rootAvailable && device.authorizationAvailableWithoutPrompt;
+        }
+
+        @Override
+        public RootShell acquireIfAuthorized(long timeoutMillis) {
+            if (!isAuthorizationAvailableWithoutPrompt()) {
+                return null;
+            }
+            if (device.revokeAuthorizationDuringNextAuthorizedAcquisition) {
+                device.revokeAuthorizationDuringNextAuthorizedAcquisition = false;
+                device.authorizationAvailableWithoutPrompt = false;
+                return null;
+            }
+            return acquire(timeoutMillis);
         }
 
         /** Holds one activation open until the test allows it to finish. */

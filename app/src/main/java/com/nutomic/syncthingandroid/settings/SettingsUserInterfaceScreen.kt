@@ -62,7 +62,7 @@ fun SettingsUserInterfaceScreen() {
                         scope.launch(Dispatchers.IO) {
                             withContext(NonCancellable) {
                                 try {
-                                    val config = ConfigRouter(context)
+                                    val config = ConfigRouter(context, true)
                                     val restApi = stService?.api
                                     val gui = config.getGui(restApi)
                                     gui.theme = when (newTheme) {

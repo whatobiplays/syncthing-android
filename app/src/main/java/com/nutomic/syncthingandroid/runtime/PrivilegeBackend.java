@@ -238,6 +238,15 @@ public interface PrivilegeBackend {
     List<FolderScriptOutcome> runFolderScripts(ConfiguredFolderReference folder, FolderEvent event)
             throws FolderOperationException;
 
+    /** Runs one admitted script event with its narrow root-prompt decision. */
+    default List<FolderScriptOutcome> runFolderScripts(
+            ConfiguredFolderReference folder,
+            FolderEvent event,
+            RunScriptRootAuthorization authorization
+    ) throws FolderOperationException {
+        return runFolderScripts(folder, event);
+    }
+
     /**
      * Applies the background I/O priority class to one exact owned execution.
      *

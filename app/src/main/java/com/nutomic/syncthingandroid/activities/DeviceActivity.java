@@ -9,7 +9,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.text.TextWatcher;
@@ -24,6 +26,7 @@ import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.app.ProgressDialog;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -46,6 +49,8 @@ import com.nutomic.syncthingandroid.model.DiscoveredDevice;
 import com.nutomic.syncthingandroid.model.Folder;
 import com.nutomic.syncthingandroid.model.Options;
 import com.nutomic.syncthingandroid.model.SharedWithDevice;
+import com.nutomic.syncthingandroid.runtime.FolderEditorStartupLoad;
+import com.nutomic.syncthingandroid.runtime.FolderWorkQueue;
 import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.RestApi;
 import com.nutomic.syncthingandroid.service.SyncthingService;
@@ -57,9 +62,11 @@ import com.nutomic.syncthingandroid.util.TextWatcherAdapter;
 import com.nutomic.syncthingandroid.util.Util;
 
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
 
 import javax.inject.Inject;
 
@@ -100,6 +107,18 @@ public class DeviceActivity extends SyncthingActivity {
 
     private ConfigRouter mConfig;
 
+    /** Runs authoritative configuration reads away from the editor's UI thread. */
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private final FolderWorkQueue mEditorWork = new FolderWorkQueue(
+            Executors.newSingleThreadExecutor(),
+            mMainHandler::post
+    );
+    private final FolderEditorStartupLoad<DeviceEditorStartup> mEditorStartupLoad =
+            new FolderEditorStartupLoad<>(mEditorWork);
+    private ProgressDialog mLoadingDialog;
+    private Bundle mPendingRestoreState;
+    private boolean mEditorLoading;
+
     private Device mDevice;
     private EditText mEditDeviceId;
     private TextView mDiscoveredDevicesTitle;
@@ -137,6 +156,9 @@ public class DeviceActivity extends SyncthingActivity {
     private OnBackPressedCallback mBackPressedCallback = new OnBackPressedCallback(true) {
         @Override
         public void handleOnBackPressed() {
+            if (mEditorLoading) {
+                return;
+            }
             if (mDeviceNeedsToUpdate) {
                 showDiscardDialog();
             } else {
@@ -249,7 +271,7 @@ public class DeviceActivity extends SyncthingActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        mConfig = new ConfigRouter(DeviceActivity.this);
+        mConfig = new ConfigRouter(DeviceActivity.this, true);
 
         super.onCreate(savedInstanceState);
         ((SyncthingApp) getApplication()).component().inject(this);
@@ -295,7 +317,7 @@ public class DeviceActivity extends SyncthingActivity {
             Log.d(TAG, "Retrieving state from savedInstanceState ...");
             mDevice = new Gson().fromJson(savedInstanceState.getString("device"), Device.class);
             mDeviceNeedsToUpdate = savedInstanceState.getBoolean("deviceNeedsToUpdate");
-            restoreDialogStates(savedInstanceState);
+            mPendingRestoreState = savedInstanceState;
         } else {
             // Fresh init of the edit or create mode.
             if (mIsCreateMode) {
@@ -306,31 +328,8 @@ public class DeviceActivity extends SyncthingActivity {
                 // Edit mode.
                 String passedId = getIntent().getStringExtra(EXTRA_DEVICE_ID);
                 Log.d(TAG, "Initializing edit mode: deviceID=" + passedId);
-                // getApi() is unavailable (onCreate > onPostCreate > onServiceConnected)
-                List<Device> devices = mConfig.getDevices(null, false);
-                mDevice = null;
-                for (Device currentDevice : devices) {
-                    if (currentDevice.deviceID.equals(passedId)) {
-                        mDevice = currentDevice;
-                        break;
-                    }
-                }
-                if (mDevice == null) {
-                    Log.w(TAG, "Device not found in API update, maybe it was deleted?");
-                    setResult(Activity.RESULT_CANCELED);
-                    finish();
-                    return;
-                }
-                mDeviceNeedsToUpdate = false;
+                if (mDevice == null) mDeviceNeedsToUpdate = false;
             }
-        }
-        updateViewsAndSetListeners();
-
-        if (mIsCreateMode) {
-            mEditDeviceId.requestFocus();
-        } else {
-            getWindow().setSoftInputMode(SOFT_INPUT_STATE_ALWAYS_HIDDEN);
-            mNameView.requestFocus();
         }
 
         // Show expert options conditionally.
@@ -339,6 +338,119 @@ public class DeviceActivity extends SyncthingActivity {
 
         // Register OnBackPressedCallback
         getOnBackPressedDispatcher().addCallback(this, mBackPressedCallback);
+
+        // The selected backend can require bounded root access to load stopped configuration.
+        // Keep the editor modal and read the authoritative snapshot on a worker before enabling it.
+        startEditorStartupLoad();
+    }
+
+    private void startEditorStartupLoad() {
+        mEditorLoading = true;
+        invalidateOptionsMenu();
+        mLoadingDialog = new ProgressDialog(this);
+        mLoadingDialog.setMessage(getString(R.string.state_loading));
+        mLoadingDialog.setIndeterminate(true);
+        mLoadingDialog.setCancelable(false);
+        mLoadingDialog.show();
+
+        final RestApi restApi = getApi();
+        mEditorStartupLoad.start(
+                () -> !isFinishing() && !isDestroyed(),
+                () -> readEditorStartup(restApi),
+                this::applyEditorStartup
+        );
+    }
+
+    private DeviceEditorStartup readEditorStartup(RestApi restApi) {
+        try {
+            return new DeviceEditorStartup(
+                    mConfig.getDevices(restApi, false),
+                    mConfig.getFolders(restApi),
+                    null
+            );
+        } catch (RuntimeException failure) {
+            return new DeviceEditorStartup(null, null, failure);
+        }
+    }
+
+    private void applyEditorStartup(DeviceEditorStartup startup) {
+        dismissLoadingDialog();
+        mEditorLoading = false;
+        invalidateOptionsMenu();
+
+        if (startup.failure != null) {
+            showConfigurationReadFailure(startup.failure);
+            return;
+        }
+
+        if (!mIsCreateMode) {
+            String requestedId = getIntent().getStringExtra(EXTRA_DEVICE_ID);
+            Device configuredDevice = null;
+            for (Device configured : startup.devices) {
+                if (requestedId != null && requestedId.equals(configured.deviceID)) {
+                    configuredDevice = configured;
+                    break;
+                }
+            }
+            if (configuredDevice == null) {
+                Log.w(TAG, "Device not found in authoritative configuration; it may have been removed");
+                setResult(Activity.RESULT_CANCELED);
+                finish();
+                return;
+            }
+            if (mDevice == null) mDevice = configuredDevice;
+        }
+
+        updateViewsAndSetListeners(startup.folders);
+        if (mPendingRestoreState != null) {
+            restoreDialogStates(mPendingRestoreState);
+            mPendingRestoreState = null;
+        }
+        if (mIsCreateMode) {
+            mEditDeviceId.requestFocus();
+        } else {
+            getWindow().setSoftInputMode(SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+            mNameView.requestFocus();
+        }
+    }
+
+    private void showConfigurationReadFailure(RuntimeException failure) {
+        String details = failure.getMessage();
+        String message = getString(R.string.configuration_unavailable)
+                + (details == null || details.isEmpty() ? "" : "\n\n" + details);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.configuration_unavailable)
+                .setMessage(message)
+                .setPositiveButton(R.string.configuration_retry, (dialog, which) ->
+                        startEditorStartupLoad())
+                .setNegativeButton(android.R.string.cancel, (dialog, which) -> {
+                    setResult(Activity.RESULT_CANCELED);
+                    finish();
+                })
+                .setOnCancelListener(dialog -> {
+                    setResult(Activity.RESULT_CANCELED);
+                    finish();
+                })
+                .show();
+    }
+
+    private void dismissLoadingDialog() {
+        if (mLoadingDialog != null && mLoadingDialog.isShowing()) {
+            mLoadingDialog.dismiss();
+        }
+        mLoadingDialog = null;
+    }
+
+    private static final class DeviceEditorStartup {
+        final List<Device> devices;
+        final List<Folder> folders;
+        final RuntimeException failure;
+
+        DeviceEditorStartup(List<Device> devices, List<Folder> folders, RuntimeException failure) {
+            this.devices = devices;
+            this.folders = folders;
+            this.failure = failure;
+        }
     }
 
     private void restoreDialogStates(Bundle savedInstanceState) {
@@ -391,6 +503,8 @@ public class DeviceActivity extends SyncthingActivity {
 
     @Override
     public void onDestroy() {
+        dismissLoadingDialog();
+        mEditorWork.close();
         super.onDestroy();
         SyncthingService syncthingService = getService();
         if (syncthingService != null) {
@@ -420,7 +534,7 @@ public class DeviceActivity extends SyncthingActivity {
         Util.dismissDialogSafe(mDeleteDialog, this);
     }
 
-    private void updateViewsAndSetListeners() {
+    private void updateViewsAndSetListeners(List<Folder> foldersList) {
         mEditDeviceId.removeTextChangedListener(mIdTextWatcher);
         mNameView.removeTextChangedListener(mNameTextWatcher);
         mAddressesView.removeTextChangedListener(mAddressesTextWatcher);
@@ -456,8 +570,6 @@ public class DeviceActivity extends SyncthingActivity {
         mCustomSyncConditionsDialog.setEnabled(mCustomSyncConditionsSwitch.isChecked());
 
         // Populate foldersList.
-        RestApi restApi = getApi();
-        List<Folder> foldersList = mConfig.getFolders(restApi);
         mFoldersContainer.removeAllViews();
         if (foldersList.isEmpty()) {
             addEmptyFolderListView();
@@ -487,7 +599,9 @@ public class DeviceActivity extends SyncthingActivity {
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
         menu.findItem(R.id.save).setTitle(mIsCreateMode ? R.string.create : R.string.save_title);
+        menu.findItem(R.id.save).setEnabled(!mEditorLoading);
         menu.findItem(R.id.remove).setVisible(!mIsCreateMode);
+        menu.findItem(R.id.remove).setEnabled(!mEditorLoading);
         return true;
     }
 
@@ -511,10 +625,18 @@ public class DeviceActivity extends SyncthingActivity {
         mDeleteDialog = new AlertDialog.Builder(this)
                 .setMessage(R.string.remove_device_confirm)
                 .setPositiveButton(android.R.string.yes, (dialogInterface, i) -> {
-                    mConfig.removeDevice(getApi(), mDevice.deviceID);
-                    mDeviceNeedsToUpdate = false;
-                    setResult(AppCompatActivity.RESULT_OK);
-                    finish();
+                    if (mEditorLoading) return;
+                    final RestApi restApi = getApi();
+                    final String deviceId = mDevice.deviceID;
+                    beginConfigurationWrite();
+                    mEditorWork.submit(() -> {
+                        try {
+                            mConfig.removeDevice(restApi, deviceId);
+                            return null;
+                        } catch (RuntimeException failure) {
+                            return failure;
+                        }
+                    }, failure -> completeConfigurationWrite(failure, true, true));
                 })
                 .setNegativeButton(android.R.string.no, null)
                 .create();
@@ -534,7 +656,7 @@ public class DeviceActivity extends SyncthingActivity {
                 }
             }
         } else if (resultCode == Activity.RESULT_OK && requestCode == FolderActivity.FOLDER_ADD_CODE) {
-            updateViewsAndSetListeners();
+            startEditorStartupLoad();
         }
     }
 
@@ -600,7 +722,7 @@ public class DeviceActivity extends SyncthingActivity {
     }
 
     private void onSave() {
-        if (mDevice == null) {
+        if (mDevice == null || mEditorLoading) {
             Log.e(TAG, "onSave: mDevice == null");
             return;
         }
@@ -622,7 +744,10 @@ public class DeviceActivity extends SyncthingActivity {
             return;
         }
 
-        // Loop through devices the folder is shared to and update encryptionPassword property.
+        // Capture editor values before a worker touches authoritative configuration.
+        final Gson gson = new Gson();
+        final Device editedDevice = gson.fromJson(gson.toJson(mDevice), Device.class);
+        final List<Folder> updatedFolders = new ArrayList<>();
         for (int i = 0; i < mFoldersContainer.getChildCount(); i++) {
             if (mFoldersContainer.getChildAt(i) instanceof TextView) {
                 continue;
@@ -630,51 +755,70 @@ public class DeviceActivity extends SyncthingActivity {
             LinearLayout folderView = (LinearLayout) mFoldersContainer.getChildAt(i);
             SwitchCompat switchView = (SwitchCompat) folderView.getChildAt(0);
             Boolean folderSharedWithDevice = switchView.isChecked();
-            Folder folder = (Folder) switchView.getTag();
+            Folder source = (Folder) switchView.getTag();
+            Folder folder = source == null ? null
+                    : gson.fromJson(gson.toJson(source), Folder.class);
             if (folder == null) {
                 continue;
             }
             EditText encryptPassView = (EditText) folderView.getChildAt(1);
             if (folderSharedWithDevice) {
-                folder.addDevice(mDevice);
-                folder.getDevice(mDevice.deviceID).encryptionPassword = encryptPassView.getText().toString();
+                folder.addDevice(editedDevice);
+                folder.getDevice(editedDevice.deviceID).encryptionPassword = encryptPassView.getText().toString();
             } else {
-                folder.removeDevice(mDevice.deviceID);
+                folder.removeDevice(editedDevice.deviceID);
             }
-            mConfig.updateFolder(getApi(), folder);
+            updatedFolders.add(folder);
         }
+        final RestApi restApi = getApi();
+        final boolean create = mIsCreateMode;
+        final boolean updateDevice = create || mDeviceNeedsToUpdate;
+        final boolean customConditions = mCustomSyncConditionsSwitch.isChecked();
+        beginConfigurationWrite();
+        mEditorWork.submit(() -> {
+            try {
+                for (Folder folder : updatedFolders) mConfig.updateFolder(restApi, folder);
+                if (updateDevice) mConfig.updateDevice(restApi, editedDevice);
+                return null;
+            } catch (RuntimeException failure) {
+                return failure;
+            }
+        }, failure -> {
+            if (failure == null && !create && updateDevice) {
+                mPreferences.edit().putBoolean(
+                        Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(
+                                Constants.PREF_OBJECT_PREFIX_DEVICE + editedDevice.deviceID),
+                        customConditions).apply();
+            }
+            completeConfigurationWrite(failure, create || updateDevice, false);
+        });
+    }
 
-        if (mIsCreateMode) {
-            Log.v(TAG, "onSave: Adding device with ID = \'" + mDevice.deviceID + "\'");
-            mConfig.updateDevice(getApi(), mDevice);
-            setResult(AppCompatActivity.RESULT_OK);
-            finish();
+    /** Keeps editor controls unavailable while a confirmed configuration write is in flight. */
+    private void beginConfigurationWrite() {
+        mEditorLoading = true;
+        invalidateOptionsMenu();
+        mLoadingDialog = new ProgressDialog(this);
+        mLoadingDialog.setMessage(getString(R.string.state_saving));
+        mLoadingDialog.setIndeterminate(true);
+        mLoadingDialog.setCancelable(false);
+        mLoadingDialog.show();
+    }
+
+    /** Reports a worker outcome on the UI thread without claiming an unsuccessful write. */
+    private void completeConfigurationWrite(RuntimeException failure, boolean changed,
+                                            boolean removed) {
+        dismissLoadingDialog();
+        mEditorLoading = false;
+        invalidateOptionsMenu();
+        if (failure != null) {
+            Log.w(TAG, "Device configuration write failed", failure);
+            Toast.makeText(this, R.string.configuration_unavailable, Toast.LENGTH_LONG).show();
             return;
         }
-
-        // Edit mode.
-        if (!mDeviceNeedsToUpdate) {
-            // We've got nothing to save.
-            setResult(AppCompatActivity.RESULT_CANCELED);
-            finish();
-            return;
-        }
-        // Log.v(TAG, "deviceID=" + mDevice.deviceID + ", introducedBy=" + mDevice.introducedBy);
-
-        // Save device specific preferences.
-        Log.v(TAG, "onSave: Updating device with ID = \'" + mDevice.deviceID + "\'");
-        SharedPreferences.Editor editor = mPreferences.edit();
-        editor.putBoolean(
-            Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_DEVICE + mDevice.deviceID),
-            mCustomSyncConditionsSwitch.isChecked()
-        );
-        editor.apply();
-
-        // Update device using RestApi or ConfigXml.
-        mConfig.updateDevice(getApi(), mDevice);
-        setResult(AppCompatActivity.RESULT_OK);
+        if (removed) mDeviceNeedsToUpdate = false;
+        setResult(changed ? AppCompatActivity.RESULT_OK : AppCompatActivity.RESULT_CANCELED);
         finish();
-        return;
     }
 
     /**
@@ -810,8 +954,8 @@ public class DeviceActivity extends SyncthingActivity {
 
         mDiscoveredDevicesContainer.removeAllViews();
         if (discoveredDevices.size() == 0) {
-            // No discovered devices. Determine if local discovery is enabled.
-            Options options = mConfig.getOptions(null);
+            // Passive discovery rendering must not read stopped root configuration or
+            // block this thread on normal configuration I/O.
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
             int dividerInset = getResources().getDimensionPixelOffset(R.dimen.material_divider_inset);
             int contentInset = getResources().getDimensionPixelOffset(R.dimen.abc_action_bar_content_inset_material);
@@ -819,10 +963,26 @@ public class DeviceActivity extends SyncthingActivity {
             setMarginEnd(params, contentInset);
             TextView emptyView = new TextView(mDiscoveredDevicesContainer.getContext());
             emptyView.setGravity(CENTER_VERTICAL);
-            if (options.localAnnounceEnabled) {
+            if (mPreferences.getBoolean(Constants.PREF_USE_ROOT, false)) {
                 emptyView.setText(getString(R.string.discovered_device_list_empty, getString(R.string.url_syncthing_homepage)));
             } else {
-                emptyView.setText(R.string.local_discovery_disabled);
+                emptyView.setText(R.string.configuration_unavailable);
+                mEditorWork.<Boolean>submitAsync(answer -> {
+                    boolean localDiscoveryEnabled = true;
+                    try {
+                        Options options = mConfig.getOptions(null);
+                        localDiscoveryEnabled = options.localAnnounceEnabled;
+                    } catch (RuntimeException failure) {
+                        Log.w(TAG, "Discovery options could not be read", failure);
+                    }
+                    answer.deliver(localDiscoveryEnabled);
+                }, enabled -> {
+                    if (mDiscoveredDevicesContainer.indexOfChild(emptyView) < 0) return;
+                    emptyView.setText(enabled
+                            ? getString(R.string.discovered_device_list_empty,
+                                    getString(R.string.url_syncthing_homepage))
+                            : getString(R.string.local_discovery_disabled));
+                });
             }
             mDiscoveredDevicesContainer.addView(emptyView, params);
             return;

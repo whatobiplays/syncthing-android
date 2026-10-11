@@ -119,6 +119,64 @@ public class FileMutationBarrierTest {
     }
 
     @Test
+    public void executionModeTransitionClosesCertificateAndLifecycleAdmissionAtomically() {
+        AtomicInteger launches = new AtomicInteger();
+        FileMutationBarrier.ExecutionModeTransitionReservation transition =
+                FileMutationBarrier.tryReserveExecutionModeTransition();
+
+        assertNotNull(transition);
+        assertNull(FileMutationBarrier.tryReserveCertificateRestore());
+        assertNull(FileMutationBarrier.tryReserveCertificateMutation());
+        assertFalse(FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                launches::incrementAndGet
+        ));
+        assertEquals(0, launches.get());
+
+        assertTrue(transition.release());
+        assertTrue(FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                launches::incrementAndGet
+        ));
+        assertEquals(1, launches.get());
+        FileMutationBarrier.CertificateRestoreReservation certificate =
+                FileMutationBarrier.tryReserveCertificateRestore();
+        assertNotNull(certificate);
+        assertTrue(certificate.release(true));
+    }
+
+    @Test
+    public void unresolvedCertificateOwnershipPreventsTransitionReservation() {
+        FileMutationBarrier.CertificateRestoreReservation certificate =
+                FileMutationBarrier.tryReserveCertificateRestore();
+
+        assertNotNull(certificate);
+        assertNull(FileMutationBarrier.tryReserveExecutionModeTransition());
+
+        assertTrue(certificate.release(true));
+        FileMutationBarrier.ExecutionModeTransitionReservation transition =
+                FileMutationBarrier.tryReserveExecutionModeTransition();
+        assertNotNull(transition);
+        assertTrue(transition.release());
+    }
+
+    @Test
+    public void releasingFailedPreCommitTransitionRestoresOldModeAdmission() {
+        AtomicInteger launches = new AtomicInteger();
+        FileMutationBarrier.ExecutionModeTransitionReservation transition =
+                FileMutationBarrier.tryReserveExecutionModeTransition();
+
+        assertNotNull(transition);
+        assertFalse(FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                launches::incrementAndGet
+        ));
+        assertTrue(transition.release());
+
+        assertTrue(FileMutationBarrier.commitLifecycleLaunchIfAvailable(
+                launches::incrementAndGet
+        ));
+        assertEquals(1, launches.get());
+    }
+
+    @Test
     public void databaseResetCannotCommitLaunchWhileCertificateStorageIsReserved() {
         FileMutationBarrier.CertificateRestoreReservation reservation =
                 FileMutationBarrier.tryReserveCertificateRestore();

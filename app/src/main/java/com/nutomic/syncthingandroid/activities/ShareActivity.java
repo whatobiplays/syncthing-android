@@ -10,6 +10,8 @@ import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Log;
@@ -29,12 +31,12 @@ import com.google.common.io.Files;
 import com.nutomic.syncthingandroid.R;
 import com.nutomic.syncthingandroid.SyncthingApp;
 import com.nutomic.syncthingandroid.model.Folder;
+import com.nutomic.syncthingandroid.runtime.FolderWorkQueue;
 import com.nutomic.syncthingandroid.service.AppPrefs;
 import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.SyncthingService;
 import com.nutomic.syncthingandroid.service.SyncthingServiceBinder;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
-import com.nutomic.syncthingandroid.util.ConfigXml.OpenConfigException;
 import com.nutomic.syncthingandroid.util.Util;
 
 import java.io.File;
@@ -48,6 +50,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
 
 import javax.inject.Inject;
 
@@ -74,6 +77,12 @@ public class ShareActivity extends SyncthingActivity
     public static final String PREF_FOLDER_SAVED_SUBDIRECTORY = "saved_sub_directory_";
 
     private ConfigRouter mConfig;
+    private final FolderWorkQueue mFolderLoad = new FolderWorkQueue(
+            Executors.newSingleThreadExecutor(),
+            new Handler(Looper.getMainLooper())::post
+    );
+    private boolean mFolderLoadInFlight;
+    private boolean mFolderLoadDirty;
 
     private Spinner mFoldersSpinner;
 
@@ -94,10 +103,33 @@ public class ShareActivity extends SyncthingActivity
 
     @Override
     public void onServiceStateChange(SyncthingService.State currentState) {
-        List<Folder> folders = null;
-        try {
-            folders = mConfig.getFolders(getApi());
-        } catch (OpenConfigException e) {
+        if (mFolderLoadInFlight) {
+            mFolderLoadDirty = true;
+            return;
+        }
+        mFolderLoadInFlight = true;
+        final com.nutomic.syncthingandroid.service.RestApi api = getApi();
+        mFolderLoad.submit(() -> {
+            try {
+                return mConfig.getFolders(api);
+            } catch (RuntimeException unavailable) {
+                Log.w(TAG, "Share folders could not be read", unavailable);
+                return null;
+            }
+        }, folders -> {
+            mFolderLoadInFlight = false;
+            if (mFolderLoadDirty) {
+                mFolderLoadDirty = false;
+                onServiceStateChange(currentState);
+                return;
+            }
+            showAvailableFolders(folders);
+        });
+    }
+
+    /** Displays only the result of the latest background configuration read. */
+    private void showAvailableFolders(List<Folder> folders) {
+        if (folders == null) {
             Toast.makeText(this, getString(R.string.complete_welcome_wizard_first), Toast.LENGTH_LONG).show();
             finish();
             return;
@@ -270,6 +302,7 @@ public class ShareActivity extends SyncthingActivity
 
     @Override
     protected void onDestroy() {
+        mFolderLoad.close();
         if (mSyncthingService != null) {
             mSyncthingService.unregisterOnServiceStateChangeListener(ShareActivity.this);
         }

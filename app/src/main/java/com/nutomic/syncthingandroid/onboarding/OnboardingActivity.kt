@@ -489,6 +489,16 @@ class OnboardingActivity : ThemedAppCompatActivity() {
                 return@launch
             }
 
+            if (!recordInstallationMarker()) {
+                uiState = uiState.copy(
+                    keyGenerationRunning = false,
+                    keyGenerationFailed = true,
+                    hasConfig = true,
+                    keyGenerationStatus = getString(R.string.installation_marker_write_failed),
+                )
+                return@launch
+            }
+
             uiState = uiState.copy(
                 keyGenerationRunning = false,
                 keyGenerationFailed = false,
@@ -500,18 +510,46 @@ class OnboardingActivity : ThemedAppCompatActivity() {
 
     private fun checkForParseableConfig(): Boolean {
         val configExists = Constants.getConfigFile(this).exists()
-        if (!configExists) {
+        val superuserModeSelected = prefs.getBoolean(Constants.PREF_USE_ROOT, false)
+        val markerPresent = prefs.getBoolean(Constants.PREF_INSTALLATION_MARKER, false)
+
+        if (!InstallationRecognition.shouldSkipKeyGeneration(
+                markerPresent, superuserModeSelected, configExists
+            )) {
             return false
         }
 
+        if (superuserModeSelected) {
+            if (InstallationRecognition.shouldRecordMarker(true, false)
+                    && !recordInstallationMarker()) {
+                Log.w(TAG, "Could not persist the installation marker for a root-configured install")
+            }
+            return true
+        }
+        if (markerPresent) {
+            return true
+        }
+
+        // An existing but unreadable file is evidence that must block first-run key generation.
+        // Parsing it here is safe because the committed mode is Normal Mode.
         try {
             val configParseTest = ConfigXml(this)
             configParseTest.loadConfig()
+            if (InstallationRecognition.shouldRecordMarker(false, true)
+                    && !recordInstallationMarker()) {
+                Log.w(TAG, "Could not persist the installation marker for an existing install")
+            }
             return true
         } catch (_: OpenConfigException) {
-            Log.d(TAG, "Failed to parse existing config. Will show key generation slide ...")
+            Log.w(TAG, "Existing configuration could not be read; skipping fresh key generation")
         }
 
-        return false
+        return true
+    }
+
+    private fun recordInstallationMarker(): Boolean {
+        return prefs.edit()
+            .putBoolean(Constants.PREF_INSTALLATION_MARKER, true)
+            .commit()
     }
 }
