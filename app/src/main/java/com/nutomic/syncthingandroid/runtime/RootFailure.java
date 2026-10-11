@@ -15,6 +15,8 @@ public enum RootFailure {
     ROOT_DENIED,
     /** No root transport exists on the device, so no root request could be delivered. */
     ROOT_UNAVAILABLE,
+    /** libsu has no guaranteed prompt-free way to create a fresh root shell for this operation. */
+    ROOT_NONINTERACTIVE_UNAVAILABLE,
     /** Root activation did not complete inside the bounded activation window. */
     ROOT_ACTIVATION_TIMEOUT,
     /** A root shell existed but failed while carrying out an operation. */

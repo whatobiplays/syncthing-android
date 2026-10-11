@@ -48,8 +48,15 @@ public final class DefaultSyncthingRuntime
                 throws InterruptedException;
     }
 
-    private final PrivilegeBackend backend;
+    private volatile PrivilegeBackend backend;
+    /** Changes only after backend operation admission is closed and drained. */
+    private volatile long executionModeGeneration;
+    private final PrivilegeBackend appUidBackend;
+    private final PrivilegeBackend rootBackend;
+    private final RootAuthorizationCapability rootAuthorization;
     private final AdmissionGate admission = new AdmissionGate();
+    private final RuntimeOperationAdmission operationAdmission =
+            new RuntimeOperationAdmission();
     private final LaunchPermitAcquirer launchPermitAcquirer;
     /** Guards the admitted execution handle the runtime keeps for a later recovery settlement. */
     private final Object settlementLock = new Object();
@@ -74,7 +81,194 @@ public final class DefaultSyncthingRuntime
             LaunchPermitAcquirer launchPermitAcquirer
     ) {
         this.backend = Objects.requireNonNull(backend);
+        this.appUidBackend = backend;
+        this.rootBackend = null;
+        this.rootAuthorization = null;
         this.launchPermitAcquirer = Objects.requireNonNull(launchPermitAcquirer);
+    }
+
+    /** Creates the runtime with both backends and the device-local committed mode. */
+    public DefaultSyncthingRuntime(
+            PrivilegeBackend appUidBackend,
+            PrivilegeBackend rootBackend,
+            RootAuthorizationCapability rootAuthorization,
+            boolean useRoot
+    ) {
+        this.appUidBackend = Objects.requireNonNull(appUidBackend);
+        this.rootBackend = Objects.requireNonNull(rootBackend);
+        this.rootAuthorization = Objects.requireNonNull(rootAuthorization);
+        this.backend = useRoot ? rootBackend : appUidBackend;
+        this.launchPermitAcquirer = OwnedExecutionShutdown::acquireLaunchPermit;
+    }
+
+    /** Closes semantic backend operations and waits within the caller's bound for admitted work. */
+    public boolean closeBackendOperationAdmission(long timeoutMillis) throws InterruptedException {
+        return operationAdmission.closeAndWait(timeoutMillis);
+    }
+
+    /** Reopens admission after pre-commit failure, once timed-out operations have left. */
+    public void reopenBackendOperationAdmissionWhenDrained() {
+        operationAdmission.reopenWhenDrained();
+    }
+
+    /**
+     * Opens backend operations after a selected-backend change, or leaves an already-open gate
+     * untouched during idempotent preference reconciliation.
+     */
+    public void openBackendOperationAdmission() {
+        operationAdmission.open();
+    }
+
+    /** Runs a continuation when a closed backend-operation gate has fully drained. */
+    public void whenBackendOperationAdmissionDrained(Runnable continuation) {
+        operationAdmission.whenClosedAndDrained(Objects.requireNonNull(continuation));
+    }
+
+    /** Reports whether the selected backend is the root backend. */
+    public boolean isSuperuserModeSelected() {
+        return rootBackend != null && backend == rootBackend;
+    }
+
+    /** Checks application-UID access through the app backend without acquiring root. */
+    public boolean isAppUidManagedStateAccessible() {
+        return appUidBackend.managedStateTransfer().isAppAccessAvailable();
+    }
+
+    /** Reports root authorization already confirmed in this process without acquiring a shell. */
+    public boolean isRootAuthorizationAvailableWithoutPrompt() {
+        return rootAuthorization != null
+                && rootAuthorization.isAuthorizationAvailableWithoutPrompt();
+    }
+
+    /** Performs bounded root authorization for an explicit user action. */
+    public void verifyRootAuthorization() throws IOException {
+        if (rootAuthorization == null) {
+            throw new RootTransportException(
+                    RootFailure.ROOT_UNAVAILABLE,
+                    "The root backend is unavailable"
+            );
+        }
+        rootAuthorization.verifyAuthorization();
+    }
+
+    /** Changes the active backend after the service has quiesced the old mode. */
+    public void selectExecutionMode(boolean useRoot) {
+        if (!operationAdmission.isClosedAndDrained()) {
+            throw new IllegalStateException(
+                    "Execution mode can change only while backend operations are quiesced"
+            );
+        }
+        PrivilegeBackend selected = useRoot ? rootBackend : appUidBackend;
+        if (selected == null) {
+            throw new IllegalStateException("The requested execution backend is unavailable");
+        }
+        synchronized (settlementLock) {
+            if (admittedExecution != null) {
+                throw new IllegalStateException(
+                        "Execution mode can change only after the admitted execution settles"
+                );
+            }
+            backend = selected;
+            executionModeGeneration++;
+        }
+    }
+
+    /**
+     * Holds runtime-operation admission from event acceptance until its asynchronous script work
+     * reaches a terminal result. The selected backend and generation cannot change while this
+     * permit is outstanding, because mode selection requires closed and drained admission.
+     */
+    public final class FolderScriptReservation implements AutoCloseable {
+        private final RuntimeOperationAdmission.Permit permit;
+        private final PrivilegeBackend selectedBackend;
+        private final long generation;
+        private boolean closed;
+        private boolean ran;
+        private boolean running;
+
+        private FolderScriptReservation(RuntimeOperationAdmission.Permit permit) {
+            this.permit = permit;
+            selectedBackend = backend;
+            generation = executionModeGeneration;
+        }
+
+        public boolean isSuperuserMode() {
+            return rootBackend != null && selectedBackend == rootBackend;
+        }
+
+        public long generation() { return generation; }
+
+        /** Executes only through the backend captured by the admitted event. */
+        public List<FolderScriptOutcome> run(
+                ConfiguredFolderReference folder,
+                FolderEvent event,
+                RunScriptRootAuthorization authorization
+        ) throws FolderOperationException {
+            synchronized (this) {
+                if (closed || ran || backend != selectedBackend
+                        || generation != executionModeGeneration) {
+                    throw new FolderOperationException(
+                            FolderOperationFailure.FOLDER_OPERATION_CANCELLED,
+                            "The Run Script event no longer owns its selected backend"
+                    );
+                }
+                ran = true;
+                running = true;
+            }
+            try {
+                return selectedBackend.runFolderScripts(folder, event, authorization);
+            } finally {
+                synchronized (this) {
+                    running = false;
+                    if (closed) permit.close();
+                }
+            }
+        }
+
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true;
+            if (!running) permit.close();
+        }
+    }
+
+    /** Reserves a backend operation before accepting an asynchronous Run Script event. */
+    public FolderScriptReservation tryReserveFolderScriptOperation() {
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        return permit == null ? null : new FolderScriptReservation(permit);
+    }
+
+    /** Repairs Managed State through UID 0 while the service owns a closed transition gate. */
+    public void repairManagedStateAccessDuringModeTransition() throws ManagedStateException {
+        if (!operationAdmission.isClosedAndDrained()) {
+            throw new IllegalStateException(
+                    "Managed State repair requires closed backend operation admission"
+            );
+        }
+        if (rootBackend == null) {
+            throw new ManagedStateException(
+                    ManagedStateFailure.STATE_REPAIR_FAILED,
+                    "The root Managed State repair backend is unavailable"
+            );
+        }
+        rootBackend.managedStateTransfer().repairAppAccess();
+    }
+
+    /** Repairs Managed State during a mode transition without triggering another root prompt. */
+    public void repairManagedStateAccessDuringModeTransitionIfAuthorized()
+            throws ManagedStateException {
+        if (!operationAdmission.isClosedAndDrained()) {
+            throw new IllegalStateException(
+                    "Managed State repair requires closed backend operation admission"
+            );
+        }
+        if (rootBackend == null) {
+            throw new ManagedStateException(
+                    ManagedStateFailure.STATE_REPAIR_FAILED,
+                    "The root Managed State repair backend is unavailable"
+            );
+        }
+        rootBackend.managedStateTransfer().repairAppAccessIfAuthorized();
     }
 
     /**
@@ -203,6 +397,27 @@ public final class DefaultSyncthingRuntime
     }
 
     private SyncthingExecution launch(
+            SyncthingCommand command,
+            SyncthingEnvironment environment,
+            OwnedExecutionRecoveryHandler recoveryHandler,
+            LifecycleLaunchCheck launchCheck,
+            boolean serviceLifecycle
+    ) throws IOException, ExecutableNotFoundException, InterruptedException {
+        RuntimeOperationAdmission.Permit operationPermit = operationAdmission.tryEnter();
+        if (operationPermit == null) {
+            admission.release();
+            throw new ExecutionAdmissionException();
+        }
+        try {
+            return launchAdmitted(
+                    command, environment, recoveryHandler, launchCheck, serviceLifecycle
+            );
+        } finally {
+            operationPermit.close();
+        }
+    }
+
+    private SyncthingExecution launchAdmitted(
             SyncthingCommand command,
             SyncthingEnvironment environment,
             OwnedExecutionRecoveryHandler recoveryHandler,
@@ -453,7 +668,59 @@ public final class DefaultSyncthingRuntime
     }
 
     public ConfigStorage configStorage() {
-        return backend.configStorage();
+        return new ConfigStorage() {
+            @Override
+            public boolean canRead() {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) return false;
+                try {
+                    return backend.configStorage().canRead();
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public byte[] load() throws IOException {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) {
+                    throw new IOException(
+                            "Configuration access is busy during an execution mode transition"
+                    );
+                }
+                try {
+                    return backend.configStorage().load();
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public boolean canWrite() {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) return false;
+                try {
+                    return backend.configStorage().canWrite();
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public void save(byte[] contents) throws IOException {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) {
+                    throw new IOException(
+                            "Configuration update is busy during an execution mode transition"
+                    );
+                }
+                try {
+                    backend.configStorage().save(contents);
+                } finally {
+                    permit.close();
+                }
+            }
+        };
     }
 
     /**
@@ -464,7 +731,59 @@ public final class DefaultSyncthingRuntime
      * failure.</p>
      */
     public ManagedStateTransfer managedStateTransfer() {
-        return backend.managedStateTransfer();
+        return new ManagedStateTransfer() {
+            @Override
+            public boolean isAppAccessAvailable() {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) return false;
+                try {
+                    return backend.managedStateTransfer().isAppAccessAvailable();
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public ManagedStateStaging snapshotForExport() throws ManagedStateException {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) throw managedStateAdmissionFailure();
+                try {
+                    return backend.managedStateTransfer().snapshotForExport();
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public void installImportedState(ManagedStateStaging staging)
+                    throws ManagedStateException {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) throw managedStateAdmissionFailure();
+                try {
+                    backend.managedStateTransfer().installImportedState(staging);
+                } finally {
+                    permit.close();
+                }
+            }
+
+            @Override
+            public void repairAppAccess() throws ManagedStateException {
+                RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+                if (permit == null) throw managedStateAdmissionFailure();
+                try {
+                    backend.managedStateTransfer().repairAppAccess();
+                } finally {
+                    permit.close();
+                }
+            }
+        };
+    }
+
+    private static ManagedStateException managedStateAdmissionFailure() {
+        return new ManagedStateException(
+                ManagedStateFailure.EXECUTION_MODE_TRANSITION_BUSY,
+                "Managed State operations are closed during an execution mode transition"
+        );
     }
 
     /**
@@ -484,7 +803,13 @@ public final class DefaultSyncthingRuntime
      * never leaves an artifact behind in the folder.</p>
      */
     public FolderWriteability validateCandidateFolder(String path) throws FolderOperationException {
-        return backend.validateCandidateFolder(path);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) throw folderAdmissionFailure();
+        try {
+            return backend.validateCandidateFolder(path);
+        } finally {
+            permit.close();
+        }
     }
 
     /**
@@ -495,7 +820,13 @@ public final class DefaultSyncthingRuntime
      */
     public ConflictDiscoveryResult discoverConflicts(ConfiguredFolderReference folder)
             throws FolderOperationException {
-        return backend.discoverConflicts(folder);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) throw folderAdmissionFailure();
+        try {
+            return backend.discoverConflicts(folder);
+        } finally {
+            permit.close();
+        }
     }
 
     /**
@@ -506,13 +837,25 @@ public final class DefaultSyncthingRuntime
      */
     public FolderIgnoreResult loadFolderIgnoreList(ConfiguredFolderReference folder)
             throws FolderOperationException {
-        return backend.loadFolderIgnoreList(folder);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) throw folderAdmissionFailure();
+        try {
+            return backend.loadFolderIgnoreList(folder);
+        } finally {
+            permit.close();
+        }
     }
 
     /** Replaces the ignore list of one configured folder through the selected backend. */
     public void saveFolderIgnoreList(ConfiguredFolderReference folder, String[] ignore)
             throws FolderOperationException {
-        backend.saveFolderIgnoreList(folder, ignore);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) throw folderAdmissionFailure();
+        try {
+            backend.saveFolderIgnoreList(folder, ignore);
+        } finally {
+            permit.close();
+        }
     }
 
     /**
@@ -526,7 +869,20 @@ public final class DefaultSyncthingRuntime
             ConfiguredFolderReference folder,
             FolderEvent event
     ) throws FolderOperationException {
-        return backend.runFolderScripts(folder, event);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) throw folderAdmissionFailure();
+        try {
+            return backend.runFolderScripts(folder, event);
+        } finally {
+            permit.close();
+        }
+    }
+
+    private static FolderOperationException folderAdmissionFailure() {
+        return new FolderOperationException(
+                FolderOperationFailure.EXECUTION_MODE_TRANSITION_BUSY,
+                "Folder operations are closed during an execution mode transition"
+        );
     }
 
     /**
@@ -537,7 +893,17 @@ public final class DefaultSyncthingRuntime
      * raised: the optimization is optional, so a device that cannot apply it keeps working.</p>
      */
     public TuningOutcome applyIoPriority(ExecutionIdentity identity) {
-        return backend.applyIoPriority(identity);
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) {
+            return TuningOutcome.notApplicable(
+                    "I/O priority was skipped during an execution mode transition"
+            );
+        }
+        try {
+            return backend.applyIoPriority(identity);
+        } finally {
+            permit.close();
+        }
     }
 
     /**
@@ -550,7 +916,36 @@ public final class DefaultSyncthingRuntime
      * The outcome is always returned rather than raised.</p>
      */
     public TuningOutcome applyInotifyWatchLimit() {
-        return backend.applyInotifyWatchLimit();
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) {
+            return TuningOutcome.failed(
+                    "Inotify tuning is busy during an execution mode transition"
+            );
+        }
+        try {
+            return rootBackend == null
+                    ? TuningOutcome.notApplicable("The root tuning backend is unavailable")
+                    : rootBackend.applyInotifyWatchLimit();
+        } finally {
+            permit.close();
+        }
+    }
+
+    /** Reapplies inotify tuning only when root authorization is already available. */
+    public TuningOutcome applyInotifyWatchLimitIfAuthorized() {
+        RuntimeOperationAdmission.Permit permit = operationAdmission.tryEnter();
+        if (permit == null) {
+            return TuningOutcome.notApplicable(
+                    "Inotify reapplication was skipped during an execution mode transition"
+            );
+        }
+        try {
+            return rootAuthorization == null
+                    ? TuningOutcome.notApplicable("The root tuning backend is unavailable")
+                    : rootAuthorization.applyInotifyWatchLimitIfAuthorized();
+        } finally {
+            permit.close();
+        }
     }
 
     @FunctionalInterface

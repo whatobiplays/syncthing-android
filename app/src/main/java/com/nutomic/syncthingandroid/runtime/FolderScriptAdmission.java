@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 public final class FolderScriptAdmission {
     private final Object lock = new Object();
     private boolean closed;
+    private boolean reopenWhenDrained;
     private int active;
 
     /**
@@ -46,8 +47,33 @@ public final class FolderScriptAdmission {
             active--;
             if (active <= 0) {
                 active = 0;
+                if (closed && reopenWhenDrained) {
+                    closed = false;
+                    reopenWhenDrained = false;
+                }
                 lock.notifyAll();
             }
+        }
+    }
+
+    /**
+     * Reopens a gate after a transition failed before commit.
+     *
+     * <p>If an admitted dispatch is still running, the gate stays closed until its matching
+     * {@link #leave()} call. This prevents a timed-out transition from permanently blocking
+     * scripts while also ensuring that old-mode work is not admitted before the current dispatch
+     * reaches a terminal result.</p>
+     */
+    public void reopenWhenDrained() {
+        synchronized (lock) {
+            if (!closed) return;
+            if (active == 0) {
+                closed = false;
+                reopenWhenDrained = false;
+            } else {
+                reopenWhenDrained = true;
+            }
+            lock.notifyAll();
         }
     }
 
@@ -65,6 +91,7 @@ public final class FolderScriptAdmission {
         long remainingNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
         synchronized (lock) {
             closed = true;
+            reopenWhenDrained = false;
             long deadline = System.nanoTime() + remainingNanos;
             while (active > 0) {
                 remainingNanos = deadline - System.nanoTime();

@@ -25,6 +25,7 @@ import com.nutomic.syncthingandroid.service.Constants;
 import com.nutomic.syncthingandroid.service.RestApi;
 import com.nutomic.syncthingandroid.service.SyncthingService;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
+import com.nutomic.syncthingandroid.util.ConfigurationUnavailableException;
 import com.nutomic.syncthingandroid.util.ConfigXml.OpenConfigException;
 import com.nutomic.syncthingandroid.views.DevicesAdapter;
 
@@ -163,6 +164,17 @@ public class DeviceListFragment extends ListFragment implements SyncthingService
         RestApi restApi = activity.getApi();
         try {
             devices = mConfigRouter.getDevices(restApi, false);
+        } catch (ConfigurationUnavailableException e) {
+            Log.i(TAG, "Stopped Superuser Mode has no in-memory configuration projection");
+            if (mAdapter == null) {
+                mAdapter = new DevicesAdapter(activity);
+                setListAdapter(mAdapter);
+            }
+            mAdapter.clear();
+            mAdapter.notifyDataSetChanged();
+            setEmptyText(getString(R.string.configuration_unavailable));
+            setListShown(true);
+            return;
         } catch (OpenConfigException e) {
             Log.e(TAG, "Failed to parse existing config. You will need support from here ...");
             return;
@@ -184,6 +196,7 @@ public class DeviceListFragment extends ListFragment implements SyncthingService
             mAdapter = new DevicesAdapter(activity);
             setListAdapter(mAdapter);
         }
+        setEmptyText(getString(R.string.no_devices_configured));
         mAdapter.setRestApi(mConfigRouter, restApi);
 
         // Prevent scroll position reset due to list update from clear().

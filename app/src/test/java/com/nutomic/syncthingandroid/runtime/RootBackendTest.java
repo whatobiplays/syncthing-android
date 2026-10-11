@@ -893,6 +893,31 @@ public class RootBackendTest {
     }
 
     @Test
+    public void explicitManagedStateRepairWorksWithoutAnAlreadyAuthorizedCapability()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.authorizationAvailableWithoutPrompt = false;
+            File config = fixture.locations.member(ManagedStateMember.CONFIG);
+            writeText(config, "<configuration/>");
+
+            assertFalse(fixture.factory.isAuthorizationAvailableWithoutPrompt());
+            assertNull(fixture.factory.acquireIfAuthorized(1_000));
+            assertEquals("the no-prompt path must not start an `su` process", 0,
+                    fixture.factory.acquireCalls());
+
+            fixture.backend.managedStateTransfer().repairAppAccess();
+
+            assertEquals("explicit repair acquires one operation-scoped root shell", 1,
+                    fixture.factory.acquireCalls());
+            assertTrue("repair proves app-UID access to the complete Managed State manifest",
+                    fixture.backend.managedStateTransfer().isAppAccessAvailable());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
     public void publicSurfaceExposesNoGenericRootCommandApi() throws Exception {
         for (Method method : RootBackend.class.getDeclaredMethods()) {
             if (!Modifier.isPublic(method.getModifiers())) {
@@ -4528,6 +4553,228 @@ public class RootBackendTest {
             output.write(buffer, 0, count);
         }
         return new String(output.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    @Test
+    public void syncCompletionScriptDoesNotAcquireNewRootAuthorization() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.authorizationAvailableWithoutPrompt = false;
+
+            assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE
+                    )
+            );
+
+            assertEquals("no root shell is acquired from the callback path", 0,
+                    fixture.device.acquisitions);
+            assertTrue(fixture.device.scriptDispatchRoots.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void optedInScriptUsesOneExplicitHelperWithoutNoPromptCapability() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.authorizationAvailableWithoutPrompt = false;
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            fixture.device.folderScriptOutcomes = Collections.singletonList(
+                    FolderScriptOutcome.of("backup.sh", 0));
+
+            assertEquals(fixture.device.folderScriptOutcomes,
+                    fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE, () -> true));
+            assertEquals(1, fixture.device.acquisitions);
+            assertEquals(Collections.singletonList("/configured/folder"),
+                    fixture.device.scriptDispatchRoots);
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void optedInScriptPreservesTypedAuthorizationFailuresWithoutExecutingScripts()
+            throws Exception {
+        RootFailure[] failures = {
+                RootFailure.ROOT_DENIED,
+                RootFailure.ROOT_AUTHORIZATION_LOST,
+                RootFailure.ROOT_ACTIVATION_TIMEOUT,
+                RootFailure.ROOT_UNAVAILABLE
+        };
+        FolderOperationFailure[] expected = {
+                FolderOperationFailure.ROOT_SCRIPT_AUTH_DENIED,
+                FolderOperationFailure.ROOT_SCRIPT_AUTH_LOST,
+                FolderOperationFailure.ROOT_SCRIPT_AUTH_TIMEOUT,
+                FolderOperationFailure.ROOT_SCRIPT_AUTH_UNAVAILABLE
+        };
+        for (int i = 0; i < failures.length; i++) {
+            Fixture fixture = new Fixture();
+            try {
+                fixture.device.authorizationAvailableWithoutPrompt = false;
+                fixture.device.activationFailure = failures[i];
+                FolderOperationException error = assertThrows(
+                        FolderOperationException.class,
+                        () -> fixture.backend.runFolderScripts(
+                                ConfiguredFolderReference.of("folder-1"),
+                                FolderEvent.SYNC_COMPLETE, () -> true));
+                assertEquals(expected[i], error.failure());
+                assertEquals(1, fixture.device.acquisitions);
+                assertTrue(fixture.device.scriptDispatchRoots.isEmpty());
+            } finally {
+                fixture.close();
+            }
+        }
+    }
+
+    @Test
+    public void revokedAuthorizationAfterAcquisitionNeverReachesConfiguredFolderOrScript()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            java.util.concurrent.atomic.AtomicInteger checks =
+                    new java.util.concurrent.atomic.AtomicInteger();
+            FolderOperationException error = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE,
+                            () -> checks.incrementAndGet() < 4));
+            assertEquals(FolderOperationFailure.FOLDER_OPERATION_CANCELLED, error.failure());
+            assertEquals(1, fixture.device.acquisitions);
+            assertTrue(fixture.device.scriptDispatchRoots.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void cancellationAtAuthorizationBoundaryNeverStartsRootAcquisition()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            FolderOperationException error = assertThrows(
+                    FolderOperationException.class,
+                    () -> fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE,
+                            new RunScriptRootAuthorization() {
+                                @Override public boolean isCurrent() { return true; }
+                                @Override public boolean tryBeginAuthorization() { return false; }
+                            }));
+            assertEquals(FolderOperationFailure.FOLDER_OPERATION_CANCELLED, error.failure());
+            assertEquals(0, fixture.device.acquisitions);
+            assertTrue(fixture.device.scriptDispatchRoots.isEmpty());
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void timedOutScriptKeepsItsOperationUntilAcquisitionActuallySettles() throws Exception {
+        Fixture fixture = new Fixture(80);
+        fixture.device.activationPaused = new CountDownLatch(1);
+        fixture.device.activationRelease = new CountDownLatch(1);
+        CountDownLatch timeoutReported = new CountDownLatch(1);
+        AtomicReference<FolderOperationException> failure = new AtomicReference<>();
+        Thread script = new Thread(() -> {
+            try {
+                fixture.backend.runFolderScripts(
+                        ConfiguredFolderReference.of("folder-1"),
+                        FolderEvent.SYNC_COMPLETE,
+                        new RunScriptRootAuthorization() {
+                            @Override public boolean isCurrent() { return true; }
+                            @Override public void onAuthorizationTimeout() {
+                                timeoutReported.countDown();
+                            }
+                        });
+            } catch (FolderOperationException error) {
+                failure.set(error);
+            }
+        }, "pending-root-script");
+        script.setDaemon(true);
+        try {
+            script.start();
+            assertTrue(fixture.device.activationPaused.await(5, TimeUnit.SECONDS));
+            assertTrue(timeoutReported.await(5, TimeUnit.SECONDS));
+            assertTrue("timeout is not proof that the helper worker exited", script.isAlive());
+            assertTrue(fixture.device.scriptDispatchRoots.isEmpty());
+            fixture.device.activationRelease.countDown();
+            script.join(5_000);
+            assertFalse(script.isAlive());
+            assertEquals(FolderOperationFailure.ROOT_SCRIPT_AUTH_TIMEOUT,
+                    failure.get().failure());
+        } finally {
+            fixture.device.activationRelease.countDown();
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void syncCompletionScriptRunsWithAnAlreadyAvailableRootCapability() throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            writeFolderConfiguration(fixture, "folder-1", "/configured/folder");
+            fixture.device.folderScriptOutcomes = Collections.singletonList(
+                    FolderScriptOutcome.of("backup.sh", 0)
+            );
+
+            assertEquals(
+                    Collections.singletonList(FolderScriptOutcome.of("backup.sh", 0)),
+                    fixture.backend.runFolderScripts(
+                            ConfiguredFolderReference.of("folder-1"),
+                            FolderEvent.SYNC_COMPLETE
+                    )
+            );
+
+            assertEquals("the authorized helper is acquired once", 1,
+                    fixture.device.acquisitions);
+            assertEquals(Collections.singletonList("/configured/folder"),
+                    fixture.device.scriptDispatchRoots);
+            assertEquals(Collections.singletonList("sync_complete"),
+                    fixture.device.scriptDispatchEvents);
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void optionalInotifyReapplicationSkipsWhenRootWasNotAlreadyAuthorized()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.authorizationAvailableWithoutPrompt = false;
+
+            TuningOutcome outcome = fixture.backend.applyInotifyWatchLimitIfAuthorized();
+
+            assertEquals(TuningOutcome.Status.NOT_APPLICABLE, outcome.status());
+            assertEquals("background reapplication never acquires a shell", 0,
+                    fixture.device.acquisitions);
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void authorizationRevokedBetweenCapabilityCheckAndAcquireDoesNotStartShell()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        try {
+            fixture.device.revokeAuthorizationDuringNextAuthorizedAcquisition = true;
+
+            TuningOutcome outcome = fixture.backend.applyInotifyWatchLimitIfAuthorized();
+
+            assertEquals(TuningOutcome.Status.FAILED, outcome.status());
+            assertEquals("the revoked capability must not start a new root process", 0,
+                    fixture.device.acquisitions);
+        } finally {
+            fixture.close();
+        }
     }
 
     /** One backend, fake device, and temporary state directory owned by a single test. */

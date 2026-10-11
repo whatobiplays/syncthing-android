@@ -1391,10 +1391,10 @@ public class RuntimeSeamTest {
             throws IOException, FolderOperationException {
         RecordingBackend backend = new RecordingBackend();
         DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
-        ConfigStorage storage = backend.storage;
+        ConfigStorage storage = runtime.configStorage();
         ConfiguredFolderReference folder = ConfiguredFolderReference.of("folder-id");
 
-        assertSame(storage, runtime.configStorage());
+        assertTrue(storage.canRead());
         storage.save(new byte[]{1, 2, 3});
         assertArrayEquals(new byte[]{1, 2, 3}, storage.load());
         assertEquals(
@@ -1420,6 +1420,22 @@ public class RuntimeSeamTest {
         assertEquals("folder-id", backend.folder.id());
         assertEquals(FolderEvent.SYNC_COMPLETE, backend.event);
         assertEquals("sync_complete", FolderEvent.SYNC_COMPLETE.argument());
+    }
+
+    @Test
+    public void reservedScriptWorkOwnsRuntimeAdmissionBeforeScheduling() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        DefaultSyncthingRuntime runtime = new DefaultSyncthingRuntime(backend);
+        DefaultSyncthingRuntime.FolderScriptReservation reservation =
+                runtime.tryReserveFolderScriptOperation();
+        assertNotNull(reservation);
+        assertFalse(runtime.closeBackendOperationAdmission(0));
+        assertNull(runtime.tryReserveFolderScriptOperation());
+        assertEquals(Collections.singletonList(FolderScriptOutcome.of("backup.sh", 0)),
+                reservation.run(ConfiguredFolderReference.of("folder-id"),
+                        FolderEvent.SYNC_COMPLETE, RunScriptRootAuthorization.DENY));
+        reservation.close();
+        assertTrue(runtime.closeBackendOperationAdmission(0));
     }
 
     @Test

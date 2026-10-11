@@ -2,6 +2,7 @@ package com.nutomic.syncthingandroid.runtime;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -10,6 +11,7 @@ import com.topjohnwu.superuser.Shell;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -52,6 +54,31 @@ public class LibsuRootShellFactoryTest {
         assertEquals(1, LibsuRootShellFactory.internalShellTimeoutSeconds(1));
         assertEquals(1, LibsuRootShellFactory.internalShellTimeoutSeconds(10_000));
         assertEquals(3, LibsuRootShellFactory.internalShellTimeoutSeconds(23_000));
+    }
+
+    @Test
+    public void optionalRootHelpersFailClosedWithoutStartingAnInteractiveShell() {
+        LibsuRootShellFactory factory = new LibsuRootShellFactory(
+                new String[] {"su"},
+                1_000,
+                new ManagedStateLocations(
+                        new File("/tmp/managed-state"),
+                        new File("/tmp/managed-state-staging"),
+                        10_000,
+                        10_000
+                )
+        );
+
+        assertFalse(factory.isAuthorizationAvailableWithoutPrompt());
+        RootTransportException failure = null;
+        try {
+            factory.acquireIfAuthorized(1_000);
+        } catch (RootTransportException expected) {
+            failure = expected;
+        }
+        assertTrue(failure != null);
+        assertEquals(RootFailure.ROOT_NONINTERACTIVE_UNAVAILABLE, failure.failure());
+        assertTrue(failure.getMessage().contains("prompt-free"));
     }
 
     @Test

@@ -55,6 +55,7 @@ import com.nutomic.syncthingandroid.service.RestApi;
 import com.nutomic.syncthingandroid.service.SyncthingService;
 import com.nutomic.syncthingandroid.service.SyncthingServiceBinder;
 import com.nutomic.syncthingandroid.util.ConfigRouter;
+import com.nutomic.syncthingandroid.util.ConfigurationUnavailableException;
 import com.nutomic.syncthingandroid.util.PermissionUtil;
 import com.nutomic.syncthingandroid.util.Util;
 
@@ -484,7 +485,13 @@ public class MainActivity extends SyncthingActivity
             return;
         }
         RestApi restApi = getApi();
-        List<Device> devices = mConfig.getDevices(restApi, true);
+        List<Device> devices;
+        try {
+            devices = mConfig.getDevices(restApi, true);
+        } catch (ConfigurationUnavailableException unavailable) {
+            Toast.makeText(this, R.string.configuration_unavailable, Toast.LENGTH_LONG).show();
+            return;
+        }
         String deviceName = "";
 
         for (Device d : devices) {

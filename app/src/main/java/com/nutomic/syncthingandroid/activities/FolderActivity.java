@@ -161,6 +161,8 @@ public class FolderActivity extends SyncthingActivity {
     private ViewGroup mIgnoreDeleteContainer;
     private SwitchCompat mRunScriptSwitch;
     private ViewGroup mRunScriptContainer;
+    /** Inline warning shown whenever root execution is selected for folder scripts. */
+    private TextView mRootScriptWarning;
     private SwitchCompat mIgnoreDelete;
     private TextView mEditIgnoreListTitle;
     private EditText mEditIgnoreListContent;
@@ -321,7 +323,7 @@ public class FolderActivity extends SyncthingActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        mConfig = new ConfigRouter(FolderActivity.this);
+        mConfig = new ConfigRouter(FolderActivity.this, true);
 
         super.onCreate(savedInstanceState);
         ((SyncthingApp) getApplication()).component().inject(this);
@@ -403,6 +405,7 @@ public class FolderActivity extends SyncthingActivity {
         // Show expert options conditionally.
         mIgnoreDeleteContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
         mRunScriptContainer.setVisibility(mPrefExpertMode ? View.VISIBLE : View.GONE);
+        updateRootScriptWarning();
 
         // Register OnBackPressedCallback
         getOnBackPressedDispatcher().addCallback(this, mBackPressedCallback);
@@ -410,6 +413,31 @@ public class FolderActivity extends SyncthingActivity {
         // The editor opens with the configuration read this starts, so until its answer arrives the
         // editor accepts no edits and cannot be saved.
         startEditorStartupLoad();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (mRunScriptContainer != null) updateRootScriptWarning();
+    }
+
+    /** Keeps the visible script warning aligned with the committed execution mode. */
+    private void updateRootScriptWarning() {
+        boolean rootSelected = mPreferences.getBoolean(Constants.PREF_USE_ROOT, false);
+        if (rootSelected && mRootScriptWarning == null) {
+            mRootScriptWarning = new TextView(this);
+            mRootScriptWarning.setText(R.string.folder_run_script_root_warning);
+            int inset = (int) (75 * getResources().getDisplayMetrics().density + 0.5f);
+            int bottom = (int) (8 * getResources().getDisplayMetrics().density + 0.5f);
+            mRootScriptWarning.setPadding(inset, 0, inset, bottom);
+            mRunScriptContainer.addView(mRootScriptWarning, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            ));
+        } else if (!rootSelected && mRootScriptWarning != null) {
+            mRunScriptContainer.removeView(mRootScriptWarning);
+            mRootScriptWarning = null;
+        }
     }
 
     private void restoreDialogStates(Bundle savedInstanceState) {

@@ -10,7 +10,12 @@ final class FileMutationBarrier {
     private static final Object CERTIFICATE_RESTORE_LOCK = new Object();
     private static final List<CertificateRestoreContinuation>
             CERTIFICATE_RESTORE_CONTINUATIONS = new ArrayList<>();
+    private static final List<Runnable> STOPPED_STATE_MUTATION_CONTINUATIONS = new ArrayList<>();
+    private static final List<Runnable> EXECUTION_MODE_TRANSITION_CONTINUATIONS =
+            new ArrayList<>();
     private static CertificateRestoreReservation sCertificateRestoreOwner;
+    private static ExecutionModeTransitionReservation sExecutionModeTransitionOwner;
+    private static int sStoppedStateMutationOwners;
     private static boolean sCertificateRestoreUnsafe;
 
     @FunctionalInterface
@@ -93,6 +98,59 @@ final class FileMutationBarrier {
         }
     }
 
+    /**
+     * Process-wide reservation that closes lifecycle-launch and certificate-storage admission
+     * while the service changes execution mode.
+     */
+    static final class ExecutionModeTransitionReservation {
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private ExecutionModeTransitionReservation() {
+        }
+
+        /** Releases this transition reservation exactly once. */
+        boolean release() {
+            List<Runnable> continuations;
+            synchronized (CERTIFICATE_RESTORE_LOCK) {
+                if (!released.compareAndSet(false, true)
+                        || sExecutionModeTransitionOwner != this) {
+                    return false;
+                }
+                sExecutionModeTransitionOwner = null;
+                continuations = new ArrayList<>(EXECUTION_MODE_TRANSITION_CONTINUATIONS);
+                EXECUTION_MODE_TRANSITION_CONTINUATIONS.clear();
+                CERTIFICATE_RESTORE_LOCK.notifyAll();
+            }
+            for (Runnable continuation : continuations) continuation.run();
+            return true;
+        }
+    }
+
+    /** Process-wide admission for stopped-state configuration work that may write Managed State. */
+    static final class StoppedStateMutationReservation {
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private StoppedStateMutationReservation() {
+        }
+
+        boolean release() {
+            List<Runnable> continuations = new ArrayList<>();
+            synchronized (CERTIFICATE_RESTORE_LOCK) {
+                if (!released.compareAndSet(false, true) || sStoppedStateMutationOwners <= 0) {
+                    return false;
+                }
+                sStoppedStateMutationOwners--;
+                if (sStoppedStateMutationOwners == 0) {
+                    continuations.addAll(STOPPED_STATE_MUTATION_CONTINUATIONS);
+                    STOPPED_STATE_MUTATION_CONTINUATIONS.clear();
+                }
+                CERTIFICATE_RESTORE_LOCK.notifyAll();
+            }
+            for (Runnable continuation : continuations) continuation.run();
+            return true;
+        }
+    }
+
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final AtomicBoolean completed = new AtomicBoolean();
     private final boolean asyncOwner;
@@ -108,7 +166,10 @@ final class FileMutationBarrier {
     static CertificateRestoreReservation tryReserveCertificateRestore() {
         CertificateRestoreReservation reservation = new CertificateRestoreReservation();
         synchronized (CERTIFICATE_RESTORE_LOCK) {
-            if (sCertificateRestoreOwner != null) return null;
+            if (sCertificateRestoreOwner != null || sExecutionModeTransitionOwner != null
+                    || sStoppedStateMutationOwners != 0) {
+                return null;
+            }
             sCertificateRestoreOwner = reservation;
             return reservation;
         }
@@ -118,16 +179,75 @@ final class FileMutationBarrier {
     static CertificateRestoreReservation tryReserveCertificateMutation() {
         CertificateRestoreReservation reservation = new CertificateRestoreReservation();
         synchronized (CERTIFICATE_RESTORE_LOCK) {
-            if (sCertificateRestoreOwner != null || sCertificateRestoreUnsafe) return null;
+            if (sCertificateRestoreOwner != null || sExecutionModeTransitionOwner != null
+                    || sStoppedStateMutationOwners != 0 || sCertificateRestoreUnsafe) return null;
             sCertificateRestoreOwner = reservation;
             return reservation;
         }
     }
 
+    /**
+     * Atomically closes process creation and new certificate-storage reservations for a mode
+     * transition. The service also checks its stopped-state mutation and reset owners on its main
+     * thread before requesting this reservation.
+     */
+    static ExecutionModeTransitionReservation tryReserveExecutionModeTransition() {
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            if (sExecutionModeTransitionOwner != null || sCertificateRestoreOwner != null
+                    || sStoppedStateMutationOwners != 0 || sCertificateRestoreUnsafe) {
+                return null;
+            }
+            ExecutionModeTransitionReservation reservation =
+                    new ExecutionModeTransitionReservation();
+            sExecutionModeTransitionOwner = reservation;
+            return reservation;
+        }
+    }
+
+    /** Reserves stopped-state configuration admission before an asynchronous read or write starts. */
+    static StoppedStateMutationReservation tryReserveStoppedStateMutation() {
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            if (sCertificateRestoreOwner != null || sExecutionModeTransitionOwner != null
+                    || sStoppedStateMutationOwners != 0 || sCertificateRestoreUnsafe) {
+                return null;
+            }
+            sStoppedStateMutationOwners++;
+            return new StoppedStateMutationReservation();
+        }
+    }
+
+    /** Runs a continuation after an existing stopped-state configuration owner releases. */
+    static void whenStoppedStateMutationReleased(Runnable continuation) {
+        boolean runImmediately;
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            runImmediately = sStoppedStateMutationOwners == 0;
+            if (!runImmediately) STOPPED_STATE_MUTATION_CONTINUATIONS.add(continuation);
+        }
+        if (runImmediately) continuation.run();
+    }
+
+    /** Reports whether process-wide mode transition admission is closed. */
+    static boolean executionModeTransitionPending() {
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            return sExecutionModeTransitionOwner != null;
+        }
+    }
+
+    /** Runs a continuation after the current mode-transition owner releases process admission. */
+    static void whenExecutionModeTransitionReleased(Runnable continuation) {
+        boolean runImmediately;
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            runImmediately = sExecutionModeTransitionOwner == null;
+            if (!runImmediately) EXECUTION_MODE_TRANSITION_CONTINUATIONS.add(continuation);
+        }
+        if (runImmediately) continuation.run();
+    }
+
     /** Commits a lifecycle launch under the same lock used to reserve certificate storage. */
     static boolean commitLifecycleLaunchIfAvailable(Runnable commitLaunch) {
         synchronized (CERTIFICATE_RESTORE_LOCK) {
-            if (sCertificateRestoreOwner != null || sCertificateRestoreUnsafe) return false;
+            if (sCertificateRestoreOwner != null || sExecutionModeTransitionOwner != null
+                    || sStoppedStateMutationOwners != 0 || sCertificateRestoreUnsafe) return false;
             commitLaunch.run();
             return true;
         }
@@ -209,6 +329,15 @@ final class FileMutationBarrier {
             Runnable onContinuationConflict
     ) {
         if (currentOwner != null) {
+            onRejected.run();
+            return null;
+        }
+        boolean transitionPending;
+        synchronized (CERTIFICATE_RESTORE_LOCK) {
+            transitionPending = sExecutionModeTransitionOwner != null
+                    || sStoppedStateMutationOwners != 0;
+        }
+        if (transitionPending) {
             onRejected.run();
             return null;
         }

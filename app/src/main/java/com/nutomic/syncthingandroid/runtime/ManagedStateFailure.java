@@ -19,5 +19,7 @@ public enum ManagedStateFailure {
     /** State could not be transferred between Managed State and an operation-owned staging area. */
     STATE_TRANSFER_FAILED,
     /** Ownership, permission, or context repair of Managed State did not restore application access. */
-    STATE_REPAIR_FAILED
+    STATE_REPAIR_FAILED,
+    /** The service closed Managed State operations while changing execution mode. */
+    EXECUTION_MODE_TRANSITION_BUSY
 }

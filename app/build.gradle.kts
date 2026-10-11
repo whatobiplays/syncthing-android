@@ -193,12 +193,11 @@ project.afterEvaluate {
         dependsOn("validateAppVersionCode")
     }
 
-    val isCopilot = System.getenv("IS_COPILOT")?.toBoolean() ?: false
-    if (!isCopilot) {
-        tasks
-            .matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
-            .configureEach {
-                dependsOn(":syncthing:buildNative")
-            }
-    }
+    // Syncthing writes JNI libraries into this app's source directory. Every
+    // variant merge must wait for that producer, including in Copilot builds.
+    tasks
+        .matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
+        .configureEach {
+            dependsOn(":syncthing:buildNative")
+        }
 }

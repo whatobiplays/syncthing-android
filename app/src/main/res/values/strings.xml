@@ -277,6 +277,38 @@
     <!-- Setting title and description -->
     <string name="folder_run_script_caption">Run Script</string>
     <string name="folder_run_script_description">Expert option to run scripts after a folder changes its sync state. Scripts at \'.stfolder/*.sh\' will be executed, other locations are not supported for security considerations.\nExample script call: \'.stfolder/rename-files.sh sync_complete\'</string>
+    <string name="configuration_unavailable">Configuration is unavailable while Syncthing is stopped. Open an edit screen to load it.</string>
+    <string name="configuration_retry">Retry</string>
+    <string name="folder_run_script_root_warning">When separately authorized in Settings, these scripts run as UID 0 with unrestricted superuser privileges. An authorization prompt may appear after sync completion, including in the background. Enable only scripts you fully trust.</string>
+    <string name="root_script_prompt_opt_in_title">Allow root prompts for Run Scripts after sync</string>
+    <string name="root_script_prompt_opt_in_summary">Off by default. Configured scripts may request superuser access when synchronization finishes, even in the background. Scripts run with unrestricted superuser privileges and can modify or delete accessible data. Your root manager may not present a background prompt; that event will fail and will not be replayed.</string>
+    <string name="root_script_prompt_suspended">Automatic root-script prompts paused: %1$s</string>
+    <string name="root_script_prompt_resume">Resume for future sync completions</string>
+    <string name="root_script_prompt_reason_denied">root authorization was denied</string>
+    <string name="root_script_prompt_reason_lost">root authorization was lost or UID 0 could not be verified</string>
+    <string name="root_script_prompt_reason_timeout">root authorization timed out</string>
+    <string name="root_script_prompt_reason_unavailable">a root helper is unavailable</string>
+    <string name="root_script_prompt_reason_interrupted">the previous attempt was interrupted</string>
+    <string name="root_script_prompt_reason_persistence">the authorization setting could not be saved</string>
+    <string name="root_script_prompt_reason_unknown">the saved authorization state is unknown</string>
+    <string name="installation_marker_write_failed">The configuration exists, but the installation marker could not be saved. Retry onboarding after storage becomes available.</string>
+    <string name="superuser_mode_title">Superuser Mode</string>
+    <string name="superuser_mode_summary">Run Syncthing with root access. The core can access all files and system resources.</string>
+    <string name="execution_mode_failure_busy">Execution Mode change is blocked by another operation.</string>
+    <string name="execution_mode_failure_root">Root authorization failed.</string>
+    <string name="execution_mode_failure_execution">The running Syncthing process could not be safely stopped.</string>
+    <string name="execution_mode_failure_repair">Managed State repair is unavailable.</string>
+    <string name="execution_mode_failure_persistence">The selected Execution Mode could not be saved.</string>
+    <string name="execution_mode_failure_access">Managed State access must be repaired before Normal Mode can start.</string>
+    <string name="execution_mode_failure_startup">The selected backend could not be activated.</string>
+    <string name="execution_mode_retry">Retry</string>
+    <string name="execution_mode_repair_state">Repair Syncthing state access</string>
+    <string name="execution_mode_disable_anyway">Disable anyway</string>
+    <string name="execution_mode_disable_anyway_title">Disable Superuser Mode without state repair?</string>
+    <string name="execution_mode_disable_anyway_summary">This skips only Managed State repair and app-access verification. Syncthing will remain stopped in Normal Mode until you explicitly repair state access. Verified root process exit and completion of admitted work are still required.</string>
+    <string name="inotify_watch_limit_title">Experimental inotify watch limit</string>
+    <string name="inotify_watch_limit_summary">Apply the system watch-limit tuning explicitly. Optional startup reapplication never requests root authorization.</string>
+    <string name="inotify_service_unavailable">The service is not available to apply inotify tuning.</string>
 
     <!-- Setting title -->
     <string name="folder_pause">Pause Folder</string>

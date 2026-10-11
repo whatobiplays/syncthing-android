@@ -25,6 +25,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Superuser (root) execution backend for the bundled Syncthing binary.
@@ -84,7 +85,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * verified against durable evidence, and the run then reports
  * {@link ExecutionExitStatusUnavailableException} instead of an unauthenticated status.</p>
  */
-public final class RootBackend implements PrivilegeBackend {
+public final class RootBackend implements PrivilegeBackend, RootAuthorizationCapability {
     /** Bounded root activation deadline required by the canonical superuser design. */
     static final long ACTIVATION_TIMEOUT_MILLIS = 60_000;
     /**
@@ -115,6 +116,7 @@ public final class RootBackend implements PrivilegeBackend {
     private final File binary;
     private final File logFile;
     private final File logTemporaryDirectory;
+    private final RootShellFactory shellFactory;
     private final RootActivation activation;
     private final long activationTimeoutMillis;
     private final long creationConfirmationTimeoutMillis;
@@ -202,11 +204,12 @@ public final class RootBackend implements PrivilegeBackend {
         this.cleanupExitWaitMillis = cleanupExitWaitMillis;
         this.tildeBase = Objects.requireNonNull(tildeBase);
         this.managedStateLocations = Objects.requireNonNull(managedStateLocations);
+        this.shellFactory = Objects.requireNonNull(shellFactory);
         this.rootConfigStorage = new RootConfigStorage();
         this.rootManagedStateTransfer = new RootManagedStateTransfer();
         this.rootHttpsCertificateStorage = new RootHttpsCertificateStorage();
         this.activation = new RootActivation(
-                Objects.requireNonNull(shellFactory),
+                this.shellFactory,
                 activationTimeoutMillis
         );
         // Every activation owns its worker. A root prompt that is never answered leaves its
@@ -502,8 +505,163 @@ public final class RootBackend implements PrivilegeBackend {
         Objects.requireNonNull(event, "The folder event is required");
         return runConfiguredFolderOperation(
                 folder,
-                (shell, folderRoot) -> shell.runFolderScriptSet(folderRoot, event.argument())
+                (shell, folderRoot) -> shell.runFolderScriptSet(folderRoot, event.argument()),
+                false
         );
+    }
+
+    /**
+     * Runs a consented automatic script event through one explicit root helper. The authorization
+     * decision belongs to the service's admitted event; this backend never reads preferences.
+     */
+    @Override
+    public List<FolderScriptOutcome> runFolderScripts(
+            ConfiguredFolderReference folder,
+            FolderEvent event,
+            RunScriptRootAuthorization authorization
+    ) throws FolderOperationException {
+        Objects.requireNonNull(folder, "The configured folder reference is required");
+        Objects.requireNonNull(event, "The folder event is required");
+        Objects.requireNonNull(authorization, "The Run Script authorization is required");
+        if (!authorization.isCurrent()) {
+            throw new FolderOperationException(
+                    FolderOperationFailure.FOLDER_OPERATION_CANCELLED,
+                    "The root Run Script event no longer owns authorization"
+            );
+        }
+        try {
+            return runRootScriptOperation(authorization, shell -> {
+                if (!authorization.isCurrent()) throw cancelledRunScript();
+                String folderRoot = resolveFolderPathInSession(shell, folder.id());
+                if (!authorization.tryBeginScriptExecution()) throw cancelledRunScript();
+                return shell.runFolderScriptSet(folderRoot, event.argument());
+            });
+        } catch (FolderOperationException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RootTransportException) {
+                RootFailure rootFailure = ((RootTransportException) cause).failure();
+                FolderOperationFailure scriptFailure;
+                switch (rootFailure) {
+                    case ROOT_DENIED: scriptFailure = FolderOperationFailure.ROOT_SCRIPT_AUTH_DENIED; break;
+                    case ROOT_AUTHORIZATION_LOST:
+                    case UID_VERIFICATION_FAILED:
+                        scriptFailure = FolderOperationFailure.ROOT_SCRIPT_AUTH_LOST; break;
+                    case ROOT_ACTIVATION_TIMEOUT:
+                        scriptFailure = FolderOperationFailure.ROOT_SCRIPT_AUTH_TIMEOUT; break;
+                    case ROOT_ACTIVATION_OBSOLETE:
+                        scriptFailure = FolderOperationFailure.FOLDER_OPERATION_CANCELLED; break;
+                    default:
+                        scriptFailure = Thread.currentThread().isInterrupted()
+                                ? FolderOperationFailure.FOLDER_OPERATION_CANCELLED
+                                : FolderOperationFailure.ROOT_SCRIPT_AUTH_UNAVAILABLE;
+                }
+                throw new FolderOperationException(scriptFailure,
+                        "Root Run Script authorization failed: " + rootFailure, failure);
+            }
+            throw failure;
+        }
+    }
+
+    private static RootFolderOperationException cancelledRunScript() {
+        return new RootFolderOperationException(
+                FolderOperationFailure.FOLDER_OPERATION_CANCELLED,
+                "The root Run Script event was cancelled before script execution"
+        );
+    }
+
+    /**
+     * Acquires a script helper with a deadline, but retains the caller's admission until the
+     * activation worker actually exits. Cancelling a Future would only end the caller's wait;
+     * a root manager may still be presenting an authorization request afterward.
+     */
+    private <T> T runRootScriptOperation(
+            RunScriptRootAuthorization authorization,
+            ShellOperation<T> operation
+    ) throws FolderOperationException {
+        try {
+            RootActivation.Request request = activation.begin();
+            CountDownLatch settled = new CountDownLatch(1);
+            AtomicReference<RuntimeException> activationFailure = new AtomicReference<>();
+            Thread activationThread = new Thread(() -> {
+                try {
+                    if (!authorization.tryBeginAuthorization() || !authorization.isCurrent()) {
+                        throw new RootTransportException(RootFailure.ROOT_ACTIVATION_OBSOLETE,
+                                "Root Run Script authorization lost lifecycle admission");
+                    }
+                    activation.acquire(request);
+                } catch (RuntimeException failure) {
+                    activationFailure.set(failure);
+                } finally {
+                    settled.countDown();
+                }
+            }, "root-script-activation");
+            activationThread.setDaemon(true);
+            activationThread.start();
+            boolean timedOut = false;
+            boolean interrupted = false;
+            try {
+                timedOut = !settled.await(activationTimeoutMillis, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException cancellation) {
+                interrupted = true;
+            }
+            if (timedOut || interrupted) {
+                closeQuietly(request.cancelAndTake());
+                activationThread.interrupt();
+                if (timedOut) {
+                    try {
+                        authorization.onAuthorizationTimeout();
+                    } catch (RuntimeException reportingFailure) {
+                        logWarning("Could not report a timed-out Run Script authorization",
+                                reportingFailure);
+                    }
+                }
+                // A cancelled manager prompt can remain active. Keep the admitted operation alive
+                // until its acquisition worker returns and disposes any late shell.
+                boolean interruptedDuringSettlement = awaitRootScriptActivationSettlement(settled);
+                if (interrupted || interruptedDuringSettlement) Thread.currentThread().interrupt();
+                throw new RootTransportException(
+                        timedOut ? RootFailure.ROOT_ACTIVATION_TIMEOUT
+                                : RootFailure.ROOT_ACTIVATION_OBSOLETE,
+                        timedOut ? "Root Run Script authorization timed out"
+                                : "Root Run Script authorization was cancelled"
+                );
+            }
+            RuntimeException failure = activationFailure.get();
+            if (failure != null) throw failure;
+            RootShellSession session = request.take();
+            if (session == null) {
+                throw new RootTransportException(
+                        RootFailure.ROOT_ACTIVATION_OBSOLETE,
+                        "Root Run Script authorization was superseded"
+                );
+            }
+            try {
+                return operation.run(new SessionOwnedRootShell(session.shell()));
+            } finally {
+                closeQuietly(session);
+            }
+        } catch (RootFolderOperationException failure) {
+            throw new FolderOperationException(failure.failure(), failure.getMessage(), failure);
+        } catch (RootTransportException failure) {
+            throw new FolderOperationException(folderFailureFor(failure),
+                    "Root Run Script helper could not be acquired", failure);
+        } catch (IOException failure) {
+            throw new FolderOperationException(FolderOperationFailure.FOLDER_ACCESS_FAILED,
+                    "Root Run Script operation failed", failure);
+        }
+    }
+
+    /** Returns whether waiting for actual worker exit observed an interruption. */
+    private static boolean awaitRootScriptActivationSettlement(CountDownLatch settled) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                settled.await();
+                return interrupted;
+            } catch (InterruptedException cancellation) {
+                interrupted = true;
+            }
+        }
     }
 
     @Override
@@ -512,7 +670,7 @@ public final class RootBackend implements PrivilegeBackend {
             return TuningOutcome.notApplicable("No owned execution was named for I/O priority");
         }
         try {
-            return withShellSession(shell -> tuneExactOwnedExecution(shell, identity));
+            return withShellSessionIfAuthorized(shell -> tuneExactOwnedExecution(shell, identity));
         } catch (IOException | RuntimeException failure) {
             // An optional optimization: a device that cannot tune the process keeps the default
             // priority, and the caller never has to handle a tuning failure.
@@ -531,6 +689,34 @@ public final class RootBackend implements PrivilegeBackend {
         } catch (IOException | RuntimeException failure) {
             return TuningOutcome.failed(
                     "The system inotify watch limit could not be applied: " + failure
+            );
+        }
+    }
+
+    @Override
+    public void verifyAuthorization() throws IOException {
+        withHelperSession(ownershipManager -> null);
+    }
+
+    @Override
+    public boolean isAuthorizationAvailableWithoutPrompt() {
+        return shellFactory.isAuthorizationAvailableWithoutPrompt();
+    }
+
+    @Override
+    public TuningOutcome applyInotifyWatchLimitIfAuthorized() {
+        if (!isAuthorizationAvailableWithoutPrompt()) {
+            return TuningOutcome.notApplicable(
+                    "Inotify tuning was skipped because root authorization is not already available"
+            );
+        }
+        try {
+            return withShellSessionIfAuthorized(
+                    shell -> shell.applyInotifyWatchLimit(InotifyWatchLimit.TARGET)
+            );
+        } catch (IOException | RuntimeException failure) {
+            return TuningOutcome.failed(
+                    "The system inotify watch limit could not be reapplied: " + failure
             );
         }
     }
@@ -586,6 +772,25 @@ public final class RootBackend implements PrivilegeBackend {
         }
     }
 
+    /** Runs an operation only when root authorization was already confirmed in this process. */
+    private <T> T withShellSessionIfAuthorized(ShellOperation<T> operation) throws IOException {
+        // The factory owns the no-prompt guarantee. A cached capability check here would race
+        // revocation and could cause acquire() to start a newly interactive `su` process.
+        RootShell shell = shellFactory.acquireIfAuthorized(activationTimeoutMillis);
+        if (shell == null) {
+            throw new RootTransportException(
+                    RootFailure.ROOT_AUTHORIZATION_LOST,
+                    "No previously authorized root capability is available"
+            );
+        }
+        RootShellSession session = RootShellSession.withoutTransportIdentity(shell);
+        try {
+            return operation.run(new SessionOwnedRootShell(session.shell()));
+        } finally {
+            closeQuietly(session);
+        }
+    }
+
     /**
      * Runs one privileged folder operation inside exactly one bounded helper session.
      *
@@ -595,8 +800,17 @@ public final class RootBackend implements PrivilegeBackend {
      * outcome, so an abandoned request never looks like broken privileged access.</p>
      */
     private <T> T runFolderOperation(ShellOperation<T> operation) throws FolderOperationException {
+        return runFolderOperation(operation, true);
+    }
+
+    private <T> T runFolderOperation(
+            ShellOperation<T> operation,
+            boolean allowAuthorizationPrompt
+    ) throws FolderOperationException {
         try {
-            return withShellSession(operation);
+            return allowAuthorizationPrompt
+                    ? withShellSession(operation)
+                    : withShellSessionIfAuthorized(operation);
         } catch (RootFolderOperationException failure) {
             throw new FolderOperationException(failure.failure(), failure.getMessage(), failure);
         } catch (RootTransportException failure) {
@@ -643,11 +857,19 @@ public final class RootBackend implements PrivilegeBackend {
             ConfiguredFolderReference folder,
             ConfiguredFolderOperation<T> operation
     ) throws FolderOperationException {
+        return runConfiguredFolderOperation(folder, operation, true);
+    }
+
+    private <T> T runConfiguredFolderOperation(
+            ConfiguredFolderReference folder,
+            ConfiguredFolderOperation<T> operation,
+            boolean allowAuthorizationPrompt
+    ) throws FolderOperationException {
         Objects.requireNonNull(folder, "The configured folder reference is required");
         return runFolderOperation(shell -> {
             String folderRoot = resolveFolderPathInSession(shell, folder.id());
             return operation.run(shell, folderRoot);
-        });
+        }, allowAuthorizationPrompt);
     }
 
     /**
@@ -950,6 +1172,11 @@ public final class RootBackend implements PrivilegeBackend {
     /** Managed State transfer served through the root transport. */
     private final class RootManagedStateTransfer implements ManagedStateTransfer {
         @Override
+        public boolean isAppAccessAvailable() {
+            return ManagedStateAccessProbe.isAccessible(managedStateLocations);
+        }
+
+        @Override
         public ManagedStateStaging snapshotForExport() throws ManagedStateException {
             ensureStagingBase(
                     ManagedStateFailure.STATE_TRANSFER_FAILED,
@@ -1007,13 +1234,24 @@ public final class RootBackend implements PrivilegeBackend {
 
         @Override
         public void repairAppAccess() throws ManagedStateException {
+            repairAppAccess(true);
+        }
+
+        @Override
+        public void repairAppAccessIfAuthorized() throws ManagedStateException {
+            repairAppAccess(false);
+        }
+
+        private void repairAppAccess(boolean allowAuthorizationPrompt)
+                throws ManagedStateException {
             runStateOperation(
                     ManagedStateFailure.STATE_REPAIR_FAILED,
                     "repair Managed State access",
                     shell -> {
                         shell.repairManagedStateAccess();
                         return null;
-                    }
+                    },
+                    allowAuthorizationPrompt
             );
             verifyAppAccessAfterRepair();
         }
@@ -1182,8 +1420,19 @@ public final class RootBackend implements PrivilegeBackend {
             String operation,
             RootStateSessionOperation<T> session
     ) throws ManagedStateException {
+        return runStateOperation(failure, operation, session, true);
+    }
+
+    private <T> T runStateOperation(
+            ManagedStateFailure failure,
+            String operation,
+            RootStateSessionOperation<T> session,
+            boolean allowAuthorizationPrompt
+    ) throws ManagedStateException {
         try {
-            return withStateSession(session);
+            return allowAuthorizationPrompt
+                    ? withStateSession(session)
+                    : withShellSessionIfAuthorized(session::run);
         } catch (RootTransportException e) {
             throw new ManagedStateException(failure, "Could not " + operation, e);
         } catch (IOException e) {

@@ -117,6 +117,35 @@ public class FolderScriptAdmissionTest {
         assertFalse(admission.tryAdmit());
     }
 
+    @Test
+    public void aDrainedGateCanBeReopenedAfterAPreCommitFailure() throws Exception {
+        FolderScriptAdmission admission = new FolderScriptAdmission();
+
+        assertTrue(admission.tryAdmit());
+        assertFalse(admission.closeAndWait(0));
+        admission.leave();
+
+        admission.reopenWhenDrained();
+        assertFalse(admission.isClosed());
+        assertTrue(admission.tryAdmit());
+        admission.leave();
+    }
+
+    @Test
+    public void aTimedOutGateCannotReopenUntilItsAdmittedWorkLeaves() throws Exception {
+        FolderScriptAdmission admission = new FolderScriptAdmission();
+
+        assertTrue(admission.tryAdmit());
+        assertFalse(admission.closeAndWait(0));
+
+        admission.reopenWhenDrained();
+        assertTrue(admission.isClosed());
+        admission.leave();
+        assertFalse(admission.isClosed());
+        assertTrue(admission.tryAdmit());
+        admission.leave();
+    }
+
     /** Waits until the teardown closed the gate, so no test depends on thread timing. */
     private static void awaitClosed(FolderScriptAdmission admission) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
