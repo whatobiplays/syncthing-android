@@ -1,0 +1,20 @@
+app/src/test/java/com/nutomic/syncthingandroid/runtime/FolderEditorStartupLoadTest.java
+  s_e34e4b4f962a30::t_6b8efb483ac3b4 219,221-225,227
+  s_e34e4b4f962a30::t_5c58aee5c55486 177,181-195,197-217,220,228-249
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "53b4c6107b186765eb8240e7d4f41ec68bec69a1",
+  "prompts": {},
+  "sessions": {
+    "s_e34e4b4f962a30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a129d4-fc1d-7750-9939-b4b0f2455c59",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "WhatObiPlays <219249021+whatobiplays@users.noreply.github.com>"
+    }
+  }
+}
