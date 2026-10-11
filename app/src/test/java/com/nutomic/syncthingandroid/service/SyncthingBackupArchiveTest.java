@@ -106,7 +106,17 @@ public class SyncthingBackupArchiveTest {
     public void extractionRejectsMalformedSharedPreferencesBeforeReturningStaging()
             throws Exception {
         File root = Files.createTempDirectory("syncthing-backup-malformed-prefs-").toFile();
-        ManagedStateStaging staging = locations(root).newStaging();
+        ManagedStateLocations locations = locations(root);
+        ManagedStateStaging staging = locations.newStaging();
+        // Extraction receives only the staging directory; a validation failure must leave the
+        // live Managed State members owned by this installation byte-for-byte intact.
+        Files.createDirectories(locations.stateRoot().toPath());
+        File liveConfig = new File(locations.stateRoot(), "config.xml");
+        File liveCert = new File(locations.stateRoot(), "cert.pem");
+        File liveKey = new File(locations.stateRoot(), "key.pem");
+        Files.write(liveConfig.toPath(), bytes("existing config"));
+        Files.write(liveCert.toPath(), bytes("existing cert"));
+        Files.write(liveKey.toPath(), bytes("existing key"));
         ByteArrayOutputStream serialized = new ByteArrayOutputStream();
         try (ObjectOutputStream preferences = new ObjectOutputStream(serialized)) {
             preferences.writeObject("not a preferences map");
@@ -119,6 +129,9 @@ public class SyncthingBackupArchiveTest {
         );
         try {
             assertThrows(IOException.class, () -> SyncthingBackupArchive.extract(archive, staging));
+            assertArrayEquals(bytes("existing config"), Files.readAllBytes(liveConfig.toPath()));
+            assertArrayEquals(bytes("existing cert"), Files.readAllBytes(liveCert.toPath()));
+            assertArrayEquals(bytes("existing key"), Files.readAllBytes(liveKey.toPath()));
         } finally {
             staging.close();
         }

@@ -182,6 +182,14 @@ jobs:
             echo "No cached native libraries found for syncthing commit ${SYNCTHING_COMMIT} - will build from scratch"
           fi
 
+      - name: Check debug architecture and JVM regressions
+        if: ${{ inputs.buildType == 'Debug' }}
+        run: |
+          set -eu
+          python3 -m unittest scripts.test_superuser_architecture
+          python3 scripts/check_superuser_architecture.py
+          ./gradlew --no-daemon testDebugUnitTest
+
       - name: Build app
         run: |
           set -eu
