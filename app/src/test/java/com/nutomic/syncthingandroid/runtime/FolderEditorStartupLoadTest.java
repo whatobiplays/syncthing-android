@@ -174,64 +174,79 @@ public class FolderEditorStartupLoadTest {
         CountDownLatch refreshStarted = new CountDownLatch(1);
         CountDownLatch releaseRefresh = new CountDownLatch(1);
         CountDownLatch newerRefreshStarted = new CountDownLatch(1);
+        CountDownLatch releaseNewerRefresh = new CountDownLatch(1);
         List<String> refreshedDevices = new ArrayList<>();
         List<String> refreshThreads = Collections.synchronizedList(new ArrayList<>());
 
-        load.start(
-                () -> true,
-                () -> {
-                    refreshThreads.add(Thread.currentThread().getName());
-                    refreshStarted.countDown();
-                    await(releaseRefresh);
-                    return new Snapshot(Collections.emptyList(), Arrays.asList("device-a"));
-                },
-                snapshot -> {
-                    deliveryThreads.add(Thread.currentThread().getName());
-                    refreshedDevices.addAll(snapshot.devices);
-                }
-        );
-        assertTrue("the refresh must run on the worker", refreshStarted.await(5, TimeUnit.SECONDS));
+        try {
+            load.start(
+                    () -> true,
+                    () -> {
+                        refreshThreads.add(Thread.currentThread().getName());
+                        refreshStarted.countDown();
+                        await(releaseRefresh);
+                        return new Snapshot(Collections.emptyList(), Arrays.asList("device-a"));
+                    },
+                    snapshot -> {
+                        deliveryThreads.add(Thread.currentThread().getName());
+                        refreshedDevices.addAll(snapshot.devices);
+                    }
+            );
+            assertTrue("the refresh must run on the worker", refreshStarted.await(5, TimeUnit.SECONDS));
 
-        // The user adds another device before the first refresh answered.
-        load.start(
-                () -> true,
-                () -> {
-                    newerRefreshStarted.countDown();
-                    return new Snapshot(
-                            Collections.emptyList(),
-                            Arrays.asList("device-a", "device-b")
-                    );
-                },
-                snapshot -> {
-                    deliveryThreads.add(Thread.currentThread().getName());
-                    refreshedDevices.addAll(snapshot.devices);
-                }
-        );
-        releaseRefresh.countDown();
-        assertTrue(
-                "the newer refresh must run too",
-                newerRefreshStarted.await(5, TimeUnit.SECONDS)
-        );
+            // The user adds another device before the first refresh answered.
+            load.start(
+                    () -> true,
+                    () -> {
+                        newerRefreshStarted.countDown();
+                        await(releaseNewerRefresh);
+                        return new Snapshot(
+                                Collections.emptyList(),
+                                Arrays.asList("device-a", "device-b")
+                        );
+                    },
+                    snapshot -> {
+                        deliveryThreads.add(Thread.currentThread().getName());
+                        refreshedDevices.addAll(snapshot.devices);
+                    }
+            );
+            releaseRefresh.countDown();
+            assertTrue(
+                    "the newer refresh must run too",
+                    newerRefreshStarted.await(5, TimeUnit.SECONDS)
+            );
 
-        awaitHandOff();
-        awaitHandOff();
-        runHandOffs();
+            // Process the stale hand-off while the newer read is still blocked.
+            awaitHandOff();
+            runHandOffs();
+            assertTrue(
+                    "a refresh superseded before delivery may not reach the editor",
+                    refreshedDevices.isEmpty()
+            );
 
-        assertEquals(
-                "only the newest device list may reach the editor",
-                Arrays.asList("device-a", "device-b"),
-                refreshedDevices
-        );
-        assertNotEquals(
-                "the refresh must not run on the thread that draws the editor",
-                ownerThreadName,
-                refreshThreads.get(0)
-        );
-        assertEquals(
-                "the refresh must reach the editor on the thread that asked for it",
-                Arrays.asList(ownerThreadName),
-                deliveryThreads
-        );
+            releaseNewerRefresh.countDown();
+            awaitHandOff();
+            runHandOffs();
+
+            assertEquals(
+                    "only the newest device list may reach the editor",
+                    Arrays.asList("device-a", "device-b"),
+                    refreshedDevices
+            );
+            assertNotEquals(
+                    "the refresh must not run on the thread that draws the editor",
+                    ownerThreadName,
+                    refreshThreads.get(0)
+            );
+            assertEquals(
+                    "the refresh must reach the editor on the thread that asked for it",
+                    Arrays.asList(ownerThreadName),
+                    deliveryThreads
+            );
+        } finally {
+            releaseRefresh.countDown();
+            releaseNewerRefresh.countDown();
+        }
     }
 
 
